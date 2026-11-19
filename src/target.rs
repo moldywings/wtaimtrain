@@ -19,6 +19,7 @@ impl Plugin for TargetPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<ResetScenario>()
             .add_message::<TargetHit>()
+            .add_message::<PlayerHit>()
             .init_resource::<ScenarioState>()
             .add_systems(Startup, (spawn_target, spawn_notice))
             .add_systems(
@@ -33,7 +34,13 @@ impl Plugin for TargetPlugin {
             )
             .add_systems(
                 Update,
-                (take_hits, end_of_run, fade_explosions, update_notice)
+                (
+                    take_hits,
+                    take_player_hits,
+                    end_of_run,
+                    fade_explosions,
+                    update_notice,
+                )
                     .chain()
                     .after(fly_target)
                     .run_if(in_state(GameState::Playing)),
@@ -48,6 +55,13 @@ pub struct ResetScenario;
 /// A round hit the target, taking away this fraction of its health.
 #[derive(Message)]
 pub struct TargetHit {
+    pub damage: f32,
+}
+
+/// One of the target's rounds hit you, taking away this fraction of your
+/// health.
+#[derive(Message)]
+pub struct PlayerHit {
     pub damage: f32,
 }
 
@@ -66,6 +80,8 @@ enum Behavior {
     Climb { intensity: f32 },
     /// Fly at the player and try to hit them.
     Ram,
+    /// Get on the player's tail and shoot them down.
+    Attack,
 }
 
 #[derive(Component)]
@@ -81,6 +97,10 @@ pub struct Target {
     next_dodge: f32,
     /// Fraction of the target destroyed (1 = gone).
     damage: f32,
+    /// Its guns are on target and it's shooting (when enemy fire is on).
+    pub firing: bool,
+    /// Seconds left of breaking away after a close pass.
+    break_off: f32,
 }
 
 impl Target {
@@ -92,6 +112,8 @@ impl Target {
             roll: 0.0,
             next_dodge: 0.0,
             damage: 0.0,
+            firing: false,
+            break_off: 0.0,
         }
     }
 
@@ -107,8 +129,10 @@ pub struct ScenarioState {
     pub current: Scenario,
     /// Seconds since the reset.
     pub time: f32,
-    /// Seconds since the target was destroyed.
+    /// Seconds since the target was destroyed (or you were shot down).
     destroyed_for: Option<f32>,
+    /// Fraction of your plane destroyed by the target's fire (1 = down).
+    pub player_damage: f32,
     rng: Rng,
     /// What to show in the middle of the screen, and for how long.
     notice: Option<(String, Color, f32)>,
@@ -124,9 +148,16 @@ impl Default for ScenarioState {
             current: Scenario::Chase,
             time: 0.0,
             destroyed_for: None,
+            player_damage: 0.0,
             rng: Rng(seed | 1),
             notice: None,
         }
+    }
+}
+
+impl ScenarioState {
+    pub fn player_down(&self) -> bool {
+        self.player_damage >= 1.0
     }
 }
 
@@ -211,13 +242,18 @@ fn spawn_target(
 /// Start over when the scenario or its settings change in the menu.
 fn restart_on_change(
     settings: Res<Settings>,
-    mut last: Local<Option<(Scenario, f32, f32)>>,
+    mut last: Local<Option<(Scenario, f32, f32, bool)>>,
     mut reset: MessageWriter<ResetScenario>,
 ) {
     if !settings.is_changed() {
         return;
     }
-    let now = (settings.scenario, settings.chase_min, settings.chase_max);
+    let now = (
+        settings.scenario,
+        settings.chase_min,
+        settings.chase_max,
+        settings.enemy_fires,
+    );
     if last.is_some_and(|l| l != now) {
         reset.write(ResetScenario);
     }
@@ -268,6 +304,7 @@ fn reset_scenario(
     state.current = scenario;
     state.time = 0.0;
     state.destroyed_for = None;
+    state.player_damage = 0.0;
 
     let p = player.body.position;
     let player_speed = player.body.speed();
@@ -349,16 +386,18 @@ fn reset_scenario(
                         rng.signed() * 250.0,
                         -bearing.cos() * dist,
                     );
-                    // Heading roughly your way (crossing to head on), so it
-                    // engages instead of flying off.
-                    let to_you = (p - pos).with_y(0.0).normalize_or(Vec3::Z);
-                    let course = rng.signed() * 80f32.to_radians();
-                    let dir = Quat::from_rotation_y(course) * to_you;
+                    // Any heading at all.
+                    let course = rng.range(0.0, std::f32::consts::TAU);
+                    let dir = Vec3::new(course.sin(), 0.0, -course.cos());
                     let speed = model.top_speed(pos.y) * rng.range(0.45, 1.0);
-                    (
-                        Target::new(Behavior::Ram),
-                        Body::new(pos, heading(dir), speed),
-                    )
+                    // With enemy fire on it tries to shoot you down;
+                    // otherwise it tries to ram you.
+                    let behavior = if settings.enemy_fires {
+                        Behavior::Attack
+                    } else {
+                        Behavior::Ram
+                    };
+                    (Target::new(behavior), Body::new(pos, heading(dir), speed))
                 }
                 Scenario::AllInOne => unreachable!("picked above"),
             }
@@ -380,6 +419,7 @@ fn offset_dir(dir: Vec3, yaw: f32, pitch: f32) -> Vec3 {
 
 pub fn fly_target(
     time: Res<Time>,
+    settings: Res<Settings>,
     mut state: ResMut<ScenarioState>,
     player: Single<&Aircraft, (With<Player>, Without<Target>)>,
     mut targets: Query<(&mut Transform, &mut Aircraft, &mut Target), Without<Player>>,
@@ -395,8 +435,29 @@ pub fn fly_target(
             continue;
         }
         target.next_dodge -= dt;
+        target.break_off = (target.break_off - dt).max(0.0);
         let new_dodge = target.next_dodge <= 0.0;
         let pos = aircraft.body.position;
+        let rel = player.position - pos;
+        let range = rel.length();
+        // Where its biggest gun has to point to hit you.
+        let gun = aircraft
+            .card
+            .weapons
+            .guns()
+            .iter()
+            .map(|(_, g, _)| settings.gun(g))
+            .max_by(|a, b| a.caliber_mm().total_cmp(&b.caliber_mm()))
+            .cloned();
+        let lead = gun.as_ref().and_then(|g| {
+            crate::weapons::lead_direction(
+                g,
+                pos,
+                aircraft.body.velocity,
+                player.position,
+                player.velocity,
+            )
+        });
         let aim = match target.behavior {
             Behavior::Straight { dir } => dir,
             Behavior::Weave {
@@ -438,7 +499,31 @@ pub fn fly_target(
                 let at = player.position + player.velocity * t * 0.8;
                 (at - pos).normalize_or(Vec3::NEG_Z)
             }
+            Behavior::Attack => {
+                // Too close and closing: break away, then come back round.
+                let closing = (player.velocity - aircraft.body.velocity).dot(rel) < 0.0;
+                if range < 150.0 && closing && target.break_off <= 0.0 {
+                    target.break_off = 1.8;
+                }
+                if target.break_off > 0.0 {
+                    // Break off to the side and up, so it can turn back in.
+                    let away = (-rel).with_y(0.0).normalize_or(Vec3::X);
+                    let side = away.cross(Vec3::Y);
+                    (away + side * 0.8 + Vec3::Y * 0.4).normalize()
+                } else {
+                    lead.unwrap_or_else(|| rel.normalize_or(Vec3::NEG_Z))
+                }
+            }
         };
+
+        // Shoot when its guns are roughly on you and you're in range: like
+        // a real pilot, it opens fire a little before the solution is perfect.
+        let forward = aircraft.body.rotation * Vec3::NEG_Z;
+        let cone = (12.0 / range.max(1.0)).atan().max(2.5f32.to_radians());
+        target.firing = settings.enemy_fires
+            && !state.player_down()
+            && range < 900.0
+            && lead.is_some_and(|d| d.angle_between(forward) < cone);
 
         let hold_speed = target.hold_speed;
         let roll = target.roll;
@@ -460,6 +545,23 @@ pub fn fly_target(
         flight_model::step(model, body, controls, dt);
         tf.translation = body.position;
         tf.rotation = body.rotation;
+    }
+}
+
+/// Count the target's hits on you; enough and you're shot down.
+fn take_player_hits(mut hits: MessageReader<PlayerHit>, mut state: ResMut<ScenarioState>) {
+    let damage: f32 = hits.read().map(|h| h.damage).sum();
+    if damage <= 0.0 || state.player_down() {
+        return;
+    }
+    state.player_damage += damage;
+    if state.player_down() && state.destroyed_for.is_none() {
+        state.destroyed_for = Some(0.0);
+        state.notice = Some((
+            "YOU WERE SHOT DOWN".into(),
+            Color::srgb(1.0, 0.3, 0.25),
+            RESET_AFTER_KILL,
+        ));
     }
 }
 

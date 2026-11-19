@@ -1005,9 +1005,9 @@ impl InstructorTuning {
             rudder_gain: 150.0,
             rudder_damp: 8.0,
             rudder_fade: 0.5,
-            aim_smooth: 0.16,
+            aim_smooth: 0.4,
             rate_smooth: 0.1,
-            aim_feed: 1.0,
+            aim_feed: 0.8,
             big_lo: 0.35,
             big_hi: 0.7,
             kh: 8.0,
@@ -1542,7 +1542,8 @@ mod jump_probe {
     fn mouse_steps_dont_kick_the_controls() {
         let (chatter, jerk, err) = mouse_sweep(InstructorTuning::get(), 5.0, 60.0);
         println!("chatter {chatter:.1}, jerk {jerk:.2}, err {err:.2}");
-        assert!(chatter < 12.0 && jerk < 0.35 && err < 0.5);
+        // The nose lags the aim on purpose (about 0.2 s), like the game.
+        assert!(chatter < 12.0 && jerk < 0.35 && err < 1.2);
     }
 
     #[test]
@@ -1753,10 +1754,21 @@ mod compare_probe {
             kv: 10.0,
             ..new
         };
+        let f6 = InstructorTuning {
+            aim_feed: 0.6,
+            ..new
+        };
+        let s4 = InstructorTuning {
+            aim_smooth: 0.4,
+            aim_feed: 0.8,
+            ..new
+        };
         for (name, t) in [
             ("old", old),
             ("hi", hi),
             ("cur", new),
+            ("f6", f6),
+            ("s4", s4),
             ("a06", a06),
             ("k6", k6),
             ("a15", a15),

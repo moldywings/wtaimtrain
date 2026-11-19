@@ -291,6 +291,8 @@ pub struct Settings {
     pub chase_max: f32,
     /// Show where to aim to hit the target.
     pub lead_indicator: bool,
+    /// The target shoots back.
+    pub enemy_fires: bool,
 }
 
 /// Practice scenarios.
@@ -340,8 +342,8 @@ impl Scenario {
                  rolling and dodging as it climbs."
             }
             Scenario::Dogfight => {
-                "The target starts close by, at a random spot, height and speed, and \
-                 tries to ram you."
+                "The target starts close by, at a random spot, height, heading and \
+                 speed. It tries to ram you, or with enemy fire on, to shoot you down."
             }
             Scenario::AllInOne => "A random scenario every time it resets.",
         }
@@ -370,6 +372,7 @@ impl Default for Settings {
             chase_min: 300.0,
             chase_max: 800.0,
             lead_indicator: false,
+            enemy_fires: false,
         }
     }
 }

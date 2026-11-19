@@ -442,6 +442,7 @@ enum MenuAction {
     Page(Page),
     CycleUnits,
     ToggleLead,
+    ToggleEnemyFire,
     PickScenario(Scenario),
     /// Move the chase start distance: (which end: 0 near, 1 far; steps).
     ChaseDistance(u8, i32),
@@ -1383,6 +1384,18 @@ fn scenario_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
                     }
                 }
                 col.spawn(label(settings.scenario.description(), 14.0, DIM));
+                col.spawn(section_header("Enemy shoots back"));
+                col.spawn(button(
+                    MenuAction::ToggleEnemyFire,
+                    if settings.enemy_fires { "On" } else { "Off" },
+                    percent(100),
+                ));
+                col.spawn(label(
+                    "When on, the target fires its own guns at you whenever they're \
+                     lined up, and in a dogfight it hunts you instead of ramming.",
+                    13.0,
+                    DIM,
+                ));
                 col.spawn(label(
                     "Destroy the target and it resets 2 seconds later. It also resets \
                      when a plane crashes, the target gets away, or you press R.",
@@ -1690,6 +1703,7 @@ fn on_menu_click(
         MenuAction::Resume => next.set(GameState::Playing),
         MenuAction::Page(page) => ui.page = page,
         MenuAction::ToggleLead => settings.lead_indicator = !settings.lead_indicator,
+        MenuAction::ToggleEnemyFire => settings.enemy_fires = !settings.enemy_fires,
         MenuAction::PickScenario(sc) => settings.scenario = sc,
         MenuAction::ChaseDistance(end, steps) => {
             let d = steps as f32 * CHASE_STEP;

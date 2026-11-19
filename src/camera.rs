@@ -62,8 +62,23 @@ impl MouseAim {
 
     /// Move the aim by a screen-space turn (rad): right and up.
     fn turn(&mut self, right: f32, up: f32) {
-        self.rot =
-            (self.rot * Quat::from_rotation_y(-right) * Quat::from_rotation_x(up)).normalize();
+        // Side to side turns about the world's vertical, so the horizon
+        // stays level however far up or down you look. Only when pointing
+        // almost straight up or down does it turn about the view's own up,
+        // so the circle can still move across the screen there.
+        let f = self.rot * Vec3::NEG_Z;
+        let own_up = self.rot * Vec3::Y;
+        let world_up = if own_up.y >= 0.0 {
+            Vec3::Y
+        } else {
+            Vec3::NEG_Y
+        };
+        let t = ((f.y.abs() - 0.9) / 0.09).clamp(0.0, 1.0);
+        let axis = world_up
+            .lerp(own_up, t * t * (3.0 - 2.0 * t))
+            .normalize_or(Vec3::Y);
+        self.rot = (Quat::from_axis_angle(axis, -right) * self.rot * Quat::from_rotation_x(up))
+            .normalize();
     }
 
     /// Roll part of the way back toward level.
@@ -92,6 +107,8 @@ pub struct ChaseCamera {
     /// Free look offset from the view, radians.
     look_yaw: f32,
     look_pitch: f32,
+    /// Where free look is heading; the view eases toward it.
+    look_goal: Vec2,
     free_looking: bool,
     /// Whether zoom is toggled on.
     zoomed: bool,
@@ -109,7 +126,9 @@ const NORMAL_FOV: f32 = 60.0;
 const ZOOM_FOV: f32 = 25.0;
 /// How quickly zoom and free look settle (1/s).
 const ZOOM_RATE: f32 = 10.0;
-const LOOK_RETURN_RATE: f32 = 8.0;
+const LOOK_RETURN_RATE: f32 = 6.0;
+/// How quickly free look catches up with the mouse (1/s).
+const LOOK_FOLLOW_RATE: f32 = 10.0;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
@@ -132,6 +151,7 @@ fn spawn_camera(mut commands: Commands) {
             view: Quat::IDENTITY,
             look_yaw: 0.0,
             look_pitch: 0.0,
+            look_goal: Vec2::ZERO,
             free_looking: false,
             zoomed: false,
             zoom: 0.0,
@@ -159,8 +179,8 @@ fn update_mouse_aim(
         (current_fov(camera.zoom).to_radians() * 0.5).tan() / (NORMAL_FOV.to_radians() * 0.5).tan();
     if camera.free_looking {
         let delta = motion.delta * settings.look_per_pixel() * zoom;
-        camera.look_yaw = (camera.look_yaw - delta.x).clamp(-3.0, 3.0);
-        camera.look_pitch = (camera.look_pitch - delta.y).clamp(-1.4, 1.4);
+        camera.look_goal.x = (camera.look_goal.x - delta.x).clamp(-3.0, 3.0);
+        camera.look_goal.y = (camera.look_goal.y - delta.y).clamp(-1.4, 1.4);
     } else {
         let delta = motion.delta * settings.aim_per_pixel() * zoom;
         aim.turn(delta.x, -delta.y);
@@ -190,12 +210,16 @@ fn follow_player(
             .slerp(aim.rotation(), ease(CAMERA_FOLLOW_RATE))
             .normalize();
 
-        // Free look springs back once the key is released.
-        if !cam.free_looking {
-            let k = ease(LOOK_RETURN_RATE);
-            cam.look_yaw -= cam.look_yaw * k;
-            cam.look_pitch -= cam.look_pitch * k;
-        }
+        // Free look eases toward where the mouse put it, and springs back
+        // once the key is released.
+        let k = if cam.free_looking {
+            ease(LOOK_FOLLOW_RATE)
+        } else {
+            cam.look_goal = Vec2::ZERO;
+            ease(LOOK_RETURN_RATE)
+        };
+        cam.look_yaw += (cam.look_goal.x - cam.look_yaw) * k;
+        cam.look_pitch += (cam.look_goal.y - cam.look_pitch) * k;
 
         if mouse.just_pressed(MouseButton::Right) {
             cam.zoomed = !cam.zoomed;
@@ -233,4 +257,5 @@ pub fn snap_view(camera: &mut ChaseCamera, aim: &MouseAim) {
     camera.view = aim.rotation();
     camera.look_yaw = 0.0;
     camera.look_pitch = 0.0;
+    camera.look_goal = Vec2::ZERO;
 }

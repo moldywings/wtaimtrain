@@ -36,7 +36,7 @@ The white circle is where you're aiming. The crosshair is where the nose points.
 - **Head on:** you fly straight at each other. The target holds a straight line at a random speed, from a slightly different height and toward a different point near you each time.
 - **Chase:** you start behind the target, a random distance between the two you set (300 to 800 m by default). It keeps its heading but weaves and dodges: some runs hard, some gently, some not at all.
 - **Stall:** the target starts just above and ahead of you and pulls straight up, rolling and dodging.
-- **Dogfight:** the target starts close by, usually ahead of you, at a random spot, height and speed, and tries to ram you.
+- **Dogfight:** the target starts close by, usually ahead of you, at a random spot, height, heading and speed, and tries to ram you. With **Enemy shoots back** on (Scenario page), it hunts you with its own guns instead: it fires when lined up, breaks off if it gets too close, and its hits show as "Your damage". At 100% you're shot down and the scenario resets 2 seconds later. Enemy fire works in the other scenarios too.
 - **All in one:** a random one of the others each time.
 
 When the target takes enough hits it's destroyed, with a sound and a "TARGET DESTROYED" notice, and the scenario restarts 2 seconds later. It also restarts when a plane crashes, the planes collide, the target gets more than 4 km away, a head-on pass is over, or you press R.
@@ -61,7 +61,7 @@ Each aircraft preset has a loadout with four mounting spots, and each spot can c
 
 - Nose, in the spinner: 1 gun through the propeller hub.
 - Nose, around it: up to 6, on a hexagon around the spinner gun.
-- Belly: up to 4 under the fuselage.
+- Belly: up to 4 under the fuselage, below and behind the wing root.
 - Wings: up to 4 per wing (8 in total).
 
 The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. Nose guns fire straight ahead. Wing and belly guns are angled to meet at the loadout's convergence range, 400 m by default, which you set with - and + on the Weapons page (100 to 1500 m, in 50 m steps), or turn off so they fire parallel. The Yak-3 carries a ShVAK in the spinner and two UBS above it. Changing its loadout saves a copy.
