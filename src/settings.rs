@@ -9,6 +9,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::flight_model::AircraftCard;
+use crate::weapons::{GunCard, is_builtin_gun};
 
 const SETTINGS_FILE: &str = "settings.json";
 const APP_FOLDER: &str = "WT Aim Trainer";
@@ -278,6 +279,8 @@ pub struct Settings {
     /// Preset names flown by the player and the target.
     pub player_aircraft: String,
     pub target_aircraft: String,
+    /// Saved gun presets.
+    pub guns: Vec<GunCard>,
 }
 
 impl Default for Settings {
@@ -291,6 +294,7 @@ impl Default for Settings {
             aircraft: vec![AircraftCard::yak3()],
             player_aircraft: "Yak-3".into(),
             target_aircraft: "Yak-3".into(),
+            guns: vec![GunCard::shvak(), GunCard::ubs()],
         }
     }
 }
@@ -332,6 +336,42 @@ impl Settings {
         Ok(())
     }
 
+    /// The gun preset with this name, or the built-in ShVAK.
+    pub fn gun(&self, name: &str) -> &GunCard {
+        self.guns
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or(&self.guns[0])
+    }
+
+    /// Store a gun preset. The built-in ShVAK can't be overwritten.
+    pub fn save_gun(&mut self, gun: GunCard) -> Result<(), String> {
+        if is_builtin_gun(&gun.name) {
+            return Err(format!(
+                "\"{}\" is the built-in gun and can't be changed. Give it a new name to save a copy.",
+                gun.name
+            ));
+        }
+        match self.guns.iter_mut().find(|g| g.name == gun.name) {
+            Some(existing) => *existing = gun,
+            None => self.guns.push(gun),
+        }
+        Ok(())
+    }
+
+    /// Remove a gun preset. The built-in ShVAK can't be deleted. Guns
+    /// mounted on aircraft that used it fall back to the ShVAK.
+    pub fn delete_gun(&mut self, name: &str) -> Result<(), String> {
+        if is_builtin_gun(name) {
+            return Err(format!(
+                "\"{name}\" is the built-in gun and can't be deleted."
+            ));
+        }
+        self.guns.retain(|g| g.name != name);
+        self.ensure_aircraft();
+        Ok(())
+    }
+
     /// Remove a preset. The built-in Yak-3 can't be deleted.
     pub fn delete_card(&mut self, name: &str) -> Result<(), String> {
         if is_builtin(name) {
@@ -350,6 +390,9 @@ impl Settings {
         // (older saves may hold an edited copy).
         self.aircraft.retain(|c| !is_builtin(&c.name));
         self.aircraft.insert(0, AircraftCard::yak3());
+        // Same for the built-in ShVAK gun.
+        self.guns.retain(|g| !is_builtin_gun(&g.name));
+        self.guns.insert(0, GunCard::shvak());
         let first = self.aircraft[0].name.clone();
         if !self.aircraft.iter().any(|c| c.name == self.player_aircraft) {
             self.player_aircraft = first.clone();

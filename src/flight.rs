@@ -98,6 +98,7 @@ fn spawn_player(mut commands: Commands, assets: Res<AssetServer>, settings: Res<
                     assets.load(GltfAssetLabel::Scene(0).from_asset(crate::AIRPLANE_MODEL)),
                 ),
                 crate::model_correction(),
+                crate::weapons::PlaneModel,
             ));
         });
 }
