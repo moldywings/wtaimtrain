@@ -11,6 +11,7 @@ mod hud;
 mod menu;
 mod settings;
 mod target;
+mod weapons;
 mod world;
 
 use bevy::prelude::*;
@@ -55,6 +56,7 @@ fn main() {
             target::TargetPlugin,
             hud::HudPlugin,
             menu::MenuPlugin,
+            weapons::WeaponsPlugin,
         ))
         .add_systems(OnEnter(GameState::Playing), (resume_time, capture_cursor))
         .add_systems(OnEnter(GameState::Paused), (pause_time, release_cursor))

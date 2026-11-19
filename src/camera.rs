@@ -167,9 +167,23 @@ fn follow_player(
         p.fov = current_fov(cam.zoom).to_radians();
     }
 
+    // Testing aid: WTAT_LOOK="yaw,pitch,distance" (degrees, metres) holds
+    // a fixed view of the player's plane for screenshots.
+    let mut offset = CAMERA_OFFSET;
+    if let Ok(look) = std::env::var("WTAT_LOOK") {
+        let v: Vec<f32> = look
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        cam.look_yaw = v.first().copied().unwrap_or(0.0).to_radians();
+        cam.look_pitch = v.get(1).copied().unwrap_or(0.0).to_radians();
+        if let Some(d) = v.get(2) {
+            offset = Vec3::new(0.0, 0.0, *d);
+        }
+    }
     let look = Quat::from_euler(EulerRot::YXZ, cam.look_yaw, cam.look_pitch, 0.0);
     let rot = cam.view * look;
-    tf.translation = player.translation + rot * CAMERA_OFFSET;
+    tf.translation = player.translation + rot * offset;
     tf.rotation = rot;
 }
 

@@ -17,6 +17,7 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | Input | Action |
 | --- | --- |
 | Mouse | Move the aim circle. The camera swings after it and the plane turns to follow |
+| Left click (hold) | Fire all guns |
 | Right click | Toggle zoom |
 | L Shift / L Ctrl | Throttle up / down |
 | S / W | Pitch up / down (overrides mouse aim while held) |
@@ -26,17 +27,30 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | R | Reset position |
 | Esc | Pause menu |
 
-The pause menu has two pages. **Settings** covers units (metric, imperial or nautical), mouse sensitivity, crosshair style and color (drop-down lists) and every key binding. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
+The pause menu has three pages. **Settings** covers units (metric, imperial or nautical), mouse sensitivity, crosshair style and color (drop-down lists) and every key binding. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies. **Weapons** has gun presets and each aircraft preset's loadout. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
 
-The white circle is where you're aiming. The crosshair is where the nose (and later, the guns) point. The target shows its preset name, a bracket marker and its range.
+The white circle is where you're aiming. The crosshair is where the nose points. The target shows its preset name, a bracket marker and its range. Hits and accuracy show in the top right, and "HIT" flashes when a round connects.
 
 ## Flight model
 
 The default flight model is the Yak-3. Planes are flown with physics: lift, drag, thrust, gravity, and stalls once the angle of attack is too high. Mouse aim works through an instructor that keeps you out of a stall. Holding a pitch, roll or yaw key overrides it, so you can stall the plane yourself.
 
-A preset is a stat card. It has power per engine (hp, or kgf of thrust for jets), the number of engines, climb rate, sustained turn time and top speed. Top speed altitude, mass, wing area, max lift coefficient and roll rate are optional: leave them blank and the game fills them in from typical values for the engine type and power, and the editor lists what it picked. The game solves for drag, induced drag and propeller efficiency so the plane reproduces those numbers. The editor shows a "model check" with the figures the solved model actually reaches.
+A preset is a stat card. It has power per engine (hp, or kgf of thrust for jets), the number of engines, climb rate, top speed, and the max sustained and max instantaneous turn rates, each in degrees per second at a speed (the Yak-3: 23.59 deg/s at 175 kt sustained, 41.1 deg/s at 302 kt instantaneous). The sustained turn sets the induced drag. The instantaneous turn sets the G limit and, unless you enter one, the max lift coefficient. Top speed altitude, mass, wing area, max lift coefficient and roll rate are optional: leave them blank and the game fills them in from typical values for the engine type and power, and the editor lists what it picked. The game solves for drag, induced drag and propeller efficiency so the plane reproduces those numbers. The editor shows a "model check" with the figures the solved model actually reaches.
 
 Save as many presets as you like. Saving under a new name makes a new preset and keeps the old one. The built-in Yak-3 can't be changed or deleted: edits to it are saved as a copy.
+
+## Weapons
+
+A gun preset has a name, muzzle velocity (m/s), projectile mass (kg) and fire rate (rounds per minute). Caliber and spread are optional. A blank caliber is estimated from the projectile mass, and spread defaults to 2 mils. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. The built-in gun is the 20 mm ShVAK (800 m/s, 0.1 kg, 800 rpm), and it can't be changed or deleted. The 12.7 mm UBS comes as a second preset.
+
+Each aircraft preset has a loadout with four mounting spots, and each spot can carry a different gun preset:
+
+- Nose, in the spinner: 1 gun through the propeller hub.
+- Nose, around it: up to 6, on a hexagon around the spinner gun.
+- Belly: up to 4 under the fuselage.
+- Wings: up to 4 per wing (8 in total).
+
+The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. Nose guns fire straight ahead. Wing and belly guns are angled to meet at 400 m. The Yak-3 carries a ShVAK in the spinner and two UBS above it. Changing its loadout saves a copy.
 
 ## Layout
 
@@ -48,11 +62,12 @@ Save as many presets as you like. Saving under a new name makes a new preset and
 - `src/world.rs` sets up the lighting, ground and buildings.
 - `src/settings.rs` holds units, sensitivity and key bindings, and saves them.
 - `src/menu.rs` is the pause menu.
+- `src/weapons.rs` holds gun presets, loadouts and mount positions, firing, ballistics and hit detection.
 - `assets/models/airplane.glb` is the aircraft model. It's scaled 1.33x in code to roughly match a real Yak-3.
 
 ## Roadmap
 
-1. Flight and mouse aim prototype (this step)
-2. Guns with set velocity, spread and rate of fire, bullet drop, hit detection, and saved gun presets
+1. Flight and mouse aim prototype (done)
+2. Guns with set velocity, spread and rate of fire, bullet drop, hit detection, and saved gun presets (done)
 3. Target scenarios: crossing, head-on, turning tail chase, long range
 4. Scoring and a settings menu

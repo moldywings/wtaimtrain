@@ -23,6 +23,7 @@ use crate::settings::{
     Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, Settings, Units,
     default_bindings, is_builtin, key_name,
 };
+use crate::weapons::{GunCard, Loadout, Slot, ballistics_at, is_builtin_gun};
 
 pub struct MenuPlugin;
 
@@ -67,6 +68,7 @@ enum Page {
     #[default]
     Settings,
     Aircraft,
+    Weapons,
 }
 
 /// Menu state that isn't a saved setting.
@@ -80,18 +82,27 @@ struct MenuUi {
     message: String,
     /// The drop-down list that's open, if any.
     open: Option<Dropdown>,
+    /// Weapons page: the gun preset open in the editor, its fields, the
+    /// aircraft preset whose loadout is shown, and feedback.
+    gun_editing: String,
+    gun_draft: GunDraft,
+    loadout_for: String,
+    gun_message: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dropdown {
     Crosshair,
     Color,
+    Gun(Slot),
+    LoadoutAircraft,
 }
 
 /// Scrollable lists, so their scroll position survives a menu rebuild.
 #[derive(Component, Clone, Copy)]
 enum ScrollList {
     Presets,
+    Guns,
     Dropdown,
 }
 
@@ -100,6 +111,7 @@ enum ScrollList {
 #[derive(Resource, Default)]
 struct ScrollMemory {
     presets: f32,
+    guns: f32,
     dropdown: f32,
 }
 
@@ -107,6 +119,7 @@ impl ScrollMemory {
     fn get_mut(&mut self, list: ScrollList) -> &mut f32 {
         match list {
             ScrollList::Presets => &mut self.presets,
+            ScrollList::Guns => &mut self.guns,
             ScrollList::Dropdown => &mut self.dropdown,
         }
     }
@@ -132,7 +145,10 @@ enum Field {
     Power,
     Engines,
     Climb,
-    TurnTime,
+    SustainedRate,
+    SustainedSpeed,
+    InstantRate,
+    InstantSpeed,
     TopSpeed,
     TopSpeedAltitude,
     Mass,
@@ -142,12 +158,15 @@ enum Field {
 }
 
 impl Field {
-    const ALL: [Field; 11] = [
+    const ALL: [Field; 14] = [
         Field::Name,
         Field::Power,
         Field::Engines,
         Field::Climb,
-        Field::TurnTime,
+        Field::SustainedRate,
+        Field::SustainedSpeed,
+        Field::InstantRate,
+        Field::InstantSpeed,
         Field::TopSpeed,
         Field::TopSpeedAltitude,
         Field::Mass,
@@ -170,7 +189,10 @@ impl Field {
             },
             Field::Engines => ("Engines", ""),
             Field::Climb => ("Climb rate", units.climb_unit().0),
-            Field::TurnTime => ("Sustained turn time", "s"),
+            Field::SustainedRate => ("Max sustained turn", "deg/s"),
+            Field::SustainedSpeed => ("  sustained turn speed", units.speed_unit().0),
+            Field::InstantRate => ("Max instant. turn", "deg/s"),
+            Field::InstantSpeed => ("  instantaneous turn speed", units.speed_unit().0),
             Field::TopSpeed => ("Top speed", units.speed_unit().0),
             Field::TopSpeedAltitude => ("  at altitude (optional)", units.altitude_unit().0),
             Field::Mass => ("Mass (optional)", "kg"),
@@ -202,7 +224,10 @@ impl Draft {
                 Field::Power => n(card.power, 0),
                 Field::Engines => card.engines.to_string(),
                 Field::Climb => n(card.climb_rate * clm, 1),
-                Field::TurnTime => n(card.turn_time, 1),
+                Field::SustainedRate => n(card.sustained_turn_rate, 2),
+                Field::SustainedSpeed => n(card.sustained_turn_speed * spd, 0),
+                Field::InstantRate => n(card.instant_turn_rate, 2),
+                Field::InstantSpeed => n(card.instant_turn_speed * spd, 0),
                 Field::TopSpeed => n(card.top_speed * spd, 0),
                 Field::TopSpeedAltitude => opt(card.top_speed_altitude.map(|v| v * alt), 0),
                 Field::Mass => opt(card.mass, 0),
@@ -263,21 +288,132 @@ impl Draft {
                 .round()
                 .max(1.0) as u32,
             climb_rate: num(Field::Climb, true, base.climb_rate, clm)?,
-            turn_time: num(Field::TurnTime, true, base.turn_time, 1.0)?,
+            sustained_turn_rate: num(Field::SustainedRate, true, base.sustained_turn_rate, 1.0)?,
+            sustained_turn_speed: num(Field::SustainedSpeed, true, base.sustained_turn_speed, spd)?,
+            instant_turn_rate: num(Field::InstantRate, true, base.instant_turn_rate, 1.0)?,
+            instant_turn_speed: num(Field::InstantSpeed, true, base.instant_turn_speed, spd)?,
             top_speed: num(Field::TopSpeed, true, base.top_speed, spd)?,
             top_speed_altitude: optional(Field::TopSpeedAltitude, alt)?,
             mass: optional(Field::Mass, 1.0)?,
             wing_area: optional(Field::WingArea, 1.0)?,
             cl_max: optional(Field::ClMax, 1.0)?,
             roll_rate: optional(Field::RollRate, 1.0)?,
+            weapons: base.weapons.clone(),
         };
         if card.power <= 0.0 || card.climb_rate <= 0.0 || card.top_speed <= 0.0 {
             return Err("Power, climb rate and top speed must be above zero.".into());
         }
-        if card.turn_time < 5.0 {
-            return Err("Turn time looks too short (under 5 s).".into());
+        if !(1.0..=90.0).contains(&card.sustained_turn_rate)
+            || !(1.0..=120.0).contains(&card.instant_turn_rate)
+        {
+            return Err("Turn rates are in degrees per second (a Yak-3 sustains about 24).".into());
+        }
+        if card.sustained_turn_speed < 20.0 || card.instant_turn_speed < 20.0 {
+            return Err("Give a speed for each turn rate.".into());
         }
         Ok(card)
+    }
+}
+
+/// The gun editor's fields.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum GunField {
+    Name,
+    Velocity,
+    Mass,
+    FireRate,
+    Caliber,
+    Spread,
+}
+
+impl GunField {
+    const ALL: [GunField; 6] = [
+        GunField::Name,
+        GunField::Velocity,
+        GunField::Mass,
+        GunField::FireRate,
+        GunField::Caliber,
+        GunField::Spread,
+    ];
+
+    fn index(self) -> usize {
+        GunField::ALL.iter().position(|f| *f == self).unwrap()
+    }
+
+    fn label(self) -> (&'static str, &'static str) {
+        match self {
+            GunField::Name => ("Name", ""),
+            GunField::Velocity => ("Muzzle velocity", "m/s"),
+            GunField::Mass => ("Projectile mass", "kg"),
+            GunField::FireRate => ("Fire rate", "rpm"),
+            GunField::Caliber => ("Caliber (optional)", "mm"),
+            GunField::Spread => ("Spread (optional)", "mils"),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct GunDraft {
+    fields: [String; GunField::ALL.len()],
+}
+
+impl GunDraft {
+    fn from_card(gun: &GunCard) -> GunDraft {
+        let n = |v: f32| {
+            let s = format!("{v:.3}");
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        };
+        let mut fields: [String; GunField::ALL.len()] = Default::default();
+        for f in GunField::ALL {
+            fields[f.index()] = match f {
+                GunField::Name => gun.name.clone(),
+                GunField::Velocity => n(gun.muzzle_velocity),
+                GunField::Mass => n(gun.projectile_mass),
+                GunField::FireRate => n(gun.fire_rate),
+                GunField::Caliber => gun.caliber.map(n).unwrap_or_default(),
+                GunField::Spread => gun.spread.map(n).unwrap_or_default(),
+            };
+        }
+        GunDraft { fields }
+    }
+
+    fn get(&self, f: GunField) -> &str {
+        self.fields[f.index()].trim()
+    }
+
+    fn to_card(&self) -> Result<GunCard, String> {
+        let name = self.get(GunField::Name).to_string();
+        if name.is_empty() {
+            return Err("Give the gun a name.".into());
+        }
+        let num = |f: GunField| -> Result<Option<f32>, String> {
+            let text = self.get(f);
+            if text.is_empty() {
+                return Ok(None);
+            }
+            match text.replace(',', "").parse::<f32>() {
+                Ok(v) if v.is_finite() && v > 0.0 => Ok(Some(v)),
+                _ => Err(format!(
+                    "\"{text}\" isn't a number above zero ({}).",
+                    f.label().0
+                )),
+            }
+        };
+        let need = |f: GunField| -> Result<f32, String> {
+            num(f)?.ok_or_else(|| format!("{} is needed.", f.label().0))
+        };
+        let gun = GunCard {
+            name,
+            muzzle_velocity: need(GunField::Velocity)?,
+            projectile_mass: need(GunField::Mass)?,
+            fire_rate: need(GunField::FireRate)?,
+            caliber: num(GunField::Caliber)?,
+            spread: num(GunField::Spread)?,
+        };
+        if gun.projectile_mass > 5.0 {
+            return Err("Projectile mass is in kg (a 20 mm round is about 0.1).".into());
+        }
+        Ok(gun)
     }
 }
 
@@ -301,6 +437,13 @@ enum MenuAction {
     SavePreset,
     CyclePlayerAircraft,
     CycleTargetAircraft,
+    EditGun(String),
+    NewGun,
+    DeleteGun,
+    SaveGun,
+    PickLoadoutAircraft(String),
+    PickMountGun(Slot, String),
+    MountCount(Slot, i32),
 }
 
 const PANEL_BG: Color = Color::srgba(0.08, 0.09, 0.11, 0.94);
@@ -364,14 +507,27 @@ fn open_menu(settings: Res<Settings>, mut ui: ResMut<MenuUi>) {
     ui.editing = settings.player_card().name.clone();
     ui.draft = Draft::from_card(settings.player_card(), settings.units);
     ui.message.clear();
-    // Testing aid: WTAT_PAGE=aircraft opens straight onto the aircraft page.
-    if std::env::var("WTAT_PAGE").is_ok_and(|p| p == "aircraft") {
-        ui.page = Page::Aircraft;
+    ui.gun_message.clear();
+    ui.open = None;
+    if !settings.guns.iter().any(|g| g.name == ui.gun_editing) {
+        ui.gun_editing = settings.guns[0].name.clone();
+    }
+    ui.gun_draft = GunDraft::from_card(settings.gun(&ui.gun_editing));
+    ui.loadout_for = settings.player_aircraft.clone();
+    // Testing aid: WTAT_PAGE=aircraft or weapons opens straight onto that page.
+    match std::env::var("WTAT_PAGE").as_deref() {
+        Ok("aircraft") => ui.page = Page::Aircraft,
+        Ok("weapons") => ui.page = Page::Weapons,
+        _ => {}
     }
 }
 
 /// Copy what's typed into the draft, without triggering a rebuild.
-fn sync_draft(mut ui: ResMut<MenuUi>, inputs: Query<(&Field, &EditableText)>) {
+fn sync_draft(
+    mut ui: ResMut<MenuUi>,
+    inputs: Query<(&Field, &EditableText)>,
+    gun_inputs: Query<(&GunField, &EditableText)>,
+) {
     // A click just replaced the draft (new preset, save, ...): the fields on
     // screen are stale until the rebuild, so don't copy them back.
     if ui.is_changed() {
@@ -382,6 +538,12 @@ fn sync_draft(mut ui: ResMut<MenuUi>, inputs: Query<(&Field, &EditableText)>) {
         let value = text.value().to_string();
         if ui.draft.fields[field.index()] != value {
             ui.draft.fields[field.index()] = value;
+        }
+    }
+    for (field, text) in &gun_inputs {
+        let value = text.value().to_string();
+        if ui.gun_draft.fields[field.index()] != value {
+            ui.gun_draft.fields[field.index()] = value;
         }
     }
 }
@@ -436,8 +598,11 @@ fn rebuild_menu(
                             ..default()
                         },
                     ));
-                    for (page, name) in [(Page::Settings, "Settings"), (Page::Aircraft, "Aircraft")]
-                    {
+                    for (page, name) in [
+                        (Page::Settings, "Settings"),
+                        (Page::Aircraft, "Aircraft"),
+                        (Page::Weapons, "Weapons"),
+                    ] {
                         let mut b = r.spawn(button(MenuAction::Page(page), name, px(120)));
                         if ui.page == page {
                             b.insert(Selected);
@@ -447,6 +612,7 @@ fn rebuild_menu(
                 match ui.page {
                     Page::Settings => settings_page(panel, &settings, &rebinding, &ui, &scroll),
                     Page::Aircraft => aircraft_page(panel, &settings, &ui, &scroll),
+                    Page::Weapons => weapons_page(panel, &settings, &ui, &scroll),
                 }
             });
         });
@@ -497,7 +663,7 @@ fn settings_page(
                     .iter()
                     .map(|c| Choice {
                         action: MenuAction::PickCrosshair(*c),
-                        label: c.label(),
+                        label: c.label().into(),
                         selected: *c == settings.crosshair,
                         swatch: None,
                     })
@@ -510,6 +676,7 @@ fn settings_page(
                     settings.crosshair.label(),
                     None,
                     &styles,
+                    percent(100),
                 );
 
                 col.spawn(section_header("Crosshair color"));
@@ -517,7 +684,7 @@ fn settings_page(
                     .iter()
                     .map(|c| Choice {
                         action: MenuAction::PickColor(*c),
-                        label: c.label(),
+                        label: c.label().into(),
                         selected: *c == settings.crosshair_color,
                         swatch: Some(swatch(*c)),
                     })
@@ -530,11 +697,12 @@ fn settings_page(
                     settings.crosshair_color.label(),
                     Some(swatch(settings.crosshair_color)),
                     &colors,
+                    percent(100),
                 );
 
                 col.spawn(section_header("Mouse"));
                 col.spawn(label(
-                    "Move: aim\nRight click: toggle zoom\nLeft click: shoot (coming soon)",
+                    "Move: aim\nRight click: toggle zoom\nLeft click (hold): fire",
                     15.0,
                     TEXT,
                 ));
@@ -690,10 +858,46 @@ fn aircraft_page(
                     });
                 });
                 for field in Field::ALL {
+                    // Turn rates share a row with their speed:
+                    // "Max sustained turn [23.59] deg/s at [175] kt".
+                    let speed_of = match field {
+                        Field::SustainedSpeed | Field::InstantSpeed => continue,
+                        Field::SustainedRate => Some(Field::SustainedSpeed),
+                        Field::InstantRate => Some(Field::InstantSpeed),
+                        _ => None,
+                    };
                     let (name, unit) = field.label(units, engine);
                     col.spawn(row()).with_children(|r| {
                         r.spawn((label(name, 15.0, TEXT), grow()));
-                        r.spawn(text_field(field, ui.draft.get(field)));
+                        if let Some(speed) = speed_of {
+                            r.spawn(text_field(
+                                field.index() as i32,
+                                ui.draft.get(field),
+                                field,
+                                58.0,
+                            ));
+                            r.spawn(label("deg/s at", 14.0, DIM));
+                            r.spawn(text_field(
+                                speed.index() as i32,
+                                ui.draft.get(speed),
+                                speed,
+                                52.0,
+                            ));
+                            r.spawn((
+                                label(units.speed_unit().0, 14.0, DIM),
+                                Node {
+                                    width: px(52),
+                                    ..default()
+                                },
+                            ));
+                            return;
+                        }
+                        r.spawn(text_field(
+                            field.index() as i32,
+                            ui.draft.get(field),
+                            field,
+                            150.0,
+                        ));
                         r.spawn((
                             label(unit, 14.0, DIM),
                             Node {
@@ -717,12 +921,19 @@ fn aircraft_page(
                     col.spawn(label(
                         &format!(
                             "Model check for \"{}\": top speed {:.0} {su} at {:.0} {au}, {:.0} {su} at sea level. \
-                             Climb {:.0} {cu}. Turn {:.1} s. Stalls at {:.0} {su}.",
+                             Climb {:.0} {cu}. Turns {:.1} deg/s sustained at {:.0} {su}, \
+                             {:.1} deg/s instantaneous at {:.0} {su} ({:.1} G). Best full circle {:.1} s. \
+                             Stalls at {:.0} {su}.",
                             card.name,
                             p.top_speed * sf,
                             card.extras().top_speed_altitude * af,
                             p.top_speed_sea_level * sf,
                             p.climb_rate * cf,
+                            p.sustained_turn_rate,
+                            card.sustained_turn_speed * sf,
+                            p.instant_turn_rate,
+                            card.instant_turn_speed * sf,
+                            card.instant_turn_g(),
                             p.turn_time,
                             p.stall_speed * sf,
                         ),
@@ -762,8 +973,15 @@ fn aircraft_page(
                     if (p.climb_rate - card.climb_rate).abs() > card.climb_rate * 0.05 {
                         misses.push("climb rate");
                     }
-                    if (p.turn_time - card.turn_time).abs() > card.turn_time * 0.05 {
-                        misses.push("turn time");
+                    if (p.sustained_turn_rate - card.sustained_turn_rate).abs()
+                        > card.sustained_turn_rate * 0.05
+                    {
+                        misses.push("sustained turn");
+                    }
+                    if (p.instant_turn_rate - card.instant_turn_rate).abs()
+                        > card.instant_turn_rate * 0.05
+                    {
+                        misses.push("instantaneous turn");
                     }
                     if !misses.is_empty() {
                         col.spawn(label(
@@ -781,6 +999,230 @@ fn aircraft_page(
         });
 }
 
+fn weapons_page(
+    panel: &mut ChildSpawnerCommands,
+    settings: &Settings,
+    ui: &MenuUi,
+    scroll: &ScrollMemory,
+) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: px(28),
+            ..default()
+        })
+        .with_children(|cols| {
+            // Left: gun presets and the gun editor.
+            cols.spawn((column(px(390)), TabGroup::new(0)))
+                .with_children(|col| {
+                    col.spawn(section_header(&format!(
+                        "Gun presets ({}, click to edit)",
+                        settings.guns.len()
+                    )));
+                    col.spawn((
+                        scroll_list(ScrollList::Guns, scroll.guns),
+                        Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: px(3),
+                            max_height: px(ROW_STEP * 4.5),
+                            overflow: Overflow::scroll_y(),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|list| {
+                        for gun in &settings.guns {
+                            let text = if is_builtin_gun(&gun.name) {
+                                format!("{} (built in)", gun.name)
+                            } else {
+                                gun.name.clone()
+                            };
+                            let mut b = list.spawn(button(
+                                MenuAction::EditGun(gun.name.clone()),
+                                &text,
+                                percent(100),
+                            ));
+                            b.insert(Node {
+                                width: percent(100),
+                                height: px(28),
+                                flex_shrink: 0.0,
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(px(6)),
+                                ..default()
+                            });
+                            if gun.name == ui.gun_editing {
+                                b.insert(Selected);
+                            }
+                        }
+                    });
+                    col.spawn(row()).with_children(|r| {
+                        r.spawn(button(MenuAction::NewGun, "New", percent(48)));
+                        r.spawn(button(MenuAction::DeleteGun, "Delete", percent(48)));
+                    });
+
+                    col.spawn(section_header("Gun: enter what you know"));
+                    if is_builtin_gun(&ui.gun_editing) {
+                        col.spawn(label(
+                            "Built-in gun. Your changes save as a new gun.",
+                            13.0,
+                            ACCENT,
+                        ));
+                    }
+                    for field in GunField::ALL {
+                        let (name, unit) = field.label();
+                        col.spawn(row()).with_children(|r| {
+                            r.spawn((label(name, 15.0, TEXT), grow()));
+                            r.spawn(text_field(
+                                100 + field.index() as i32,
+                                ui.gun_draft.get(field),
+                                field,
+                                150.0,
+                            ));
+                            r.spawn((
+                                label(unit, 14.0, DIM),
+                                Node {
+                                    width: px(40),
+                                    ..default()
+                                },
+                            ));
+                        });
+                    }
+                    col.spawn(button(MenuAction::SaveGun, "Save gun", percent(100)));
+                    if !ui.gun_message.is_empty() {
+                        col.spawn(label(&ui.gun_message, 14.0, ACCENT));
+                    }
+                    if let Some(gun) = settings.guns.iter().find(|g| g.name == ui.gun_editing) {
+                        let b = ballistics_at(gun, 1000.0);
+                        let mut text = format!(
+                            "\"{}\" at 1 km (sea level): {:.2} s flight, {:.0} m/s left, {:.1} m drop.",
+                            gun.name, b.time, b.speed, b.drop
+                        );
+                        let mut filled = vec![];
+                        if gun.caliber.is_none() {
+                            filled.push(format!("caliber {:.1} mm", gun.caliber_mm()));
+                        }
+                        if gun.spread.is_none() {
+                            filled.push(format!("spread {:.1} mils", gun.spread_mils()));
+                        }
+                        if !filled.is_empty() {
+                            text += &format!(" Filled in for you: {}.", filled.join(", "));
+                        }
+                        col.spawn(label(&text, 13.0, DIM));
+                    }
+                });
+
+            // Right: where the guns go on an aircraft preset.
+            cols.spawn(column(px(400))).with_children(|col| {
+                col.spawn(section_header("Loadout for aircraft preset"));
+                let aircraft: Vec<_> = settings
+                    .aircraft
+                    .iter()
+                    .map(|c| Choice {
+                        action: MenuAction::PickLoadoutAircraft(c.name.clone()),
+                        label: c.name.clone(),
+                        selected: c.name == ui.loadout_for,
+                        swatch: None,
+                    })
+                    .collect();
+                let card = settings.card(&ui.loadout_for);
+                col.spawn((Node::default(), GlobalZIndex(20)))
+                    .with_children(|w| {
+                        dropdown(
+                            w,
+                            Dropdown::LoadoutAircraft,
+                            ui,
+                            scroll,
+                            &card.name,
+                            None,
+                            &aircraft,
+                            px(400),
+                        );
+                    });
+                if is_builtin(&card.name) {
+                    col.spawn(label(
+                        "Built-in preset. Changing its guns saves a copy.",
+                        13.0,
+                        ACCENT,
+                    ));
+                }
+                let loadout = &card.weapons;
+                for slot in Slot::ALL {
+                    let mount = loadout.mount(slot);
+                    col.spawn(section_header(&format!(
+                        "{} (up to {})",
+                        slot.label(),
+                        slot.max()
+                    )));
+                    col.spawn((row(), GlobalZIndex(slot_z(slot))))
+                        .with_children(|r| {
+                            let guns: Vec<_> = settings
+                                .guns
+                                .iter()
+                                .map(|g| Choice {
+                                    action: MenuAction::PickMountGun(slot, g.name.clone()),
+                                    label: g.name.clone(),
+                                    selected: g.name == settings.gun(&mount.gun).name,
+                                    swatch: None,
+                                })
+                                .collect();
+                            dropdown(
+                                r,
+                                Dropdown::Gun(slot),
+                                ui,
+                                scroll,
+                                &settings.gun(&mount.gun).name,
+                                None,
+                                &guns,
+                                px(250),
+                            );
+                            r.spawn(button(MenuAction::MountCount(slot, -1), "-", px(36)));
+                            r.spawn((
+                                label(&mount.count.min(slot.max()).to_string(), 18.0, TEXT),
+                                Node {
+                                    width: px(30),
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                TextLayout::justify(Justify::Center),
+                            ));
+                            r.spawn(button(MenuAction::MountCount(slot, 1), "+", px(36)));
+                        });
+                }
+                let guns = loadout.guns();
+                let mass_per_s: f32 = guns
+                    .iter()
+                    .map(|(_, g, _)| {
+                        let g = settings.gun(g);
+                        g.projectile_mass * g.fire_rate / 60.0
+                    })
+                    .sum();
+                col.spawn(label(
+                    &format!(
+                        "{} guns, {:.2} kg of rounds per second. Wing and belly guns \
+                         converge at {:.0} m; nose guns fire straight ahead.",
+                        loadout.total_guns(),
+                        mass_per_s,
+                        crate::weapons::CONVERGENCE
+                    ),
+                    13.0,
+                    DIM,
+                ));
+                col.spawn(Node {
+                    flex_grow: 1.0,
+                    min_height: px(12),
+                    ..default()
+                });
+                col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
+            });
+        });
+}
+
+/// Higher rows draw over lower ones, so an open gun list covers the rows
+/// beneath it.
+fn slot_z(slot: Slot) -> i32 {
+    15 - Slot::ALL.iter().position(|s| *s == slot).unwrap_or(0) as i32
+}
+
 fn grow() -> Node {
     Node {
         flex_grow: 1.0,
@@ -788,10 +1230,10 @@ fn grow() -> Node {
     }
 }
 
-fn text_field(field: Field, value: &str) -> impl Bundle {
+fn text_field(tab: i32, value: &str, field: impl Component, width: f32) -> impl Bundle {
     (
         Node {
-            width: px(150),
+            width: px(width),
             height: px(26),
             padding: UiRect::axes(px(6), px(3)),
             border: UiRect::all(px(1)),
@@ -814,7 +1256,7 @@ fn text_field(field: Field, value: &str) -> impl Bundle {
         TextColor(TEXT),
         TextCursorStyle::default(),
         // Clicking only focuses widgets that have a tab index.
-        TabIndex(field.index() as i32),
+        TabIndex(tab),
         SelectAllOnFocus,
         field,
     )
@@ -823,7 +1265,7 @@ fn text_field(field: Field, value: &str) -> impl Bundle {
 /// One entry in a drop-down list.
 struct Choice {
     action: MenuAction,
-    label: &'static str,
+    label: String,
     selected: bool,
     swatch: Option<Color>,
 }
@@ -859,90 +1301,88 @@ fn dropdown(
     current: &str,
     current_swatch: Option<Color>,
     choices: &[Choice],
+    width: Val,
 ) {
     let open = ui.open == Some(kind);
-    col.spawn(Node {
-        width: percent(100),
-        ..default()
-    })
-    .with_children(|wrap| {
-        let mut head = wrap.spawn((
-            Button,
-            Hovered::default(),
-            MenuAction::ToggleDropdown(kind),
-            Node {
-                width: percent(100),
-                height: px(28),
-                padding: UiRect::horizontal(px(10)),
-                align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(px(6)),
-                ..default()
-            },
-            BackgroundColor(BUTTON_BG),
-        ));
-        if open {
-            head.insert(Selected);
-        }
-        head.with_children(|b| {
-            if let Some(c) = current_swatch {
-                b.spawn(color_chip(c));
+    col.spawn(Node { width, ..default() })
+        .with_children(|wrap| {
+            let mut head = wrap.spawn((
+                Button,
+                Hovered::default(),
+                MenuAction::ToggleDropdown(kind),
+                Node {
+                    width: percent(100),
+                    height: px(28),
+                    padding: UiRect::horizontal(px(10)),
+                    align_items: AlignItems::Center,
+                    border_radius: BorderRadius::all(px(6)),
+                    ..default()
+                },
+                BackgroundColor(BUTTON_BG),
+            ));
+            if open {
+                head.insert(Selected);
             }
-            b.spawn((label(current, 16.0, TEXT), grow()));
-            b.spawn(label(if open { "^" } else { "v" }, 15.0, DIM));
-        });
-
-        if !open {
-            return;
-        }
-        wrap.spawn((
-            scroll_list(ScrollList::Dropdown, scroll.dropdown),
-            Node {
-                position_type: PositionType::Absolute,
-                top: px(31),
-                left: px(0),
-                width: percent(100),
-                max_height: px(ROW_STEP * DROPDOWN_ROWS),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(3),
-                padding: UiRect::all(px(3)),
-                overflow: Overflow::scroll_y(),
-                border: UiRect::all(px(1)),
-                border_radius: BorderRadius::all(px(6)),
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.10, 0.11, 0.13)),
-            BorderColor::all(Color::srgb(0.35, 0.38, 0.44)),
-            GlobalZIndex(20),
-        ))
-        .with_children(|list| {
-            for choice in choices {
-                let mut item = list.spawn((
-                    Button,
-                    Hovered::default(),
-                    choice.action.clone(),
-                    Node {
-                        width: percent(100),
-                        height: px(28),
-                        flex_shrink: 0.0,
-                        padding: UiRect::horizontal(px(8)),
-                        align_items: AlignItems::Center,
-                        border_radius: BorderRadius::all(px(4)),
-                        ..default()
-                    },
-                    BackgroundColor(BUTTON_BG),
-                ));
-                if choice.selected {
-                    item.insert(Selected);
+            head.with_children(|b| {
+                if let Some(c) = current_swatch {
+                    b.spawn(color_chip(c));
                 }
-                item.with_children(|b| {
-                    if let Some(c) = choice.swatch {
-                        b.spawn(color_chip(c));
-                    }
-                    b.spawn(label(choice.label, 16.0, TEXT));
-                });
+                b.spawn((label(current, 16.0, TEXT), grow(), TextLayout::no_wrap()));
+                b.spawn(label(if open { "^" } else { "v" }, 15.0, DIM));
+            });
+
+            if !open {
+                return;
             }
+            wrap.spawn((
+                scroll_list(ScrollList::Dropdown, scroll.dropdown),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: px(31),
+                    left: px(0),
+                    width: percent(100),
+                    max_height: px(ROW_STEP * DROPDOWN_ROWS),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(3),
+                    padding: UiRect::all(px(3)),
+                    overflow: Overflow::scroll_y(),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(6)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.10, 0.11, 0.13)),
+                BorderColor::all(Color::srgb(0.35, 0.38, 0.44)),
+                GlobalZIndex(20),
+            ))
+            .with_children(|list| {
+                for choice in choices {
+                    let mut item = list.spawn((
+                        Button,
+                        Hovered::default(),
+                        choice.action.clone(),
+                        Node {
+                            width: percent(100),
+                            height: px(28),
+                            flex_shrink: 0.0,
+                            padding: UiRect::horizontal(px(8)),
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(4)),
+                            ..default()
+                        },
+                        BackgroundColor(BUTTON_BG),
+                    ));
+                    if choice.selected {
+                        item.insert(Selected);
+                    }
+                    item.with_children(|b| {
+                        if let Some(c) = choice.swatch {
+                            b.spawn(color_chip(c));
+                        }
+                        b.spawn(label(&choice.label, 16.0, TEXT));
+                    });
+                }
+            });
         });
-    });
 }
 
 fn scroll_list(list: ScrollList, offset: f32) -> impl Bundle {
@@ -1056,6 +1496,14 @@ fn on_menu_click(
                     Dropdown::Color => CrosshairColor::ALL
                         .iter()
                         .position(|c| *c == settings.crosshair_color),
+                    Dropdown::Gun(slot) => {
+                        let gun = &settings.card(&ui.loadout_for).weapons.mount(slot).gun;
+                        settings.guns.iter().position(|g| &g.name == gun)
+                    }
+                    Dropdown::LoadoutAircraft => settings
+                        .aircraft
+                        .iter()
+                        .position(|c| c.name == ui.loadout_for),
                 };
                 scroll.dropdown = (index.unwrap_or(0) as f32 - 2.0).max(0.0) * ROW_STEP;
             }
@@ -1149,7 +1597,130 @@ fn on_menu_click(
         MenuAction::CycleTargetAircraft => {
             settings.target_aircraft = next_name(&settings, &settings.target_aircraft);
         }
+        MenuAction::EditGun(name) => {
+            let gun = settings.gun(&name).clone();
+            ui.gun_draft = GunDraft::from_card(&gun);
+            ui.gun_editing = gun.name;
+            ui.gun_message.clear();
+        }
+        MenuAction::NewGun => {
+            let mut gun = settings.gun(&ui.gun_editing).clone();
+            gun.name = unique_gun_name(&settings, "New gun");
+            ui.gun_draft = GunDraft::from_card(&gun);
+            ui.gun_editing = gun.name;
+            ui.gun_message = "Fill in the gun's numbers, then Save gun.".into();
+        }
+        MenuAction::DeleteGun => {
+            let name = ui.gun_editing.clone();
+            let saved = settings.guns.iter().any(|g| g.name == name);
+            let result = if saved {
+                settings.delete_gun(&name)
+            } else {
+                Ok(())
+            };
+            match result {
+                Ok(()) => {
+                    let gun = settings.guns[0].clone();
+                    ui.gun_draft = GunDraft::from_card(&gun);
+                    ui.gun_editing = gun.name;
+                    ui.gun_message = if saved {
+                        format!(
+                            "Deleted \"{name}\". Mounts that used it now carry the {}.",
+                            settings.guns[0].name
+                        )
+                    } else {
+                        format!("Discarded \"{name}\".")
+                    };
+                }
+                Err(e) => ui.gun_message = e,
+            }
+        }
+        MenuAction::SaveGun => match ui.gun_draft.to_card() {
+            Ok(mut gun) => {
+                let copied = is_builtin_gun(&gun.name);
+                if copied {
+                    gun.name = unique_gun_name(&settings, &format!("{} copy", gun.name.trim()));
+                }
+                let name = gun.name.clone();
+                let replaced = settings.guns.iter().any(|g| g.name == name);
+                let old = ui.gun_editing.clone();
+                let kept_old = old != name && settings.guns.iter().any(|g| g.name == old);
+                match settings.save_gun(gun) {
+                    Ok(()) => {
+                        ui.gun_message = if copied {
+                            format!(
+                                "The ShVAK is built in, so this was saved as \"{name}\". \
+                                 Rename it and save again if you like."
+                            )
+                        } else if replaced {
+                            format!("Saved \"{name}\".")
+                        } else if kept_old {
+                            format!("Saved new gun \"{name}\". \"{old}\" is still there.")
+                        } else {
+                            format!("Saved new gun \"{name}\".")
+                        };
+                        ui.gun_draft.fields[GunField::Name.index()] = name.clone();
+                        ui.gun_editing = name;
+                    }
+                    Err(e) => ui.gun_message = e,
+                }
+            }
+            Err(e) => ui.gun_message = e,
+        },
+        MenuAction::PickLoadoutAircraft(name) => {
+            ui.loadout_for = name;
+            ui.gun_message.clear();
+        }
+        MenuAction::PickMountGun(slot, gun) => {
+            edit_loadout(&mut settings, &mut ui, |l| l.mount_mut(slot).gun = gun);
+        }
+        MenuAction::MountCount(slot, delta) => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                let m = l.mount_mut(slot);
+                m.count = (m.count as i32 + delta).clamp(0, slot.max() as i32) as u32;
+            });
+        }
     }
+}
+
+/// Change the loadout of the aircraft shown on the weapons page. The
+/// built-in Yak-3 isn't changed: a copy gets the new loadout, and if you
+/// were flying the Yak-3 you now fly the copy.
+fn edit_loadout(settings: &mut Settings, ui: &mut MenuUi, change: impl FnOnce(&mut Loadout)) {
+    let name = ui.loadout_for.clone();
+    let mut card = settings.card(&name).clone();
+    let before = card.weapons.clone();
+    change(&mut card.weapons);
+    if card.weapons == before {
+        return;
+    }
+    if is_builtin(&card.name) {
+        card.name = unique_name(settings, &format!("{} copy", card.name));
+        let flying = settings.player_aircraft == name;
+        ui.gun_message = format!(
+            "The Yak-3 is built in, so this loadout was saved on a copy, \"{}\"{}.",
+            card.name,
+            if flying { ", which you now fly" } else { "" }
+        );
+        if flying {
+            settings.player_aircraft = card.name.clone();
+        }
+        ui.loadout_for = card.name.clone();
+    }
+    if let Err(e) = settings.save_card(card) {
+        ui.gun_message = e;
+    }
+}
+
+fn unique_gun_name(settings: &Settings, base: &str) -> String {
+    let taken = |n: &str| settings.guns.iter().any(|g| g.name == n);
+    if !taken(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|i| format!("{base} {i}"))
+        .find(|n| !taken(n))
+        .unwrap()
 }
 
 fn next_name(settings: &Settings, current: &str) -> String {

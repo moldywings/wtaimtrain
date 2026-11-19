@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 pub const G: f32 = 9.81;
 const KGF: f32 = 9.80665;
 const HP: f32 = 745.7;
+/// One knot in m/s.
+pub const KT: f32 = 0.514_444;
 
 // ---------------------------------------------------------------------------
 // Stat card
@@ -39,8 +41,14 @@ pub struct AircraftCard {
     pub engines: u32,
     /// Best climb rate at sea level, m/s.
     pub climb_rate: f32,
-    /// Time for a full 360° sustained turn at sea level, seconds.
-    pub turn_time: f32,
+    /// Max sustained turn rate at sea level, degrees per second, flown at
+    /// `sustained_turn_speed` (m/s).
+    pub sustained_turn_rate: f32,
+    pub sustained_turn_speed: f32,
+    /// Max instantaneous turn rate at sea level, degrees per second, at
+    /// `instant_turn_speed` (m/s). Sets the max lift and the G limit.
+    pub instant_turn_rate: f32,
+    pub instant_turn_speed: f32,
     /// Top speed, m/s, reached at `top_speed_altitude`.
     pub top_speed: f32,
     // Optional extras. Leave them out (None) and they're estimated from
@@ -55,6 +63,8 @@ pub struct AircraftCard {
     pub cl_max: Option<f32>,
     /// Full-stick roll rate at 400 km/h, degrees per second.
     pub roll_rate: Option<f32>,
+    /// Guns and where they're mounted.
+    pub weapons: crate::weapons::Loadout,
 }
 
 /// The optional figures with every blank filled in.
@@ -82,13 +92,18 @@ impl AircraftCard {
             power: 1320.0,
             engines: 1,
             climb_rate: 4193.0 * 0.3048 / 60.0, // 4193 ft/min
-            turn_time: 17.4,
+            sustained_turn_rate: 23.59,
+            sustained_turn_speed: 175.0 * KT,
+            instant_turn_rate: 41.1,
+            instant_turn_speed: 302.0 * KT,
             top_speed: 352.0 * 0.514_444, // 352 kt
             top_speed_altitude: Some(4000.0),
             mass: Some(2464.0),
             wing_area: Some(14.83), // from 166.17 kg/m² wing loading
-            cl_max: Some(1.33),
+            // Max lift comes from the instantaneous turn instead.
+            cl_max: None,
             roll_rate: Some(140.0),
+            weapons: crate::weapons::Loadout::default(),
         }
     }
 
@@ -110,14 +125,45 @@ impl AircraftCard {
             EngineKind::Jet => (1.85, 260.0, 1.15, 150.0, 0.0),
         };
         let mass = self.mass.unwrap_or(output * kg_per_unit).max(100.0);
+        let wing_area = self.wing_area.unwrap_or(mass / wing_loading).max(1.0);
+        // The instantaneous turn is a max-lift (or G-limited) pull, so it
+        // tells us the max lift coefficient.
+        // The sustained turn needs at least that much lift too (it's often
+        // flown right at the edge of the stall).
+        let cl_needed = |rate_deg: f32, v: f32| {
+            let q = 0.5 * air_density(0.0) * v.max(10.0).powi(2);
+            load_factor(rate_deg.max(0.0).to_radians(), v) * mass * G / (q * wing_area)
+        };
+        let cl_from_turn = if self.instant_turn_rate > 0.0 && self.instant_turn_speed > 10.0 {
+            Some(
+                cl_needed(self.instant_turn_rate, self.instant_turn_speed)
+                    .max(1.02 * cl_needed(self.sustained_turn_rate, self.sustained_turn_speed)),
+            )
+        } else {
+            None
+        };
         Extras {
             top_speed_altitude: self.top_speed_altitude.unwrap_or(alt).max(0.0),
             mass,
-            wing_area: self.wing_area.unwrap_or(mass / wing_loading).max(1.0),
-            cl_max: self.cl_max.unwrap_or(cl_max).clamp(0.6, 2.5),
+            wing_area,
+            cl_max: self
+                .cl_max
+                .or(cl_from_turn)
+                .unwrap_or(cl_max)
+                .clamp(0.6, 2.5),
             roll_rate: self.roll_rate.unwrap_or(roll).max(10.0),
         }
     }
+
+    /// Load factor in the card's instantaneous turn.
+    pub fn instant_turn_g(&self) -> f32 {
+        load_factor(self.instant_turn_rate.to_radians(), self.instant_turn_speed)
+    }
+}
+
+/// Load factor for a level turn at `rate` (rad/s) and speed `v` (m/s).
+pub fn load_factor(rate: f32, v: f32) -> f32 {
+    (1.0 + (v * rate / G).powi(2)).sqrt()
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +222,10 @@ pub struct Performance {
     pub top_speed_sea_level: f32,
     /// Best sea-level climb rate, m/s.
     pub climb_rate: f32,
+    /// Sustained turn rate at the card's speed, sea level, deg/s.
+    pub sustained_turn_rate: f32,
+    /// Instantaneous turn rate at the card's speed, sea level, deg/s.
+    pub instant_turn_rate: f32,
     /// Best sustained 360° turn time at sea level, s.
     pub turn_time: f32,
     /// 1 G stall speed at sea level, m/s.
@@ -219,11 +269,13 @@ impl FlightModel {
             cl_max,
             alpha_stall: cl_max / cl_alpha,
             roll_rate: extras.roll_rate.to_radians(),
-            g_limit: 11.0,
+            // The instantaneous turn's G, but no less than a typical
+            // fighter's limit... unless the card's pull is gentler.
+            g_limit: card.instant_turn_g().clamp(4.0, 15.0),
             check: Performance::default(),
         };
         m.solve(card);
-        m.check = m.performance(extras.top_speed_altitude);
+        m.check = m.performance(card);
         m
     }
 
@@ -231,7 +283,8 @@ impl FlightModel {
     /// climb rate and turn time.
     fn solve(&mut self, card: &AircraftCard) {
         let target_climb = card.climb_rate.max(0.5);
-        let target_turn = std::f32::consts::TAU / card.turn_time.max(5.0);
+        let target_turn = card.sustained_turn_rate.max(1.0).to_radians();
+        let turn_speed = card.sustained_turn_speed.max(30.0);
         for _ in 0..30 {
             // Efficiency from climb rate (cd0 follows from top speed).
             self.efficiency = bisect(0.2, 1.5, |e| {
@@ -241,13 +294,14 @@ impl FlightModel {
                 m.best_climb(0.0) - target_climb
             });
             self.fit_cd0(card);
-            // Induced drag from sustained turn rate.
+            // Induced drag from the sustained turn: at that speed and G,
+            // thrust just balances drag.
+            let n = load_factor(target_turn, turn_speed);
             self.k = bisect(0.01, 0.6, |k| {
                 let mut m = self.clone();
                 m.k = k;
                 m.fit_cd0(card);
-                // More induced drag means a slower turn, so flip the sign.
-                target_turn - m.best_sustained_turn_rate(0.0)
+                m.drag(turn_speed, 0.0, n) - m.thrust(turn_speed, 0.0, 1.0)
             });
             self.fit_cd0(card);
         }
@@ -319,6 +373,33 @@ impl FlightModel {
         best
     }
 
+    /// Sustained turn rate (rad/s) at speed `v` and altitude `h`: the
+    /// tightest turn where thrust still equals drag.
+    pub fn sustained_turn_rate_at(&self, v: f32, h: f32) -> f32 {
+        let q = 0.5 * air_density(h) * v * v;
+        let s = self.wing_area;
+        let t = self.thrust(v, h, 1.0);
+        let cl_thrust = ((t / (q * s) - self.cd0) / self.k).max(0.0).sqrt();
+        let n = (cl_thrust.min(self.cl_max) * q * s / (self.mass * G)).min(self.g_limit);
+        if n > 1.0 {
+            G * (n * n - 1.0).sqrt() / v
+        } else {
+            0.0
+        }
+    }
+
+    /// Instantaneous turn rate (rad/s) at speed `v` and altitude `h`: max
+    /// lift or the G limit, whichever comes first.
+    pub fn instant_turn_rate_at(&self, v: f32, h: f32) -> f32 {
+        let q = 0.5 * air_density(h) * v * v;
+        let n = (self.cl_max * q * self.wing_area / (self.mass * G)).min(self.g_limit);
+        if n > 1.0 {
+            G * (n * n - 1.0).sqrt() / v
+        } else {
+            0.0
+        }
+    }
+
     /// Best sustained turn rate (rad/s) at altitude `h`.
     pub fn best_sustained_turn_rate(&self, h: f32) -> f32 {
         let rho = air_density(h);
@@ -346,9 +427,16 @@ impl FlightModel {
         bisect(lo, 400.0, |v| self.thrust(v, h, 1.0) - self.drag(v, h, 1.0))
     }
 
-    pub fn performance(&self, top_speed_altitude: f32) -> Performance {
+    pub fn performance(&self, card: &AircraftCard) -> Performance {
+        let top_speed_altitude = card.extras().top_speed_altitude;
         let turn = self.best_sustained_turn_rate(0.0);
         Performance {
+            sustained_turn_rate: self
+                .sustained_turn_rate_at(card.sustained_turn_speed.max(30.0), 0.0)
+                .to_degrees(),
+            instant_turn_rate: self
+                .instant_turn_rate_at(card.instant_turn_speed.max(30.0), 0.0)
+                .to_degrees(),
             top_speed: self.top_speed(top_speed_altitude),
             top_speed_sea_level: self.top_speed(0.0),
             climb_rate: self.best_climb(0.0),
@@ -771,19 +859,30 @@ mod tests {
         let m = FlightModel::from_card(&card);
         let p = m.check;
         println!(
-            "eff {:.3} cd0 {:.4} k {:.4} | top {:.0} km/h @4000, {:.0} km/h SL | climb {:.1} m/s | turn {:.1} s | stall {:.0} km/h",
+            "eff {:.3} cd0 {:.4} k {:.4} clmax {:.2} glim {:.1} | top {:.0} km/h @4000, {:.0} km/h SL | climb {:.1} m/s | sust {:.2} deg/s, inst {:.1} deg/s, best 360 {:.1} s | stall {:.0} km/h",
             m.efficiency,
             m.cd0,
             m.k,
+            m.cl_max,
+            m.g_limit,
             kmh(p.top_speed),
             kmh(p.top_speed_sea_level),
             p.climb_rate,
+            p.sustained_turn_rate,
+            p.instant_turn_rate,
             p.turn_time,
             kmh(p.stall_speed)
         );
         assert!((p.top_speed - card.top_speed).abs() < 3.0, "top speed");
         assert!((p.climb_rate - card.climb_rate).abs() < 0.5, "climb");
-        assert!((p.turn_time - card.turn_time).abs() < 0.5, "turn time");
+        assert!(
+            (p.sustained_turn_rate - card.sustained_turn_rate).abs() < 0.3,
+            "sustained turn"
+        );
+        assert!(
+            (p.instant_turn_rate - card.instant_turn_rate).abs() < 0.5,
+            "instant turn"
+        );
         assert!(m.cd0 > 0.01 && m.cd0 < 0.05, "cd0 plausible");
     }
 
@@ -983,7 +1082,8 @@ mod tests {
         assert!(e.mass > 2000.0 && e.mass < 3000.0);
         assert!(e.wing_area > 11.0 && e.wing_area < 18.0);
         let m = FlightModel::from_card(&card);
-        assert!((m.check.turn_time - card.turn_time).abs() < 0.6);
+        assert!((m.check.sustained_turn_rate - card.sustained_turn_rate).abs() < 0.5);
+        assert!((m.check.instant_turn_rate - card.instant_turn_rate).abs() < 0.5);
         assert!((m.check.climb_rate - card.climb_rate).abs() < 0.6);
     }
 
@@ -995,13 +1095,17 @@ mod tests {
             power: 2700.0,
             engines: 1,
             climb_rate: 45.0,
-            turn_time: 22.0,
+            sustained_turn_rate: 16.0,
+            sustained_turn_speed: 450.0 / 3.6,
+            instant_turn_rate: 22.0,
+            instant_turn_speed: 600.0 / 3.6,
             top_speed: 1050.0 / 3.6,
             top_speed_altitude: None,
             mass: None,
             wing_area: None,
             cl_max: None,
             roll_rate: None,
+            weapons: Default::default(),
         };
         let m = FlightModel::from_card(&card);
         println!("jet {:?}", m.check);

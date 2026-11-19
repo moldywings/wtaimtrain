@@ -45,6 +45,15 @@ const START_AHEAD: f32 = 1_200.0;
 impl Target {
     pub fn reset(&mut self, aircraft: &mut Aircraft) {
         *self = Target::default();
+        // Testing aid: WTAT_EASY_TARGET=1 puts the target 250 m dead ahead,
+        // flying straight, so a test run can check hits.
+        if std::env::var("WTAT_EASY_TARGET").is_ok() {
+            self.turn_rate = 0.0;
+            self.altitude = START_ALTITUDE;
+            let speed = START_SPEED_FRACTION * aircraft.model.top_speed(self.altitude);
+            aircraft.body = Body::new(Vec3::new(0.0, self.altitude, -250.0), Quat::IDENTITY, speed);
+            return;
+        }
         let speed = START_SPEED_FRACTION * aircraft.model.top_speed(self.altitude);
         aircraft.body = Body::new(
             Vec3::new(0.0, self.altitude, -START_AHEAD),
@@ -74,11 +83,15 @@ fn spawn_target(mut commands: Commands, assets: Res<AssetServer>, settings: Res<
                     assets.load(GltfAssetLabel::Scene(0).from_asset(crate::AIRPLANE_MODEL)),
                 ),
                 crate::model_correction(),
+                crate::weapons::PlaneModel,
             ));
         });
 }
 
-fn fly_target(time: Res<Time>, mut targets: Query<(&mut Transform, &mut Aircraft, &mut Target)>) {
+pub fn fly_target(
+    time: Res<Time>,
+    mut targets: Query<(&mut Transform, &mut Aircraft, &mut Target)>,
+) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
