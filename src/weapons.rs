@@ -13,7 +13,7 @@ use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
 use crate::settings::Settings;
 use crate::sound::{self, Sounds};
-use crate::target::Target;
+use crate::target::{Target, TargetHit};
 
 /// Path of the gun model, relative to `assets/`.
 pub const GUN_MODEL: &str = "models/gun.glb";
@@ -40,6 +40,9 @@ pub struct GunCard {
     pub spread: Option<f32>,
     /// Color of the tracer.
     pub tracer: TracerColor,
+    /// Optional: hits from this gun that destroy an aircraft. Estimated
+    /// from the caliber when blank.
+    pub hits_to_kill: Option<f32>,
 }
 
 /// Tracer colors to pick from.
@@ -120,6 +123,7 @@ impl GunCard {
             caliber: Some(20.0),
             spread: None,
             tracer: TracerColor::Orange,
+            hits_to_kill: None,
         }
     }
 
@@ -133,6 +137,7 @@ impl GunCard {
             caliber: Some(12.7),
             spread: None,
             tracer: TracerColor::Red,
+            hits_to_kill: None,
         }
     }
 
@@ -145,6 +150,16 @@ impl GunCard {
 
     pub fn spread_mils(&self) -> f32 {
         self.spread.unwrap_or(DEFAULT_SPREAD)
+    }
+
+    /// Hits needed to destroy an aircraft. Left blank, it comes from the
+    /// caliber: about 6 for 20 mm, 16 for 12.7 mm, 50 for 7.62 mm and 2
+    /// for 37 mm.
+    pub fn hits_to_destroy(&self) -> u32 {
+        let hits = self
+            .hits_to_kill
+            .unwrap_or_else(|| 6.0 * (20.0 / self.caliber_mm().max(3.0)).powf(2.2));
+        (hits.round() as u32).max(1)
     }
 
     /// Drag factor: deceleration = factor * air density * speed².
@@ -184,6 +199,49 @@ pub fn ballistics_at(gun: &GunCard, range: f32) -> Ballistics {
         speed: v.length(),
         drop: -p.y,
     }
+}
+
+/// Which way to point a gun so its rounds meet a target flying straight
+/// on: the shooter's own speed, gravity and drag (at the shooter's height)
+/// all count. `None` if the target is out of reach.
+pub fn lead_direction(
+    gun: &GunCard,
+    shooter: Vec3,
+    shooter_vel: Vec3,
+    target: Vec3,
+    target_vel: Vec3,
+) -> Option<Vec3> {
+    const H: f32 = 1.0 / 240.0;
+    let rho = air_density(shooter.y.max(0.0));
+    let drag = gun.drag_factor();
+    let mut aim_at = target;
+    let mut dir = (aim_at - shooter).normalize_or_zero();
+    if dir == Vec3::ZERO {
+        return None;
+    }
+    for _ in 0..5 {
+        let mut v = shooter_vel + dir * gun.muzzle_velocity;
+        let mut p = shooter;
+        let mut t = 0.0;
+        // Fly the round until it's as far out as the target is then.
+        loop {
+            let tp = target + target_vel * t;
+            let line = tp - shooter;
+            let reach = line.length();
+            if (p - shooter).dot(line) >= reach * reach {
+                aim_at += tp - p;
+                break;
+            }
+            if t > 6.0 || (p - shooter).length() > BULLET_RANGE {
+                return None;
+            }
+            v += (Vec3::NEG_Y * 9.81 - v * v.length() * rho * drag) * H;
+            p += v * H;
+            t += H;
+        }
+        dir = (aim_at - shooter).normalize_or(dir);
+    }
+    Some(dir)
 }
 
 pub fn is_builtin_gun(name: &str) -> bool {
@@ -431,6 +489,8 @@ struct ShownGuns(Vec<(Vec3, f32)>);
 #[derive(Resource)]
 struct WeaponAssets {
     tracer_mesh: Handle<Mesh>,
+    /// A flat card that always faces the camera, for the glow.
+    glow_mesh: Handle<Mesh>,
     /// Per color: the bright core and the soft glow around it.
     tracer_materials: HashMap<TracerColor, (Handle<StandardMaterial>, Handle<StandardMaterial>)>,
     spark_mesh: Handle<Mesh>,
@@ -442,10 +502,17 @@ fn setup_assets(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     assets: Res<AssetServer>,
 ) {
+    let glow_texture = images.add(glow_image());
     commands.insert_resource(WeaponAssets {
-        tracer_mesh: meshes.add(Cuboid::new(TRACER_WIDTH, TRACER_WIDTH, 1.0)),
+        // A round streak, lying along -Z.
+        tracer_mesh: meshes.add(
+            Mesh::from(Cylinder::new(TRACER_WIDTH * 0.5, 1.0))
+                .rotated_by(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+        ),
+        glow_mesh: meshes.add(Rectangle::new(1.0, 1.0)),
         // A hot, nearly white core inside a soft additive glow of the
         // tracer's color.
         tracer_materials: TracerColor::ALL
@@ -463,7 +530,10 @@ fn setup_assets(
                         }),
                         materials.add(StandardMaterial {
                             base_color: Color::srgba(rgb.x, rgb.y, rgb.z, TRACER_GLOW),
+                            base_color_texture: Some(glow_texture.clone()),
                             unlit: true,
+                            double_sided: true,
+                            cull_mode: None,
                             alpha_mode: AlphaMode::Add,
                             ..default()
                         }),
@@ -607,6 +677,8 @@ struct Bullet {
     traveled: f32,
     size: f32,
     drag: f32,
+    /// Share of a plane's health one hit takes.
+    damage: f32,
 }
 
 #[derive(Component)]
@@ -692,6 +764,7 @@ fn fire_guns(
             let early = -gun.cooldown;
             let position = muzzle + velocity * early;
             let size = tracer_size(gun.card.caliber_mm());
+            let (core_tf, glow_tf) = tracer_shape(position, velocity, camera.translation(), size);
             let (core, glow) = weapon_assets
                 .tracer_materials
                 .get(&gun.card.tracer)
@@ -704,16 +777,25 @@ fn fire_guns(
                     age: early,
                     traveled: 0.0,
                     drag: gun.card.drag_factor(),
+                    damage: 1.0 / gun.card.hits_to_destroy() as f32,
                     size,
                 },
-                tracer_transform(position, velocity, camera.translation(), size),
-                Mesh3d(weapon_assets.tracer_mesh.clone()),
-                MeshMaterial3d(core),
-                children![(
-                    Mesh3d(weapon_assets.tracer_mesh.clone()),
-                    MeshMaterial3d(glow),
-                    Transform::from_scale(Vec3::new(3.0, 3.0, 1.15)),
-                )],
+                Transform::from_translation(position),
+                Visibility::default(),
+                children![
+                    (
+                        TracerCore,
+                        Mesh3d(weapon_assets.tracer_mesh.clone()),
+                        MeshMaterial3d(core),
+                        core_tf,
+                    ),
+                    (
+                        TracerGlow,
+                        Mesh3d(weapon_assets.glow_mesh.clone()),
+                        MeshMaterial3d(glow),
+                        glow_tf,
+                    )
+                ],
             ));
             stats.shots += 1;
             gun.cooldown += gun.card.interval();
@@ -744,26 +826,78 @@ fn tracer_size(caliber_mm: f32) -> f32 {
     (caliber_mm / 20.0).clamp(0.3, 3.0)
 }
 
-/// A tracer is drawn as a glowing streak trailing the round. Far away it's
-/// widened to stay about two pixels wide, like tracers in the game.
-fn tracer_transform(position: Vec3, velocity: Vec3, camera: Vec3, size: f32) -> Transform {
+#[derive(Component)]
+struct TracerCore;
+
+#[derive(Component)]
+struct TracerGlow;
+
+/// How a tracer is drawn, relative to the round's own position: a thin
+/// round streak trailing it, and a soft glow card around the streak that
+/// turns to face the camera.
+fn tracer_shape(position: Vec3, velocity: Vec3, camera: Vec3, size: f32) -> (Transform, Transform) {
     let dist = position.distance(camera);
     // Close up: true to caliber. Far off: a minimum on-screen width, still
     // thicker for bigger rounds.
-    let width = size.max(dist * 0.0022 * size.sqrt() / TRACER_WIDTH);
-    let len = (velocity.length() * 0.012)
-        .clamp(2.0, 10.0)
-        .max(dist * 0.02);
+    let width = size.max(dist * 0.0018 * size.sqrt() / TRACER_WIDTH);
+    let len = (velocity.length() * 0.008).clamp(1.5, 7.0).max(dist * 0.02);
     let dir = velocity.normalize_or(Vec3::NEG_Z);
-    Transform::from_translation(position - dir * len * 0.5)
+    let center = -dir * len * 0.5;
+    let core = Transform::from_translation(center)
         .looking_to(dir, Vec3::Y)
-        .with_scale(Vec3::new(width, width, len))
+        .with_scale(Vec3::new(width, width, len));
+    // The glow card: its Y along the streak, its face toward the camera.
+    let to_eye = camera - (position + center);
+    let face = (to_eye - dir * to_eye.dot(dir)).normalize_or(Vec3::Y.any_orthonormal_vector());
+    let side = dir.cross(face);
+    let glow_w = width * TRACER_WIDTH * GLOW_WIDTH;
+    let glow = Transform {
+        translation: center,
+        rotation: Quat::from_mat3(&Mat3::from_cols(side, dir, face)),
+        scale: Vec3::new(glow_w, len + glow_w, 1.0),
+    };
+    (core, glow)
+}
+
+/// The glow's texture: a soft-edged, rounded streak (white, with the shape
+/// in alpha), brightest along the middle and fading out to nothing.
+fn glow_image() -> Image {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    const W: usize = 32;
+    const H: usize = 128;
+    let mut data = Vec::with_capacity(W * H * 4);
+    for y in 0..H {
+        for x in 0..W {
+            // -1..1 across and along the streak.
+            let u = (x as f32 + 0.5) / W as f32 * 2.0 - 1.0;
+            let v = (y as f32 + 0.5) / H as f32 * 2.0 - 1.0;
+            // Distance from the middle line, with rounded ends.
+            let along = (v.abs() - 0.75).max(0.0) / 0.25;
+            let d = (u * u + along * along).sqrt();
+            let a = ((-d * d * 3.0).exp() * (1.0 - d * d).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            data.extend_from_slice(&[255, 255, 255, (a * 255.0) as u8]);
+        }
+    }
+    Image::new(
+        Extent3d {
+            width: W as u32,
+            height: H as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 /// Tracer thickness for a 20 mm round, m.
-const TRACER_WIDTH: f32 = 0.12;
+const TRACER_WIDTH: f32 = 0.05;
+/// The glow is this many times wider than the streak.
+const GLOW_WIDTH: f32 = 6.0;
 /// Strength of the glow around a tracer (0 to 1).
-const TRACER_GLOW: f32 = 0.35;
+const TRACER_GLOW: f32 = 0.8;
 
 /// The target's pose at the start of the frame, so bullets can be tested
 /// against where it actually was during the frame.
@@ -849,8 +983,27 @@ fn fly_bullets(
     mut stats: ResMut<HitStats>,
     sounds: Res<Sounds>,
     mut last_hit_sound: Local<f32>,
-    mut bullets: Query<(Entity, &mut Bullet, &mut Transform), Without<Target>>,
-    targets: Query<(Entity, &Transform, &PrevPose), With<Target>>,
+    mut bullets: Query<(Entity, &mut Bullet, &mut Transform, &Children), Without<Target>>,
+    mut cores: Query<
+        &mut Transform,
+        (
+            With<TracerCore>,
+            Without<TracerGlow>,
+            Without<Bullet>,
+            Without<Target>,
+        ),
+    >,
+    mut glows: Query<
+        &mut Transform,
+        (
+            With<TracerGlow>,
+            Without<TracerCore>,
+            Without<Bullet>,
+            Without<Target>,
+        ),
+    >,
+    targets: Query<(Entity, &Transform, &PrevPose, &Target)>,
+    mut hit_messages: MessageWriter<TargetHit>,
     camera: Single<&GlobalTransform, With<Camera3d>>,
 ) {
     let eye = camera.translation();
@@ -859,9 +1012,12 @@ fn fly_bullets(
         return;
     }
     let h = dt / BULLET_SUBSTEPS as f32;
-    let poses: Vec<(Entity, Transform, Transform)> =
-        targets.iter().map(|(e, tf, p)| (e, p.0, *tf)).collect();
-    'bullets: for (entity, mut bullet, mut tf) in &mut bullets {
+    let poses: Vec<(Entity, Transform, Transform)> = targets
+        .iter()
+        .filter(|(_, _, _, t)| !t.destroyed())
+        .map(|(e, tf, p, _)| (e, p.0, *tf))
+        .collect();
+    'bullets: for (entity, mut bullet, mut tf, children) in &mut bullets {
         let mut pos = bullet.position;
         for i in 0..BULLET_SUBSTEPS {
             let start = pos;
@@ -883,6 +1039,9 @@ fn fly_bullets(
                     .reduce(f32::min);
                 if let Some(t) = hit {
                     stats.hits += 1;
+                    hit_messages.write(TargetHit {
+                        damage: bullet.damage,
+                    });
                     stats.last_hit = real.elapsed_secs();
                     // A hit sound, up to about 15 a second.
                     if stats.last_hit - *last_hit_sound > 0.065 {
@@ -911,7 +1070,15 @@ fn fly_bullets(
             commands.entity(entity).despawn();
             continue;
         }
-        *tf = tracer_transform(pos, bullet.velocity, eye, bullet.size);
+        tf.translation = pos;
+        let (core, glow) = tracer_shape(pos, bullet.velocity, eye, bullet.size);
+        for c in children {
+            if let Ok(mut t) = cores.get_mut(*c) {
+                *t = core;
+            } else if let Ok(mut t) = glows.get_mut(*c) {
+                *t = glow;
+            }
+        }
     }
 }
 
@@ -1011,6 +1178,33 @@ fn update_hit_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lead_points_ahead_of_a_crossing_target_and_above_for_drop() {
+        let gun = GunCard::shvak();
+        // Still target 600 m ahead: aim a little high.
+        let d = lead_direction(
+            &gun,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -600.0),
+            Vec3::ZERO,
+        )
+        .unwrap();
+        assert!(d.y > 0.0 && d.y < 0.02, "{d}");
+        // Crossing left to right at 120 m/s: aim to the right of it.
+        let d = lead_direction(
+            &gun,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -400.0),
+            Vec3::new(120.0, 0.0, 0.0),
+        )
+        .unwrap();
+        let lead_deg = d.x.atan2(-d.z).to_degrees();
+        println!("lead {lead_deg:.2} deg");
+        assert!(lead_deg > 6.0 && lead_deg < 12.0);
+    }
 
     #[test]
     fn mount_counts_and_symmetry() {

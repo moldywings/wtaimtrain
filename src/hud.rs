@@ -35,6 +35,13 @@ struct TargetMarker;
 #[derive(Component)]
 struct TargetName;
 
+/// Where to point the guns to hit the target.
+#[derive(Component)]
+struct LeadMarker;
+
+const LEAD_SIZE: f32 = 18.0;
+const LEAD_COLOR: Color = Color::srgb(0.55, 1.0, 0.55);
+
 #[derive(Component)]
 struct TargetRange;
 
@@ -144,6 +151,17 @@ fn spawn_hud(mut commands: Commands) {
         Visibility::Hidden,
         GunCrosshair,
     ));
+
+    commands
+        .spawn((
+            absolute(LEAD_SIZE, LEAD_SIZE),
+            Visibility::Hidden,
+            LeadMarker,
+        ))
+        .with_children(|m| {
+            m.spawn(ring(LEAD_SIZE, LEAD_SIZE, 2.0, LEAD_COLOR));
+            m.spawn(dot(LEAD_SIZE, 4.0, LEAD_COLOR));
+        });
 
     // Target marker: red name, bracket diamond with a red dot, red range.
     commands
@@ -338,13 +356,14 @@ fn update_hud(
     cursor: Single<&CursorOptions>,
     camera: Single<(&Camera, &GlobalTransform), With<ChaseCamera>>,
     player: Single<(&GlobalTransform, &Aircraft), With<Player>>,
-    target: Single<(&GlobalTransform, &Aircraft), With<Target>>,
+    target: Single<(&GlobalTransform, &Aircraft, &Target)>,
     mut nodes: ParamSet<(
         Single<(&mut Node, &mut Visibility), With<AimCircle>>,
         Single<(&mut Node, &mut Visibility), With<GunCrosshair>>,
         Single<(&mut Node, &mut Visibility), With<TargetMarker>>,
         Single<&mut Visibility, With<StallWarning>>,
         Single<&mut Visibility, With<HelpText>>,
+        Single<(&mut Node, &mut Visibility), With<LeadMarker>>,
     )>,
     mut texts: ParamSet<(
         Single<&mut Text, With<TargetName>>,
@@ -354,7 +373,7 @@ fn update_hud(
 ) {
     let (cam, cam_tf) = *camera;
     let (player_tf, plane) = *player;
-    let (target_tf, target_plane) = *target;
+    let (target_tf, target_plane, target_state) = *target;
     let units = settings.units;
     let project = |world: Vec3| -> Option<Vec2> {
         // Behind the camera means not on screen.
@@ -385,9 +404,36 @@ fn update_hud(
     let range = player_tf.translation().distance(target_pos);
     place(
         nodes.p2().into_inner(),
-        project(target_pos),
+        project(target_pos).filter(|_| !target_state.destroyed()),
         Vec2::new(MARKER_WIDTH / 2.0, NAME_HEIGHT + DIAMOND_BOX / 2.0),
     );
+    // Lead indicator, worked out for the biggest gun on the plane.
+    let lead = settings
+        .lead_indicator
+        .then(|| {
+            plane
+                .card
+                .weapons
+                .guns()
+                .iter()
+                .map(|(_, g, _)| settings.gun(g))
+                .max_by(|a, b| a.caliber_mm().total_cmp(&b.caliber_mm()))
+                .cloned()
+        })
+        .flatten()
+        .filter(|_| !target_state.destroyed())
+        .and_then(|gun| {
+            crate::weapons::lead_direction(
+                &gun,
+                player_tf.translation(),
+                plane.body.velocity,
+                target_pos,
+                target_plane.body.velocity,
+            )
+        })
+        .and_then(|dir| project(player_tf.translation() + dir * 2_000.0));
+    place(nodes.p5().into_inner(), lead, Vec2::splat(LEAD_SIZE / 2.0));
+
     texts.p0().0 = target_plane.model.name.clone();
     texts.p1().0 = units.range(range);
 

@@ -24,12 +24,22 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | A / D | Roll left / right |
 | Q / E | Yaw left / right |
 | L Alt (hold) | Free look |
-| R | Reset position |
+| R | Restart the scenario |
 | Esc | Pause menu |
 
-The pause menu has three pages. **Settings** covers units (metric, imperial or nautical), mouse sensitivity, crosshair style and color (drop-down lists) and every key binding. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies. **Weapons** has gun presets and each aircraft preset's loadout. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
+The pause menu has four pages. **Settings** covers units (metric, imperial or nautical), mouse sensitivity, crosshair style and color, the lead indicator, and every key binding. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies from drop-down lists. **Weapons** has gun presets and each aircraft preset's loadout. **Scenario** picks what you practice. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
 
-The white circle is where you're aiming. The crosshair is where the nose points. The target shows its preset name, a bracket marker and its range. Hits and accuracy show in the top right, and "HIT" flashes when a round connects.
+The white circle is where you're aiming. The crosshair is where the nose points. The target shows its preset name, a bracket marker and its range. Hits and accuracy show in the top right, and "HIT" flashes when a round connects. With the lead indicator on, a green circle shows where to put your gun crosshair to hit the target. It's worked out for the biggest gun on your plane, counting your speed, the target's speed, bullet drop and drag.
+
+## Scenarios
+
+- **Head on:** you fly straight at each other. The target holds a straight line at a random speed, from a slightly different height and toward a different point near you each time.
+- **Chase:** you start behind the target, a random distance between the two you set (300 to 800 m by default). It keeps its heading but weaves and dodges: some runs hard, some gently, some not at all.
+- **Stall:** the target starts just above and ahead of you and pulls straight up, rolling and dodging.
+- **Dogfight:** the target starts close by at a random spot, height and speed, and tries to ram you.
+- **All in one:** a random one of the others each time.
+
+When the target takes enough hits it's destroyed, with a sound and a "TARGET DESTROYED" notice, and the scenario restarts 2 seconds later. It also restarts when a plane crashes, the planes collide, the target gets more than 4 km away, a head-on pass is over, or you press R.
 
 ## Flight model
 
@@ -41,7 +51,7 @@ Save as many presets as you like. Saving under a new name makes a new preset and
 
 ## Weapons
 
-A gun preset has a name, muzzle velocity (m/s), projectile mass (kg), fire rate (rounds per minute) and tracer color. Caliber and spread are optional. A blank caliber is estimated from the projectile mass, and spread defaults to 2 mils. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. Tracers glow, get bigger with caliber, and disappear after 2.5 miles (about 4 km).
+A gun preset has a name, muzzle velocity (m/s), projectile mass (kg), fire rate (rounds per minute) and tracer color. Caliber, spread and hits to kill are optional. A blank caliber is estimated from the projectile mass, spread defaults to 2 mils, and hits to kill comes from the caliber (about 6 for 20 mm, 16 for 12.7 mm, 50 for 7.62 mm). Hits from different guns add up: each takes its share of the target's health. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. Tracers are thin round streaks with a soft glow, get bigger with caliber, and disappear after 2.5 miles (about 4 km).
 
 Gunshots and hits have sounds made in code, with no sound files. Small, fast rounds crack higher and big, slow ones boom lower. The built-in gun is the 20 mm ShVAK (800 m/s, 0.1 kg, 800 rpm), and it can't be changed or deleted. The 12.7 mm UBS comes as a second preset.
 
@@ -59,7 +69,7 @@ The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. 
 - `src/camera.rs` handles mouse aim and the chase camera.
 - `src/flight_model.rs` holds the stat card, the solver that fills in the blanks, the physics, and the mouse aim instructor.
 - `src/flight.rs` is the player plane: keyboard and mouse input, and applying presets.
-- `src/target.rs` flies the target aircraft.
+- `src/target.rs` runs the scenarios: it places both planes, flies the target, counts damage and restarts runs.
 - `src/hud.rs` draws the aim circle, nose marker, target box and flight readout.
 - `src/world.rs` sets up the lighting, ground and buildings.
 - `src/settings.rs` holds units, sensitivity and key bindings, and saves them.
@@ -72,5 +82,5 @@ The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. 
 
 1. Flight and mouse aim prototype (done)
 2. Guns with set velocity, spread and rate of fire, bullet drop, hit detection, and saved gun presets (done)
-3. Target scenarios: crossing, head-on, turning tail chase, long range
+3. Target scenarios: head on, chase, stall, dogfight (done)
 4. Scoring and a settings menu

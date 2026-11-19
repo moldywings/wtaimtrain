@@ -23,12 +23,14 @@ impl Plugin for SoundPlugin {
 pub struct Sounds {
     guns: HashMap<(u32, u32), Handle<AudioSource>>,
     hit: Handle<AudioSource>,
+    kill: Handle<AudioSource>,
 }
 
 fn setup_sounds(mut commands: Commands, mut sources: ResMut<Assets<AudioSource>>) {
     commands.insert_resource(Sounds {
         guns: HashMap::new(),
         hit: sources.add(source(&hit_samples())),
+        kill: sources.add(source(&kill_samples())),
     });
 }
 
@@ -49,6 +51,10 @@ impl Sounds {
 
     pub fn hit(&self) -> Handle<AudioSource> {
         self.hit.clone()
+    }
+
+    pub fn kill(&self) -> Handle<AudioSource> {
+        self.kill.clone()
     }
 }
 
@@ -148,6 +154,47 @@ pub fn hit_samples() -> Vec<f32> {
     out
 }
 
+/// Target destroyed: a deep boom under a bright rising three-note chime
+/// (a major arpeggio of bell-like tones), so a kill sounds like a reward.
+pub fn kill_samples() -> Vec<f32> {
+    let len = 1.3;
+    let n = (len * RATE as f32) as usize;
+    let mut out = Vec::with_capacity(n);
+    let mut noise = Noise(0x2545_F491);
+    let dt = 1.0 / RATE as f32;
+    let tau = std::f32::consts::TAU;
+    let (mut lp, mut lp2) = (0.0f32, 0.0f32);
+    // A5, C#6, E6, each struck a little after the last.
+    let notes = [(880.0f32, 0.0f32), (1108.7, 0.09), (1318.5, 0.18)];
+    for i in 0..n {
+        let t = i as f32 * dt;
+        // Boom: low-passed noise and a falling sine.
+        let w = noise.next();
+        lp += (w - lp) * 0.04;
+        lp2 += (lp - lp2) * 0.04;
+        let boom = lp2 * 6.0 * (-t / 0.35).exp()
+            + (tau * (45.0 + 70.0 * (-t / 0.08).exp()) * t).sin() * 0.7 * (-t / 0.4).exp();
+        // Chime: each note a bell (fundamental plus a soft octave and a
+        // slightly sharp upper partial), with a quick attack.
+        let mut chime = 0.0;
+        for (f, start) in notes {
+            let u = t - start;
+            if u < 0.0 {
+                continue;
+            }
+            let env = (u / 0.004).min(1.0) * (-u / 0.45).exp();
+            chime += env
+                * ((tau * f * u).sin()
+                    + 0.35 * (tau * 2.0 * f * u).sin() * (-u / 0.15).exp()
+                    + 0.15 * (tau * 2.76 * f * u).sin() * (-u / 0.08).exp());
+        }
+        let attack = (t / 0.001).min(1.0);
+        out.push((boom * 0.8 + chime * 0.45) * attack);
+    }
+    normalize(&mut out, 0.9);
+    out
+}
+
 fn normalize(samples: &mut [f32], peak: f32) {
     let max = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     if max > 0.0 {
@@ -224,5 +271,10 @@ mod tests {
         assert_eq!(&w[0..4], b"RIFF");
         assert_eq!(w.len(), 44 + s.len() * 2);
         assert!(hit_samples().iter().all(|x| x.is_finite()));
+        assert!(
+            kill_samples()
+                .iter()
+                .all(|x| x.is_finite() && x.abs() <= 1.0)
+        );
     }
 }
