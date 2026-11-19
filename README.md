@@ -41,6 +41,7 @@ The white circle is where you're aiming. The crosshair is where the nose points.
 - **Chase:** you start behind the target, a random distance between the two you set (300 to 800 m by default). It keeps its heading but weaves and dodges: some runs hard, some gently, some not at all.
 - **Stall:** the target starts just above and ahead of you and pulls straight up, rolling and dodging.
 - **Dogfight:** the target starts close by, usually ahead of you, at a random spot, height, heading and speed, and tries to ram you. With **Enemy shoots back** on (Scenario page), it hunts you with its own guns instead: it fires when lined up, breaks off if it gets too close, and its hits show as "Your damage". At 100% you're shot down and the scenario resets 2 seconds later. Enemy fire works in the other scenarios too.
+- **Banking:** the target starts 500 to 1300 m ahead, off to one side and above, below or level with you, then pulls a hard banked turn, usually across your nose and sometimes away. The path changes every run (low to high, high to low, or straight across, from either side). After turning 150 to 300 degrees it rolls out, and the run ends after about 22 seconds.
 - **All in one:** a random one of the others each time.
 
 When the target takes enough hits it's destroyed, with a sound and a "TARGET DESTROYED" notice, and the scenario restarts 2 seconds later. It also restarts when a plane crashes, the planes collide, the target gets more than 4 km away, a head-on pass is over, or you press R.

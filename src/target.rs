@@ -82,6 +82,15 @@ enum Behavior {
     Ram,
     /// Get on the player's tail and shoot them down.
     Attack,
+    /// A hard banked turn: `turn` is the aim's yaw offset (rad, + right),
+    /// `climb` the flight path angle to hold (rad). Turns through `left`
+    /// more radians of heading, then rolls out and flies straight.
+    Bank {
+        turn: f32,
+        climb: f32,
+        left: f32,
+        last: Vec3,
+    },
 }
 
 #[derive(Component)]
@@ -144,6 +153,11 @@ impl Default for ScenarioState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
             .unwrap_or(1);
+        // Testing aid: WTAT_SEED fixes the random runs.
+        let seed = std::env::var("WTAT_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(seed);
         ScenarioState {
             current: Scenario::Chase,
             time: 0.0,
@@ -268,6 +282,7 @@ fn scenario_override() -> Option<Scenario> {
         "chase" => Some(Scenario::Chase),
         "stall" => Some(Scenario::Stall),
         "dogfight" => Some(Scenario::Dogfight),
+        "banking" => Some(Scenario::Banking),
         _ => None,
     }
 }
@@ -299,6 +314,7 @@ fn reset_scenario(
             Scenario::Chase,
             Scenario::Stall,
             Scenario::Dogfight,
+            Scenario::Banking,
         ]);
     }
     state.current = scenario;
@@ -398,6 +414,40 @@ fn reset_scenario(
                         Behavior::Ram
                     };
                     (Target::new(behavior), Body::new(pos, heading(dir), speed))
+                }
+                Scenario::Banking => {
+                    let dist = rng.range(500.0, 1_300.0);
+                    // Which side of the screen it starts on (-1 left, +1 right).
+                    let side = rng.signed().signum();
+                    // Path: low to high, straight across, or high to low.
+                    let path = rng.pick(&[-1.0f32, 0.0, 1.0]);
+                    let (rise, climb) = if path == 0.0 {
+                        (rng.signed() * 0.03, rng.signed() * 3f32.to_radians())
+                    } else {
+                        (
+                            -path * rng.range(0.05, 0.18),
+                            path * rng.range(8.0, 22.0).to_radians(),
+                        )
+                    };
+                    let pos =
+                        p + Vec3::new(side * rng.range(0.08, 0.35) * dist, rise * dist, -dist);
+                    // Mostly turns across your nose, sometimes away.
+                    let toward = rng.unit() < 0.8;
+                    let sign = if toward { -side } else { side };
+                    // Starts pointing a little away from the turn.
+                    let course = -sign * rng.range(-10.0, 35.0).to_radians();
+                    let dir = Vec3::new(course.sin(), 0.0, -course.cos());
+                    // About your speed, so it stays ahead while you follow.
+                    let speed =
+                        (player_speed * rng.range(0.95, 1.1)).min(model.top_speed(pos.y) * 0.97);
+                    let mut t = Target::new(Behavior::Bank {
+                        turn: sign * rng.range(0.4, 0.8),
+                        climb,
+                        left: rng.range(150.0, 300.0).to_radians(),
+                        last: dir,
+                    });
+                    t.hold_speed = Some(speed);
+                    (t, Body::new(pos, heading(dir), speed))
                 }
                 Scenario::AllInOne => unreachable!("picked above"),
             }
@@ -512,6 +562,33 @@ pub fn fly_target(
                     (away + side * 0.8 + Vec3::Y * 0.4).normalize()
                 } else {
                     lead.unwrap_or_else(|| rel.normalize_or(Vec3::NEG_Z))
+                }
+            }
+            Behavior::Bank {
+                turn,
+                climb,
+                left,
+                last,
+            } => {
+                // Count how far it has turned since the last frame.
+                let flat = aircraft.body.velocity.with_y(0.0).normalize_or(last);
+                let left = (left - last.angle_between(flat)).max(0.0);
+                target.behavior = Behavior::Bank {
+                    turn,
+                    climb,
+                    left,
+                    last: flat,
+                };
+                // Pull out of a dive well above the ground.
+                let climb = if pos.y < 300.0 {
+                    climb.max(5f32.to_radians())
+                } else {
+                    climb
+                };
+                if left > 0.0 {
+                    offset_dir(flat, turn, climb)
+                } else {
+                    offset_dir(flat, 0.0, 0.0)
                 }
             }
         };
@@ -684,6 +761,8 @@ fn end_of_run(
                 Scenario::HeadOn => behind && range > 600.0,
                 // Once the target has stalled and fallen away.
                 Scenario::Stall => state.time > 25.0,
+                // Once it has finished its turn and flown on a while.
+                Scenario::Banking => state.time > 22.0,
                 _ => false,
             };
             if over {
