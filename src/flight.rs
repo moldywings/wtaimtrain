@@ -1,13 +1,14 @@
-//! Player plane. A simple "instructor" turns the plane toward the mouse aim
-//! point, the way War Thunder's mouse aim does: roll toward the aim point,
-//! pull, then level the wings when the nose is on target. Holding a pitch,
-//! roll or yaw key takes over that axis until it's released.
+//! Player plane, flown by the physics in `flight_model`. Mouse aim drives
+//! an instructor (like War Thunder's) that works the stick for you; holding
+//! a pitch, roll or yaw key takes over that axis until it's released.
 
 use bevy::prelude::*;
 
 use crate::GameState;
 use crate::camera::{ChaseCamera, MouseAim, snap_view};
+use crate::flight_model::{self, AircraftCard, Body, Controls, FlightModel};
 use crate::settings::{Action, Settings};
+use crate::target::Target;
 
 pub struct FlightPlugin;
 
@@ -15,42 +16,81 @@ impl Plugin for FlightPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_player).add_systems(
             Update,
-            (fly_player, reset_player).run_if(in_state(GameState::Playing)),
+            (
+                apply_presets,
+                (fly_player, reset).run_if(in_state(GameState::Playing)),
+            )
+                .chain(),
         );
     }
 }
 
+/// An aircraft in the world: its flight model, card and moving state.
 #[derive(Component)]
+pub struct Aircraft {
+    pub card: AircraftCard,
+    pub model: FlightModel,
+    pub body: Body,
+    pub controls: Controls,
+}
+
+impl Aircraft {
+    pub fn new(card: &AircraftCard, body: Body) -> Self {
+        Aircraft {
+            card: card.clone(),
+            model: FlightModel::from_card(card),
+            body,
+            controls: Controls {
+                throttle: 0.8,
+                ..default()
+            },
+        }
+    }
+
+    pub fn set_card(&mut self, card: &AircraftCard) {
+        if self.card != *card {
+            self.card = card.clone();
+            self.model = FlightModel::from_card(card);
+        }
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        self.model.is_stalled(self.body.alpha)
+    }
+}
+
+#[derive(Component, Default)]
 pub struct Player {
-    /// Current airspeed, m/s.
-    pub speed: f32,
-    /// Throttle, 0..=1.
-    pub throttle: f32,
+    /// Keyboard pitch/roll/yaw, eased toward -1..=1 while keys are held.
+    keys: Vec3,
 }
 
-/// Handling limits for the player plane. Rough fighter-like numbers.
-const MAX_PITCH_RATE: f32 = 1.1; // rad/s, nose up
-const MAX_PUSH_RATE: f32 = 0.4; // rad/s, nose down (mouse aim)
-const KEY_PUSH_RATE: f32 = 0.6; // rad/s, nose down (keyboard)
-const MAX_YAW_RATE: f32 = 0.25; // rad/s
-const MAX_ROLL_RATE: f32 = 3.5; // rad/s
-const MIN_SPEED: f32 = 60.0;
-const MAX_LEVEL_SPEED: f32 = 170.0; // m/s at full throttle, level flight
-const START_ALTITUDE: f32 = 1_500.0;
+pub const START_ALTITUDE: f32 = 1_500.0;
+/// Start at this fraction of the preset's top speed at the start altitude.
+pub const START_SPEED_FRACTION: f32 = 0.85;
+/// How quickly keyboard inputs reach full deflection (per second).
+const KEY_RAMP: f32 = 4.0;
 
-fn start_transform() -> Transform {
-    Transform::from_xyz(0.0, START_ALTITUDE, 0.0)
+fn start_body(model: &FlightModel) -> Body {
+    Body::new(
+        Vec3::new(0.0, START_ALTITUDE, 0.0),
+        Quat::IDENTITY,
+        START_SPEED_FRACTION * model.top_speed(START_ALTITUDE),
+    )
 }
 
-fn spawn_player(mut commands: Commands, assets: Res<AssetServer>) {
+fn spawn_player(mut commands: Commands, assets: Res<AssetServer>, settings: Res<Settings>) {
+    let mut aircraft = Aircraft::new(
+        settings.player_card(),
+        Body::new(Vec3::ZERO, Quat::IDENTITY, 0.0),
+    );
+    aircraft.body = start_body(&aircraft.model);
     commands
         .spawn((
-            start_transform(),
+            Transform::from_translation(aircraft.body.position),
             Visibility::default(),
-            Player {
-                speed: 140.0,
-                throttle: 0.8,
-            },
+            Player::default(),
+            aircraft,
         ))
         .with_children(|plane| {
             plane.spawn((
@@ -62,110 +102,95 @@ fn spawn_player(mut commands: Commands, assets: Res<AssetServer>) {
         });
 }
 
+/// Rebuild flight models when presets change in the menu.
+fn apply_presets(
+    settings: Res<Settings>,
+    mut player: Query<&mut Aircraft, (With<Player>, Without<Target>)>,
+    mut targets: Query<&mut Aircraft, (With<Target>, Without<Player>)>,
+) {
+    if !settings.is_changed() {
+        return;
+    }
+    for mut a in &mut player {
+        a.set_card(settings.player_card());
+    }
+    for mut a in &mut targets {
+        a.set_card(settings.target_card());
+    }
+}
+
 pub fn fly_player(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
     aim: Res<MouseAim>,
-    player: Single<(&mut Transform, &mut Player)>,
+    player: Single<(&mut Transform, &mut Aircraft, &mut Player)>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    let (mut tf, mut plane) = player.into_inner();
-
+    let (mut tf, mut aircraft, mut player) = player.into_inner();
     let axis = |plus: Action, minus: Action| -> f32 {
         settings.pressed(&keys, plus) as i32 as f32 - settings.pressed(&keys, minus) as i32 as f32
     };
 
     let throttle_input = axis(Action::ThrottleUp, Action::ThrottleDown);
-    plane.throttle = (plane.throttle + throttle_input * 0.5 * dt).clamp(0.0, 1.0);
+    let mut controls = aircraft.controls;
+    controls.throttle = (controls.throttle + throttle_input * 0.5 * dt).clamp(0.0, 1.0);
 
-    // Aim direction in the plane's local frame (forward = -Z, up = +Y).
-    let local = tf.rotation.inverse() * aim.direction();
-    let off_nose = local.angle_between(Vec3::NEG_Z);
+    // Keys ease in and out so a tap isn't a full-deflection jolt.
+    let wanted = Vec3::new(
+        axis(Action::PitchUp, Action::PitchDown),
+        axis(Action::RollRight, Action::RollLeft),
+        axis(Action::YawRight, Action::YawLeft),
+    );
+    let step = KEY_RAMP * dt;
+    let current = player.keys;
+    player.keys = current + (wanted - current).clamp(Vec3::splat(-step), Vec3::splat(step));
 
-    // Pitch toward the aim point, measured in the plane's pitch plane.
-    let pitch_err = local.y.atan2(-local.z);
-    let pitch_rate = (pitch_err * 4.0).clamp(-MAX_PUSH_RATE, MAX_PITCH_RATE);
+    // Instructor for whatever the keys aren't doing; keys blend in on top.
+    let auto = {
+        let Aircraft { model, body, .. } = &mut *aircraft;
+        flight_model::instructor(model, body, aim.direction(), dt)
+    };
+    let blend = |auto: f32, key: f32| auto * (1.0 - key.abs()) + key;
+    controls.pitch = blend(auto.pitch, player.keys.x);
+    controls.roll = blend(auto.roll, player.keys.y);
+    controls.yaw = blend(auto.yaw, player.keys.z);
+    aircraft.controls = controls;
 
-    // A little rudder for fine aiming.
-    let yaw_err = local.x.atan2(-local.z);
-    let yaw_rate = (-yaw_err * 3.0).clamp(-MAX_YAW_RATE, MAX_YAW_RATE);
+    let Aircraft { model, body, .. } = &mut *aircraft;
+    flight_model::step(model, body, &controls, dt);
 
-    // Roll: far off the nose, bank so the aim point sits "above" the canopy.
-    // Close to the nose, roll the wings level instead.
-    // Aim point well below the nose means rolling inverted and pulling.
-    let bank_to_target = local.x.atan2(local.y);
-    let right = tf.rotation * Vec3::X;
-    let bank_to_level = right.y.clamp(-1.0, 1.0).asin();
-    let w = smoothstep(0.03, 0.15, off_nose);
-    let roll_err = w * bank_to_target + (1.0 - w) * bank_to_level;
-    let roll_rate = (-roll_err * 5.0).clamp(-MAX_ROLL_RATE, MAX_ROLL_RATE);
-
-    // Pull less while still rolling into the turn, like a real pilot.
-    let pull_scale = 1.0 - (w * bank_to_target.abs() / 1.5).clamp(0.0, 0.8);
-
-    let mut pitch_rate = pitch_rate * pull_scale;
-    let mut yaw_rate = yaw_rate;
-    let mut roll_rate = roll_rate;
-
-    // Keyboard overrides, one axis at a time.
-    let pitch_key = axis(Action::PitchUp, Action::PitchDown);
-    if pitch_key > 0.0 {
-        pitch_rate = MAX_PITCH_RATE;
-    } else if pitch_key < 0.0 {
-        pitch_rate = -KEY_PUSH_RATE;
-    }
-    let roll_key = axis(Action::RollRight, Action::RollLeft);
-    if roll_key != 0.0 {
-        roll_rate = -roll_key * MAX_ROLL_RATE;
-    }
-    let yaw_key = axis(Action::YawRight, Action::YawLeft);
-    if yaw_key != 0.0 {
-        yaw_rate = -yaw_key * MAX_YAW_RATE * 1.5;
+    // No crash damage yet: hitting the ground just restarts you.
+    if body.position.y < 3.0 {
+        *body = start_body(model);
     }
 
-    let delta = Quat::from_rotation_x(pitch_rate * dt)
-        * Quat::from_rotation_y(yaw_rate * dt)
-        * Quat::from_rotation_z(roll_rate * dt);
-    tf.rotation = (tf.rotation * delta).normalize();
-
-    // Energy: gravity along the flight path plus thrust pulling toward the
-    // throttle's level speed. Climbing bleeds speed, diving adds it.
-    let forward = tf.rotation * Vec3::NEG_Z;
-    let target_speed = MAX_LEVEL_SPEED * (0.35 + 0.65 * plane.throttle);
-    let accel = -9.81 * forward.y + (target_speed - plane.speed) * 0.15;
-    plane.speed = (plane.speed + accel * dt).max(MIN_SPEED);
-
-    tf.translation += forward * plane.speed * dt;
-
-    // No crashes yet: bounce off a floor.
-    if tf.translation.y < 50.0 {
-        tf.translation.y = 50.0;
-    }
+    tf.translation = body.position;
+    tf.rotation = body.rotation;
 }
 
-/// The reset key puts the player back at the start position.
-fn reset_player(
+/// The reset key puts the player back at the start and the target ahead.
+#[allow(clippy::type_complexity)]
+fn reset(
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
     mut aim: ResMut<MouseAim>,
     mut camera: Single<&mut ChaseCamera>,
-    player: Single<(&mut Transform, &mut Player)>,
+    mut player: Single<&mut Aircraft, (With<Player>, Without<Target>)>,
+    mut targets: Query<(&mut Aircraft, &mut Target), Without<Player>>,
 ) {
-    if settings.just_pressed(&keys, Action::Reset) {
-        let (mut tf, mut plane) = player.into_inner();
-        *tf = start_transform();
-        plane.speed = 140.0;
-        aim.yaw = 0.0;
-        aim.pitch = 0.0;
-        snap_view(&mut camera, &aim);
+    if !settings.just_pressed(&keys, Action::Reset) {
+        return;
     }
-}
-
-fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+    player.body = start_body(&player.model);
+    player.controls.throttle = 0.8;
+    aim.yaw = 0.0;
+    aim.pitch = 0.0;
+    snap_view(&mut camera, &aim);
+    for (mut aircraft, mut target) in &mut targets {
+        target.reset(&mut aircraft);
+    }
 }
