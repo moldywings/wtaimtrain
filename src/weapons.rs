@@ -312,7 +312,8 @@ pub struct Loadout {
     pub nose_ring: Mount,
     pub belly: Mount,
     pub wings: Mount,
-    /// Range in meters where wing and belly guns are angled to meet.
+    /// Range in meters where wing and belly guns are angled to meet; 0
+    /// means off (they fire parallel, straight ahead).
     pub convergence: f32,
 }
 
@@ -640,7 +641,11 @@ fn sync_player_guns(
     let correction = crate::model_correction();
     let built = Guns {
         last_sound: HashMap::new(),
-        convergence: loadout.convergence.clamp(CONVERGENCE_MIN, CONVERGENCE_MAX),
+        convergence: if loadout.convergence > 0.0 {
+            loadout.convergence.clamp(CONVERGENCE_MIN, CONVERGENCE_MAX)
+        } else {
+            0.0
+        },
         guns: loadout
             .guns()
             .into_iter()
@@ -738,6 +743,7 @@ fn fire_guns(
     let (tf, aircraft, mut guns) = player.into_inner();
     let firing = trigger_held(&mouse, &cursor);
     let forward = tf.forward().as_vec3();
+    let converging = guns.convergence > 0.0;
     let converge_at = tf.translation + forward * guns.convergence;
     let up = tf.up().as_vec3();
     let right = tf.right().as_vec3();
@@ -756,7 +762,10 @@ fn fire_guns(
             let muzzle = tf.transform_point(gun.muzzle);
             let aim = match gun.slot {
                 Slot::NoseCenter | Slot::NoseRing => forward,
-                Slot::Belly | Slot::Wings => (converge_at - muzzle).normalize_or(forward),
+                Slot::Belly | Slot::Wings if converging => {
+                    (converge_at - muzzle).normalize_or(forward)
+                }
+                Slot::Belly | Slot::Wings => forward,
             };
             let spread = gun.card.spread_mils() * 0.001 * 0.5;
             let dir = (aim + right * rng.next() * spread + up * rng.next() * spread).normalize();
@@ -879,7 +888,8 @@ fn glow_image() -> Image {
             let u = (x as f32 + 0.5) / N as f32 * 2.0 - 1.0;
             let v = (y as f32 + 0.5) / N as f32 * 2.0 - 1.0;
             let d2 = u * u + v * v;
-            let a = ((-d2 * 3.5).exp() * (1.0 - d2).max(0.0)).clamp(0.0, 1.0);
+            // A bright, nearly solid middle that softens toward the edge.
+            let a = (2.2 * (-d2 * 2.5).exp() * (1.0 - d2).max(0.0)).clamp(0.0, 1.0);
             data.extend_from_slice(&[255, 255, 255, (a * 255.0) as u8]);
         }
     }
@@ -904,7 +914,7 @@ const MIN_TRACER_ANGLE: f32 = 0.0012;
 /// The glow is this many times wider than the streak.
 const GLOW_WIDTH: f32 = 2.0;
 /// Strength of the glow around a tracer (0 to 1).
-const TRACER_GLOW: f32 = 0.8;
+const TRACER_GLOW: f32 = 1.0;
 
 /// The target's pose at the start of the frame, so bullets can be tested
 /// against where it actually was during the frame.

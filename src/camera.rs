@@ -33,8 +33,8 @@ impl Plugin for CameraPlugin {
 
 /// Where the player wants to point, in world space: a full orientation, so
 /// the aim can go straight up and over the top. The mouse moves it across
-/// the screen, and it slowly rolls back level whenever it isn't pointing
-/// steeply up or down.
+/// the screen, and it keeps itself upright (horizon level) except when
+/// pointing almost straight up or down.
 #[derive(Resource)]
 pub struct MouseAim {
     pub rot: Quat,
@@ -49,7 +49,7 @@ impl Default for MouseAim {
 }
 
 /// How quickly the aim (and the view) rolls back level, 1/s.
-const LEVEL_RATE: f32 = 1.5;
+const LEVEL_RATE: f32 = 10.0;
 
 impl MouseAim {
     pub fn rotation(&self) -> Quat {
@@ -76,7 +76,7 @@ impl MouseAim {
         }
         let err = f.dot(up.cross(level_up)).atan2(up.dot(level_up));
         // Hardly at all when pointing straight up or down.
-        let k = (1.0 - f.y.abs()).powi(2) * (1.0 - (-LEVEL_RATE * dt).exp());
+        let k = (1.0 - f.y.abs()).sqrt() * (1.0 - (-LEVEL_RATE * dt).exp());
         self.rot = (Quat::from_axis_angle(f, err * k) * self.rot).normalize();
     }
 

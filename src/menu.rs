@@ -159,10 +159,11 @@ enum Field {
     WingArea,
     ClMax,
     RollRate,
+    RollSpeed,
 }
 
 impl Field {
-    const ALL: [Field; 14] = [
+    const ALL: [Field; 15] = [
         Field::Name,
         Field::Power,
         Field::Engines,
@@ -177,6 +178,7 @@ impl Field {
         Field::WingArea,
         Field::ClMax,
         Field::RollRate,
+        Field::RollSpeed,
     ];
 
     fn index(self) -> usize {
@@ -202,7 +204,8 @@ impl Field {
             Field::Mass => ("Mass (optional)", "kg"),
             Field::WingArea => ("Wing area (optional)", "sq m"),
             Field::ClMax => ("Max lift coeff. (optional)", ""),
-            Field::RollRate => ("Roll rate (optional)", "deg/s"),
+            Field::RollRate => ("Best roll (optional)", "deg/s"),
+            Field::RollSpeed => ("  best roll speed", units.speed_unit().0),
         }
     }
 }
@@ -238,6 +241,7 @@ impl Draft {
                 Field::WingArea => opt(card.wing_area, 2),
                 Field::ClMax => opt(card.cl_max, 2),
                 Field::RollRate => opt(card.roll_rate, 0),
+                Field::RollSpeed => opt(card.roll_speed.map(|v| v * spd), 0),
             };
         }
         Draft {
@@ -302,6 +306,7 @@ impl Draft {
             wing_area: optional(Field::WingArea, 1.0)?,
             cl_max: optional(Field::ClMax, 1.0)?,
             roll_rate: optional(Field::RollRate, 1.0)?,
+            roll_speed: optional(Field::RollSpeed, spd)?,
             weapons: base.weapons.clone(),
         };
         if card.power <= 0.0 || card.climb_rate <= 0.0 || card.top_speed <= 0.0 {
@@ -467,6 +472,8 @@ enum MenuAction {
     MountCount(Slot, i32),
     /// Move wing gun convergence by this many steps.
     Convergence(i32),
+    /// Switch wing gun convergence off (parallel guns) or back on.
+    ConvergenceOff,
 }
 
 const PANEL_BG: Color = Color::srgba(0.08, 0.09, 0.11, 0.94);
@@ -937,7 +944,8 @@ fn aircraft_page(
                     // Turn rates share a row with their speed:
                     // "Max sustained turn [23.59] deg/s at [175] kt".
                     let speed_of = match field {
-                        Field::SustainedSpeed | Field::InstantSpeed => continue,
+                        Field::SustainedSpeed | Field::InstantSpeed | Field::RollSpeed => continue,
+                        Field::RollRate => Some(Field::RollSpeed),
                         Field::SustainedRate => Some(Field::SustainedSpeed),
                         Field::InstantRate => Some(Field::InstantSpeed),
                         _ => None,
@@ -1033,6 +1041,9 @@ fn aircraft_page(
                     }
                     if card.roll_rate.is_none() {
                         filled.push(format!("roll rate {:.0} deg/s", e.roll_rate));
+                    }
+                    if card.roll_speed.is_none() {
+                        filled.push(format!("best roll speed {}", units.speed(e.roll_speed)));
                     }
                     if !filled.is_empty() {
                         col.spawn(label(
@@ -1297,7 +1308,11 @@ fn weapons_page(
                 col.spawn(row()).with_children(|r| {
                     r.spawn((
                         label(
-                            &convergence_text(settings.units, loadout.convergence),
+                            &if loadout.convergence > 0.0 {
+                                convergence_text(settings.units, loadout.convergence)
+                            } else {
+                                "Off (parallel)".to_string()
+                            },
                             18.0,
                             TEXT,
                         ),
@@ -1305,6 +1320,11 @@ fn weapons_page(
                     ));
                     r.spawn(button(MenuAction::Convergence(-1), "-", px(36)));
                     r.spawn(button(MenuAction::Convergence(1), "+", px(36)));
+                    r.spawn(button(
+                        MenuAction::ConvergenceOff,
+                        if loadout.convergence > 0.0 { "Turn off" } else { "Turn on" },
+                        px(90),
+                    ));
                 });
                 let guns = loadout.guns();
                 let mass_per_s: f32 = guns
@@ -1316,11 +1336,18 @@ fn weapons_page(
                     .sum();
                 col.spawn(label(
                     &format!(
-                        "{} guns, {:.2} kg of rounds per second. Wing and belly guns \
-                         converge at {}; nose guns fire straight ahead.",
+                        "{} guns, {:.2} kg of rounds per second. {}; nose guns fire \
+                         straight ahead.",
                         loadout.total_guns(),
                         mass_per_s,
-                        convergence_text(settings.units, loadout.convergence)
+                        if loadout.convergence > 0.0 {
+                            format!(
+                                "Wing and belly guns converge at {}",
+                                convergence_text(settings.units, loadout.convergence)
+                            )
+                        } else {
+                            "Convergence is off, so wing and belly guns fire parallel".into()
+                        }
                     ),
                     13.0,
                     DIM,
@@ -1903,9 +1930,26 @@ fn on_menu_click(
         MenuAction::Convergence(steps) => {
             use crate::weapons::{CONVERGENCE_MAX, CONVERGENCE_MIN, CONVERGENCE_STEP};
             edit_loadout(&mut settings, &mut ui, |l| {
-                let c = (l.convergence / CONVERGENCE_STEP).round() * CONVERGENCE_STEP
+                // From off, - and + start again at the nearest end.
+                let from = if l.convergence > 0.0 {
+                    l.convergence
+                } else if steps < 0 {
+                    CONVERGENCE_MAX + CONVERGENCE_STEP
+                } else {
+                    CONVERGENCE_MIN - CONVERGENCE_STEP
+                };
+                let c = (from / CONVERGENCE_STEP).round() * CONVERGENCE_STEP
                     + steps as f32 * CONVERGENCE_STEP;
                 l.convergence = c.clamp(CONVERGENCE_MIN, CONVERGENCE_MAX);
+            });
+        }
+        MenuAction::ConvergenceOff => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                l.convergence = if l.convergence > 0.0 {
+                    0.0
+                } else {
+                    crate::weapons::CONVERGENCE
+                };
             });
         }
     }

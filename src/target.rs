@@ -335,20 +335,25 @@ fn reset_scenario(
                     (t, Body::new(pos, Quat::IDENTITY, player_speed * 0.95))
                 }
                 Scenario::Dogfight => {
-                    // Usually somewhere ahead of you; now and then behind.
-                    let bearing = if rng.unit() < 0.8 {
-                        rng.signed() * 60f32.to_radians()
+                    // Mostly ahead of you, in view; now and then anywhere,
+                    // including behind.
+                    let ahead = rng.unit() < 0.85;
+                    let bearing = if ahead {
+                        rng.signed() * 35f32.to_radians()
                     } else {
                         rng.range(0.0, std::f32::consts::TAU)
                     };
-                    let dist = rng.range(300.0, 900.0);
+                    let dist = rng.range(400.0, 1_000.0);
                     let pos = p + Vec3::new(
                         bearing.sin() * dist,
-                        rng.signed() * 300.0,
+                        rng.signed() * 250.0,
                         -bearing.cos() * dist,
                     );
-                    let course = rng.range(0.0, std::f32::consts::TAU);
-                    let dir = Vec3::new(course.sin(), 0.0, -course.cos());
+                    // Heading roughly your way (crossing to head on), so it
+                    // engages instead of flying off.
+                    let to_you = (p - pos).with_y(0.0).normalize_or(Vec3::Z);
+                    let course = rng.signed() * 80f32.to_radians();
+                    let dir = Quat::from_rotation_y(course) * to_you;
                     let speed = model.top_speed(pos.y) * rng.range(0.45, 1.0);
                     (
                         Target::new(Behavior::Ram),
