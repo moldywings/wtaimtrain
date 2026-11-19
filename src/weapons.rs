@@ -36,7 +36,8 @@ pub struct GunCard {
     /// Optional: bore in mm (sets drag and the size of the gun model).
     /// Estimated from the projectile mass when blank.
     pub caliber: Option<f32>,
-    /// Optional: dispersion, mils (1 mil = 1 m at 1 km).
+    /// Optional: dispersion, mils (1 mil = 1 m at 1 km): the width of the
+    /// circle the rounds land in. The editor shows it as meters at 500 m.
     pub spread: Option<f32>,
     /// Color of the tracer.
     pub tracer: TracerColor,
@@ -111,6 +112,8 @@ pub const BUILTIN_GUN: &str = "ShVAK 20 mm";
 
 /// Spread used when the preset leaves it blank, mils.
 pub const DEFAULT_SPREAD: f32 = 2.0;
+/// One mil of spread is half a meter wide at 500 m.
+pub const MILS_TO_M_AT_500: f32 = 0.5;
 
 impl GunCard {
     /// The Soviet 20 mm ShVAK cannon.
@@ -150,6 +153,11 @@ impl GunCard {
 
     pub fn spread_mils(&self) -> f32 {
         self.spread.unwrap_or(DEFAULT_SPREAD)
+    }
+
+    /// Width of the spread circle at 500 m, m.
+    pub fn spread_at_500(&self) -> f32 {
+        self.spread_mils() * MILS_TO_M_AT_500
     }
 
     /// Hits needed to destroy an aircraft. Left blank, it comes from the
@@ -293,6 +301,11 @@ pub struct Mount {
     /// Gun preset name.
     pub gun: String,
     pub count: u32,
+    /// Belly and wing guns: a different gun preset for each position, from
+    /// the first outward (wing positions match on both wings). Blank or
+    /// missing uses `gun`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub each: Vec<String>,
 }
 
 impl Mount {
@@ -300,6 +313,38 @@ impl Mount {
         Mount {
             gun: gun.into(),
             count,
+            each: vec![],
+        }
+    }
+
+    /// The gun preset at position `i`.
+    pub fn gun_at(&self, i: usize) -> &str {
+        match self.each.get(i) {
+            Some(g) if !g.trim().is_empty() => g,
+            _ => &self.gun,
+        }
+    }
+
+    /// Set every position to one gun preset.
+    pub fn set_all(&mut self, gun: &str) {
+        self.gun = gun.into();
+        self.each.clear();
+    }
+
+    /// Set one position's gun preset.
+    pub fn set_at(&mut self, i: usize, gun: &str) {
+        if self.each.len() <= i {
+            self.each.resize(i + 1, String::new());
+        }
+        self.each[i] = gun.into();
+        // Positions matching the main gun don't need their own entry.
+        for g in &mut self.each {
+            if *g == self.gun {
+                g.clear();
+            }
+        }
+        while self.each.last().is_some_and(|g| g.is_empty()) {
+            self.each.pop();
         }
     }
 }
@@ -312,9 +357,16 @@ pub struct Loadout {
     pub nose_ring: Mount,
     pub belly: Mount,
     pub wings: Mount,
-    /// Range in meters where wing and belly guns are angled to meet; 0
-    /// means off (they fire parallel, straight ahead).
+    /// Range in meters where wing and belly guns are angled in to meet
+    /// (sideways only, like War Thunder); 0 means off (they fire parallel,
+    /// straight ahead).
     pub convergence: f32,
+    /// How far behind the spinner the belly guns' muzzles sit, m (full
+    /// size aircraft).
+    pub belly_back: f32,
+    /// Distance from the wing root out to the first wing gun, m (full
+    /// size aircraft).
+    pub wing_out: f32,
 }
 
 impl Default for Loadout {
@@ -326,6 +378,8 @@ impl Default for Loadout {
             belly: Mount::new(BUILTIN_GUN, 0),
             wings: Mount::new("UBS 12.7 mm", 0),
             convergence: CONVERGENCE,
+            belly_back: BELLY_BACK,
+            wing_out: WING_OUT,
         }
     }
 }
@@ -355,11 +409,19 @@ impl Loadout {
         let mut out = vec![];
         for slot in Slot::ALL {
             let m = self.mount(slot);
-            for p in muzzle_positions(slot, m.count.min(slot.max())) {
-                out.push((slot, m.gun.clone(), p));
+            let n = m.count.min(slot.max());
+            let per = if slot == Slot::Wings { 2 } else { 1 };
+            for (i, p) in self.muzzles(slot, n).into_iter().enumerate() {
+                out.push((slot, m.gun_at(i / per).to_string(), p));
             }
         }
         out
+    }
+
+    /// Muzzle positions for `count` guns in a slot, in model space, with
+    /// this loadout's belly and wing placement.
+    pub fn muzzles(&self, slot: Slot, count: u32) -> Vec<Vec3> {
+        place_muzzles(slot, count, self.belly_back, self.wing_out)
     }
 
     pub fn total_guns(&self) -> u32 {
@@ -381,13 +443,35 @@ const SPINNER_MUZZLE_Z: f32 = 2.53;
 const RING_MUZZLE_Z: f32 = 2.30;
 const RING_RADIUS: f32 = 0.17;
 const BELLY_Y: f32 = -0.04;
-const BELLY_MUZZLE_Z: f32 = 1.2;
 const BELLY_SPACING: f32 = 0.17;
-/// Spanwise stations for wing guns, from the root outward.
-const WING_STATIONS: [f32; 4] = [0.85, 1.15, 1.45, 1.75];
+/// Default and limits for how far behind the spinner the belly guns sit,
+/// m on the full size aircraft.
+pub const BELLY_BACK: f32 = 1.7;
+pub const BELLY_BACK_MIN: f32 = 0.9;
+pub const BELLY_BACK_MAX: f32 = 4.5;
+/// Where the wing meets the fuselage, and the outermost spot a gun fits,
+/// model space.
+const WING_ROOT_X: f32 = 0.48;
+const WING_GUN_MAX_X: f32 = 3.0;
+const WING_SPACING: f32 = 0.3;
+/// Default and limits for the root-to-first-wing-gun distance, m on the
+/// full size aircraft.
+pub const WING_OUT: f32 = 0.5;
+pub const WING_OUT_MIN: f32 = 0.1;
+pub const WING_OUT_MAX: f32 = 3.3;
 
-/// Muzzle positions for `count` guns in a slot, in model space.
+/// Muzzle positions for `count` guns in a slot at the default placement,
+/// in model space.
+#[cfg(test)]
 pub fn muzzle_positions(slot: Slot, count: u32) -> Vec<Vec3> {
+    place_muzzles(slot, count, BELLY_BACK, WING_OUT)
+}
+
+/// Muzzle positions for `count` guns in a slot, in model space. Belly guns
+/// sit `belly_back` m behind the spinner; the first wing gun `wing_out` m
+/// out from the root (both full size meters).
+fn place_muzzles(slot: Slot, count: u32, belly_back: f32, wing_out: f32) -> Vec<Vec3> {
+    let scale = crate::MODEL_SCALE;
     match slot {
         Slot::NoseCenter => (0..count.min(1))
             .map(|_| Vec3::new(SPINNER.x, SPINNER.y, SPINNER_MUZZLE_Z))
@@ -421,13 +505,18 @@ pub fn muzzle_positions(slot: Slot, count: u32) -> Vec<Vec3> {
             (0..count.min(4))
                 .map(|i| {
                     let x = (i as f32 - (n - 1.0) / 2.0) * BELLY_SPACING;
-                    Vec3::new(x, BELLY_Y, BELLY_MUZZLE_Z)
+                    let back = belly_back.clamp(BELLY_BACK_MIN, BELLY_BACK_MAX) / scale;
+                    Vec3::new(x, BELLY_Y, SPINNER.z - back)
                 })
                 .collect()
         }
         Slot::Wings => {
             let mut out = vec![];
-            for &x in WING_STATIONS.iter().take(count.min(4) as usize) {
+            let n = count.min(4);
+            let first = (WING_ROOT_X + wing_out.clamp(WING_OUT_MIN, WING_OUT_MAX) / scale)
+                .min(WING_GUN_MAX_X - (n.max(1) - 1) as f32 * WING_SPACING);
+            for i in 0..n {
+                let x = first + i as f32 * WING_SPACING;
                 // The wing sweeps back and has dihedral toward the tip.
                 let leading_edge = 0.88 - (x - 0.48) * 0.49 / 2.76;
                 let y = 0.19 + (x - 0.48) * 0.09;
@@ -463,6 +552,7 @@ impl Plugin for WeaponsPlugin {
                 (
                     record_target_pose.before(crate::target::fly_target),
                     (sync_gun_models, sync_player_guns),
+                    (warm_up, warm_gun_sounds),
                     (fire_guns, fly_bullets)
                         .chain()
                         .after(crate::flight::fly_player)
@@ -554,6 +644,88 @@ fn setup_assets(
     });
 }
 
+/// Draws every effect once, tiny and right in front of the camera, for the
+/// first frames after launch. The graphics driver builds each kind of
+/// material the first time it's drawn, which takes a moment; doing it now
+/// stops the game hitching at the first shot, hit or kill.
+#[derive(Component)]
+struct WarmUp;
+
+const WARM_UP_FRAMES: u32 = 20;
+
+fn warm_up(
+    mut commands: Commands,
+    mut frames: Local<u32>,
+    weapon_assets: Res<WeaponAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    camera: Query<Entity, With<Camera3d>>,
+    warm: Query<Entity, With<WarmUp>>,
+) {
+    if *frames > WARM_UP_FRAMES {
+        return;
+    }
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    *frames += 1;
+    if *frames == 1 {
+        let mut items: Vec<(Handle<Mesh>, Handle<StandardMaterial>)> = vec![];
+        for (core, glow) in weapon_assets.tracer_materials.values() {
+            items.push((weapon_assets.tracer_mesh.clone(), core.clone()));
+            items.push((weapon_assets.glow_mesh.clone(), glow.clone()));
+        }
+        items.push((
+            weapon_assets.spark_mesh.clone(),
+            weapon_assets.spark_material.clone(),
+        ));
+        // Same kind of material as the kill explosion.
+        items.push((
+            meshes.add(Sphere::new(1.0)),
+            materials.add(StandardMaterial {
+                base_color: Color::srgba(1.0, 0.8, 0.35, 0.95),
+                unlit: true,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            }),
+        ));
+        commands.entity(camera).with_children(|c| {
+            for (i, (mesh, material)) in items.into_iter().enumerate() {
+                c.spawn((
+                    WarmUp,
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material),
+                    Transform::from_xyz(i as f32 * 0.001, 0.0, -1.0)
+                        .with_scale(Vec3::splat(0.0005)),
+                ));
+            }
+            c.spawn((
+                WarmUp,
+                WorldAssetRoot(weapon_assets.gun_scene.clone()),
+                Transform::from_xyz(0.0, 0.0, -1.0).with_scale(Vec3::splat(0.0005)),
+            ));
+        });
+    } else if *frames == WARM_UP_FRAMES {
+        for e in &warm {
+            commands.entity(e).despawn();
+        }
+    }
+}
+
+/// Make each gun preset's shot sound ahead of time, not at its first shot.
+fn warm_gun_sounds(
+    settings: Res<Settings>,
+    mut sounds: ResMut<Sounds>,
+    mut sources: ResMut<Assets<AudioSource>>,
+) {
+    if !settings.is_changed() {
+        return;
+    }
+    for g in &settings.guns {
+        sounds.gunshot(&mut sources, g.caliber_mm(), g.muzzle_velocity);
+    }
+}
+
 /// Put gun models on each plane where its preset's loadout says.
 #[allow(clippy::type_complexity)]
 fn sync_gun_models(
@@ -640,14 +812,17 @@ fn sync_guns(
     aircraft: &Aircraft,
     guns: Option<Mut<Guns>>,
 ) {
-    let loadout = aircraft.card.weapons.clone();
-    let key = (loadout.clone(), settings.guns.clone());
-    if guns
-        .as_ref()
-        .is_some_and(|g| g.built_from.as_ref() == Some(&key))
-    {
+    // Nothing to do unless the loadout or a gun changed (checked without
+    // copying anything, since this runs every frame).
+    if guns.as_ref().is_some_and(|g| {
+        g.built_from
+            .as_ref()
+            .is_some_and(|(l, c)| *l == aircraft.card.weapons && *c == settings.guns)
+    }) {
         return;
     }
+    let loadout = aircraft.card.weapons.clone();
+    let key = (loadout.clone(), settings.guns.clone());
     let correction = crate::model_correction();
     let built = Guns {
         last_sound: HashMap::new(),
@@ -679,10 +854,13 @@ fn sync_guns(
 /// Default range where wing and belly guns meet; nose guns fire straight
 /// ahead.
 pub const CONVERGENCE: f32 = 400.0;
-/// Limits and step for the convergence setting, m.
-pub const CONVERGENCE_MIN: f32 = 100.0;
+/// Limits for the convergence setting, m.
+pub const CONVERGENCE_MIN: f32 = 50.0;
 pub const CONVERGENCE_MAX: f32 = 1500.0;
-pub const CONVERGENCE_STEP: f32 = 50.0;
+/// The choices War Thunder offers for gun targeting distance, m (0 = No).
+pub const CONVERGENCE_CHOICES: [f32; 12] = [
+    0.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0,
+];
 
 #[derive(Component)]
 struct Bullet {
@@ -813,7 +991,6 @@ fn fire_plane(
 ) {
     let forward = tf.forward().as_vec3();
     let converging = guns.convergence > 0.0;
-    let converge_at = tf.translation + forward * guns.convergence;
     let up = tf.up().as_vec3();
     let right = tf.right().as_vec3();
     // Guns of the same kind share one sound per frame (louder for more of
@@ -830,13 +1007,19 @@ fn fire_plane(
             let muzzle = tf.transform_point(gun.muzzle);
             let aim = match gun.slot {
                 Slot::NoseCenter | Slot::NoseRing => forward,
+                // Angled in sideways only (War Thunder's horizontal
+                // convergence): the guns still fire parallel up and down.
                 Slot::Belly | Slot::Wings if converging => {
-                    (converge_at - muzzle).normalize_or(forward)
+                    let side = (muzzle - tf.translation).dot(right);
+                    (forward * guns.convergence - right * side).normalize_or(forward)
                 }
                 Slot::Belly | Slot::Wings => forward,
             };
-            let spread = gun.card.spread_mils() * 0.001 * 0.5;
-            let dir = (aim + right * rng.next() * spread + up * rng.next() * spread).normalize();
+            // Rounds land evenly over a circle `spread` wide.
+            let radius = gun.card.spread_mils() * 0.001 * 0.5;
+            let angle = rng.next() * std::f32::consts::PI;
+            let r = radius * (rng.next() * 0.5 + 0.5).sqrt();
+            let dir = (aim + (right * angle.cos() + up * angle.sin()) * r).normalize();
             let velocity = aircraft.body.velocity + dir * gun.card.muzzle_velocity;
             // A shot due partway through the frame has already flown a bit.
             let early = -gun.cooldown;
@@ -889,15 +1072,18 @@ fn fire_plane(
     for (card, count) in fired {
         let key = card.name.clone();
         let last = guns.last_sound.get(&key).copied().unwrap_or(f32::MIN);
-        // Every shot up to about 25 a second; faster guns blend together.
-        if now - last < card.interval().max(0.04) * 0.95 {
+        // Every shot gets its sound, up to 25 a second (faster guns blend
+        // together). Shots land on whole frames, so the gap between two can
+        // be most of a frame shorter than the gun's interval: only skip a
+        // sound that comes far too soon, or slow guns drop shots at random.
+        if now - last < (card.interval() * 0.5).max(0.04) {
             continue;
         }
         guns.last_sound.insert(key, now);
         let sound = sounds.gunshot(sources, card.caliber_mm(), card.muzzle_velocity);
         let loud = (card.caliber_mm() / 20.0).clamp(0.4, 1.6).sqrt();
         let volume = 0.22 * loud * (count as f32).powf(0.35) * loudness;
-        let speed = 1.0 + rng.next() * 0.04;
+        let speed = 1.0 + rng.next() * 0.015;
         sound::play(commands, sound, volume, speed);
     }
 }
@@ -1363,6 +1549,43 @@ mod tests {
         assert_eq!(muzzle_positions(Slot::Wings, 4).len(), 8);
         let yak = Loadout::default();
         assert_eq!(yak.total_guns(), 3);
+    }
+
+    #[test]
+    fn mixed_guns_and_placement() {
+        let mut l = Loadout::default();
+        l.wings.set_all("UBS 12.7 mm");
+        l.wings.count = 3;
+        l.wings.set_at(1, BUILTIN_GUN);
+        let wing_guns: Vec<_> = l
+            .guns()
+            .into_iter()
+            .filter(|g| g.0 == Slot::Wings)
+            .collect();
+        assert_eq!(wing_guns.len(), 6);
+        // Both wings' second position carry the cannon.
+        assert_eq!(wing_guns[2].1, BUILTIN_GUN);
+        assert_eq!(wing_guns[3].1, BUILTIN_GUN);
+        assert_eq!(wing_guns[0].1, "UBS 12.7 mm");
+        // Setting it back to the main gun clears the override.
+        l.wings.set_at(1, "UBS 12.7 mm");
+        assert!(l.wings.each.is_empty());
+
+        // Sliders move the guns.
+        let near = l.muzzles(Slot::Wings, 1)[0].x.abs();
+        l.wing_out = 2.0;
+        assert!(l.muzzles(Slot::Wings, 1)[0].x.abs() > near + 1.0);
+        let fwd = l.muzzles(Slot::Belly, 1)[0].z;
+        l.belly_back = 3.5;
+        assert!(l.muzzles(Slot::Belly, 1)[0].z < fwd - 1.0);
+        // Four guns far out still fit on the wing.
+        l.wing_out = WING_OUT_MAX;
+        assert!(l.muzzles(Slot::Wings, 4).iter().all(|p| p.x.abs() <= 3.01));
+
+        // Old saves without the new fields load with the defaults.
+        let old: Loadout = serde_json::from_str(r#"{"convergence": 300.0}"#).unwrap();
+        assert_eq!(old.belly_back, BELLY_BACK);
+        assert_eq!(old.wing_out, WING_OUT);
     }
 
     #[test]

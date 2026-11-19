@@ -10,8 +10,9 @@ use crate::GameState;
 use crate::camera::{ChaseCamera, MouseAim, snap_view};
 use crate::flight::{Aircraft, Player, START_ALTITUDE, start_body};
 use crate::flight_model::{self, Body};
-use crate::settings::{Scenario, Settings};
+use crate::settings::{Ranges, Scenario, Settings, Span};
 use crate::sound::{self, Sounds};
+use crate::weapons::HitStats;
 
 pub struct TargetPlugin;
 
@@ -91,6 +92,16 @@ enum Behavior {
         left: f32,
         last: Vec3,
     },
+    /// Fly along unaware (or watching), then dive away and run once
+    /// alerted. `style`: 0 jinks, 1 rolls, 2 corkscrews.
+    Evade {
+        aware: bool,
+        alerted: bool,
+        style: u8,
+        intensity: f32,
+        dir: Vec3,
+        phase: f32,
+    },
 }
 
 #[derive(Component)]
@@ -142,6 +153,8 @@ pub struct ScenarioState {
     destroyed_for: Option<f32>,
     /// Fraction of your plane destroyed by the target's fire (1 = down).
     pub player_damage: f32,
+    /// Your shot count when the run started (to tell when you open fire).
+    shots_at_start: u32,
     rng: Rng,
     /// What to show in the middle of the screen, and for how long.
     notice: Option<(String, Color, f32)>,
@@ -163,6 +176,7 @@ impl Default for ScenarioState {
             time: 0.0,
             destroyed_for: None,
             player_damage: 0.0,
+            shots_at_start: 0,
             rng: Rng(seed | 1),
             notice: None,
         }
@@ -256,18 +270,13 @@ fn spawn_target(
 /// Start over when the scenario or its settings change in the menu.
 fn restart_on_change(
     settings: Res<Settings>,
-    mut last: Local<Option<(Scenario, f32, f32, bool)>>,
+    mut last: Local<Option<(Scenario, Ranges, bool)>>,
     mut reset: MessageWriter<ResetScenario>,
 ) {
     if !settings.is_changed() {
         return;
     }
-    let now = (
-        settings.scenario,
-        settings.chase_min,
-        settings.chase_max,
-        settings.enemy_fires,
-    );
+    let now = (settings.scenario, settings.ranges, settings.enemy_fires);
     if last.is_some_and(|l| l != now) {
         reset.write(ResetScenario);
     }
@@ -283,6 +292,7 @@ fn scenario_override() -> Option<Scenario> {
         "stall" => Some(Scenario::Stall),
         "dogfight" => Some(Scenario::Dogfight),
         "banking" => Some(Scenario::Banking),
+        "diving" => Some(Scenario::Diving),
         _ => None,
     }
 }
@@ -296,13 +306,14 @@ fn reset_scenario(
     mut camera: Single<&mut ChaseCamera>,
     player: Single<(&mut Aircraft, &mut Transform), (With<Player>, Without<Target>)>,
     targets: Query<(&mut Aircraft, &mut Target, &mut Transform, &mut Visibility), Without<Player>>,
+    shots: Res<HitStats>,
 ) {
     if messages.read().count() == 0 {
         return;
     }
     let (mut player, mut player_tf) = player.into_inner();
     player.body = start_body(&player.model);
-    player.controls.throttle = 0.8;
+    player.controls.throttle = 1.0;
     *player_tf = Transform::from_translation(player.body.position);
     aim.reset();
     snap_view(&mut camera, &aim);
@@ -315,13 +326,24 @@ fn reset_scenario(
             Scenario::Stall,
             Scenario::Dogfight,
             Scenario::Banking,
+            Scenario::Diving,
         ]);
     }
     state.current = scenario;
     state.time = 0.0;
     state.destroyed_for = None;
     state.player_damage = 0.0;
+    state.shots_at_start = shots.shots;
 
+    let ranges = settings.ranges;
+    // Diving: you start this far above the target.
+    let dive_height = if scenario == Scenario::Diving {
+        pick(&mut state.rng, ranges.diving_height)
+    } else {
+        0.0
+    };
+    player.body.position.y += dive_height;
+    player_tf.translation = player.body.position;
     let p = player.body.position;
     let player_speed = player.body.speed();
     for (mut aircraft, mut target, mut tf, mut vis) in targets {
@@ -340,7 +362,7 @@ fn reset_scenario(
         } else {
             match scenario {
                 Scenario::HeadOn => {
-                    let dist = rng.range(1_800.0, 2_600.0);
+                    let dist = pick(rng, ranges.head_on);
                     let alt = rng.range(30.0, 250.0) * rng.signed().signum();
                     let pos = p + Vec3::new(rng.signed() * 150.0, alt, -dist);
                     let speed = model.top_speed(pos.y) * rng.range(0.55, 1.0);
@@ -355,11 +377,7 @@ fn reset_scenario(
                     (t, Body::new(pos, heading(dir), speed))
                 }
                 Scenario::Chase => {
-                    let (lo, hi) = (
-                        settings.chase_min.min(settings.chase_max),
-                        settings.chase_max.max(settings.chase_min),
-                    );
-                    let dist = rng.range(lo, hi);
+                    let dist = pick(rng, ranges.chase);
                     let pos = p + Vec3::new(
                         rng.signed() * 0.08 * dist,
                         rng.signed() * 0.04 * dist,
@@ -380,7 +398,7 @@ fn reset_scenario(
                     let pos = p + Vec3::new(
                         rng.signed() * 30.0,
                         rng.range(40.0, 120.0),
-                        -rng.range(90.0, 200.0),
+                        -pick(rng, ranges.stall),
                     );
                     let t = Target::new(Behavior::Climb {
                         intensity: rng.pick(&INTENSITIES),
@@ -396,7 +414,7 @@ fn reset_scenario(
                     } else {
                         rng.range(0.0, std::f32::consts::TAU)
                     };
-                    let dist = rng.range(400.0, 1_000.0);
+                    let dist = pick(rng, ranges.dogfight);
                     let pos = p + Vec3::new(
                         bearing.sin() * dist,
                         rng.signed() * 250.0,
@@ -416,7 +434,7 @@ fn reset_scenario(
                     (Target::new(behavior), Body::new(pos, heading(dir), speed))
                 }
                 Scenario::Banking => {
-                    let dist = rng.range(500.0, 1_300.0);
+                    let dist = pick(rng, ranges.banking);
                     // Which side of the screen it starts on (-1 left, +1 right).
                     let side = rng.signed().signum();
                     // Path: low to high, straight across, or high to low.
@@ -449,6 +467,26 @@ fn reset_scenario(
                     t.hold_speed = Some(speed);
                     (t, Body::new(pos, heading(dir), speed))
                 }
+                Scenario::Diving => {
+                    let dist = pick(rng, ranges.diving);
+                    let bearing = rng.signed() * 25f32.to_radians();
+                    let pos =
+                        p + Vec3::new(bearing.sin() * dist, -dive_height, -bearing.cos() * dist);
+                    // Any heading; it cruises along until it notices you.
+                    let course = rng.range(0.0, std::f32::consts::TAU);
+                    let dir = Vec3::new(course.sin(), 0.0, -course.cos());
+                    let speed = model.top_speed(pos.y) * rng.range(0.6, 0.85);
+                    let mut t = Target::new(Behavior::Evade {
+                        aware: rng.unit() < 0.5,
+                        alerted: false,
+                        style: rng.pick(&[0u8, 1, 2]),
+                        intensity: rng.pick(&INTENSITIES),
+                        dir,
+                        phase: 0.0,
+                    });
+                    t.hold_speed = Some(speed);
+                    (t, Body::new(pos, heading(dir), speed))
+                }
                 Scenario::AllInOne => unreachable!("picked above"),
             }
         };
@@ -458,6 +496,11 @@ fn reset_scenario(
         tf.translation = aircraft.body.position;
         tf.rotation = aircraft.body.rotation;
     }
+}
+
+/// A random value in a range.
+fn pick(rng: &mut Rng, span: Span) -> f32 {
+    rng.range(span.min.min(span.max), span.max.max(span.min))
 }
 
 /// Rotate `dir` by a yaw and pitch offset (rad).
@@ -473,6 +516,7 @@ pub fn fly_target(
     mut state: ResMut<ScenarioState>,
     player: Single<&Aircraft, (With<Player>, Without<Target>)>,
     mut targets: Query<(&mut Transform, &mut Aircraft, &mut Target), Without<Player>>,
+    shots: Res<HitStats>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
@@ -564,6 +608,78 @@ pub fn fly_target(
                     lead.unwrap_or_else(|| rel.normalize_or(Vec3::NEG_Z))
                 }
             }
+            Behavior::Evade {
+                aware,
+                alerted,
+                style,
+                intensity,
+                dir,
+                phase,
+            } => {
+                let mut alerted = alerted;
+                if !alerted {
+                    // Alerted by your fire, or (if it's watching) by you
+                    // diving at it.
+                    let fired = shots.shots > state.shots_at_start;
+                    let to_it = (pos - player.position).normalize_or_zero();
+                    let pv = player.velocity.normalize_or_zero();
+                    let diving_at = pv.y < -0.17 && pv.dot(to_it) > 0.85;
+                    alerted = fired || (aware && (diving_at || range < 500.0));
+                    if alerted {
+                        // Full throttle from here on.
+                        target.hold_speed = None;
+                        target.next_dodge = 0.0;
+                        target.roll = 0.0;
+                    }
+                }
+                let phase = if alerted { phase + dt } else { phase };
+                target.behavior = Behavior::Evade {
+                    aware,
+                    alerted,
+                    style,
+                    intensity,
+                    dir,
+                    phase,
+                };
+                if !alerted {
+                    dir
+                } else {
+                    // Dive away from you and run, leveling off near the ground.
+                    let away = (pos - player.position).with_y(0.0).normalize_or(dir);
+                    let dive = if pos.y > 700.0 {
+                        -(0.3 + 0.3 * intensity)
+                    } else if pos.y > 350.0 {
+                        -0.1
+                    } else {
+                        0.08
+                    };
+                    let (yaw, pitch) = match style {
+                        // Corkscrew: the nose circles round the escape line.
+                        2 => {
+                            let a = (0.15 + 0.35 * intensity) * 0.5;
+                            let w = 1.4 + intensity;
+                            (a * (phase * w).sin(), a * (phase * w).cos())
+                        }
+                        // Jinks (and rolls, which also jink a little).
+                        _ => {
+                            if new_dodge {
+                                let rng = &mut state.rng;
+                                let k = if style == 1 { 0.4 } else { 1.0 };
+                                target.dodge = Vec2::new(
+                                    rng.signed() * intensity * 35f32.to_radians() * k,
+                                    rng.signed() * intensity * 15f32.to_radians() * k,
+                                );
+                                if style == 1 {
+                                    target.roll = rng.signed().signum() * (0.4 + 0.6 * intensity);
+                                }
+                                target.next_dodge = rng.range(0.8, 2.5) * (1.3 - intensity * 0.6);
+                            }
+                            (target.dodge.x, target.dodge.y)
+                        }
+                    };
+                    offset_dir(away, yaw, dive + pitch)
+                }
+            }
             Behavior::Bank {
                 turn,
                 climb,
@@ -604,7 +720,11 @@ pub fn fly_target(
 
         let hold_speed = target.hold_speed;
         let roll = target.roll;
-        let is_climb = matches!(target.behavior, Behavior::Climb { .. });
+        let extra_roll = match target.behavior {
+            Behavior::Climb { .. } => true,
+            Behavior::Evade { alerted, style, .. } => alerted && style == 1,
+            _ => false,
+        };
         let Aircraft {
             model,
             body,
@@ -612,7 +732,7 @@ pub fn fly_target(
             ..
         } = &mut *aircraft;
         *controls = flight_model::instructor(model, body, aim, dt);
-        if is_climb {
+        if extra_roll {
             controls.roll = (controls.roll + roll).clamp(-1.0, 1.0);
         }
         controls.throttle = match hold_speed {
@@ -652,6 +772,7 @@ fn take_hits(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     targets: Query<(&mut Target, &Transform, &mut Visibility)>,
+    mut sphere: Local<Option<Handle<Mesh>>>,
 ) {
     let damage: f32 = hits.read().map(|h| h.damage).sum();
     if damage <= 0.0 {
@@ -674,7 +795,11 @@ fn take_hits(
             commands.spawn((
                 Explosion { age: 0.0 },
                 Transform::from_translation(tf.translation),
-                Mesh3d(meshes.add(Sphere::new(1.0))),
+                Mesh3d(
+                    sphere
+                        .get_or_insert_with(|| meshes.add(Sphere::new(1.0)))
+                        .clone(),
+                ),
                 MeshMaterial3d(materials.add(StandardMaterial {
                     base_color: Color::srgba(1.0, 0.8, 0.35, 0.95),
                     unlit: true,
@@ -763,6 +888,7 @@ fn end_of_run(
                 Scenario::Stall => state.time > 25.0,
                 // Once it has finished its turn and flown on a while.
                 Scenario::Banking => state.time > 22.0,
+                Scenario::Diving => state.time > 45.0,
                 _ => false,
             };
             if over {

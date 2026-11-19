@@ -502,14 +502,19 @@ fn update_hud(
 
     let body = &plane.body;
     texts.p2().0 = format!(
-        "{}\nIAS {}\nTAS {}\nALT {}\nTHR {:.0} %\nG {:.1}",
+        "{}\nIAS {}\nTAS {}\nALT {}\nTHR {:.0} %{}\nG {:.1}",
         plane.model.name,
         units.speed(
             body.speed() * (air_density(body.position.y.max(0.0)) / air_density(0.0)).sqrt()
         ),
         units.speed(body.speed()),
-        units.distance(body.position.y),
+        units.altitude(body.position.y),
         plane.controls.throttle * 100.0,
+        if plane.controls.throttle > 1.0 {
+            " AB"
+        } else {
+            ""
+        },
         body.g_load,
     );
     **nodes.p3() = if plane.is_stalled() {

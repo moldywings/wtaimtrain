@@ -66,6 +66,10 @@ pub struct AircraftCard {
     /// Airspeed of that best roll rate, m/s. Below it the ailerons have less
     /// bite; above it they slowly stiffen.
     pub roll_speed: Option<f32>,
+    /// Jets only: has an afterburner, lit by pushing the throttle past 100%.
+    pub afterburner: bool,
+    /// Thrust per engine with the afterburner lit, kgf (blank: 1.5x dry).
+    pub afterburner_thrust: Option<f32>,
     /// Guns and where they're mounted.
     pub weapons: crate::weapons::Loadout,
 }
@@ -108,8 +112,15 @@ impl AircraftCard {
             cl_max: None,
             roll_rate: Some(165.0),
             roll_speed: Some(480.0 / 3.6),
+            afterburner: false,
+            afterburner_thrust: None,
             weapons: crate::weapons::Loadout::default(),
         }
+    }
+
+    /// Whether this card's afterburner is in use (jets only).
+    pub fn has_afterburner(&self) -> bool {
+        self.engine == EngineKind::Jet && self.afterburner
     }
 
     /// Fill in any blank optional figures with typical values for the
@@ -201,6 +212,8 @@ pub struct FlightModel {
     pub efficiency: f32,
     /// Static thrust cap for props, N.
     pub static_thrust: f32,
+    /// Total thrust with the afterburner lit, N (0 without one).
+    pub ab_power: f32,
     /// Altitude up to which engine output holds (supercharger), m.
     pub critical_altitude: f32,
     /// Zero-lift drag coefficient. Solved.
@@ -274,6 +287,8 @@ pub fn roll_authority(m: &FlightModel, v: f32) -> f32 {
     m.roll_rate * build / (1.0 + 0.9 * over * over)
 }
 const ASPECT_RATIO: f32 = 6.0;
+/// Throttle setting with the afterburner fully lit (shown as 110%, like the game).
+pub const AFTERBURNER_THROTTLE: f32 = 1.1;
 
 impl FlightModel {
     pub fn from_card(card: &AircraftCard) -> FlightModel {
@@ -302,6 +317,12 @@ impl FlightModel {
             power,
             efficiency: 0.8,
             static_thrust,
+            ab_power: if card.has_afterburner() {
+                let per = card.afterburner_thrust.unwrap_or(card.power.max(1.0) * 1.5);
+                (per * engines * KGF).max(power)
+            } else {
+                0.0
+            },
             critical_altitude,
             cd0: 0.02,
             k: 1.0 / (std::f32::consts::PI * 0.8 * ASPECT_RATIO),
@@ -342,7 +363,7 @@ impl FlightModel {
                 let mut m = self.clone();
                 m.k = k;
                 m.fit_cd0(card);
-                m.drag(turn_speed, 0.0, n) - m.thrust(turn_speed, 0.0, 1.0)
+                m.drag(turn_speed, 0.0, n) - m.thrust(turn_speed, 0.0, m.max_throttle())
             });
             self.fit_cd0(card);
         }
@@ -356,7 +377,7 @@ impl FlightModel {
         let s = self.wing_area;
         let w = self.mass * G;
         let induced = self.k * (w / (q * s)).powi(2);
-        self.cd0 = (self.thrust(v, h, 1.0) / (q * s) - induced).max(0.004);
+        self.cd0 = (self.thrust(v, h, self.max_throttle()) / (q * s) - induced).max(0.004);
     }
 
     /// Engine output at altitude: constant up to the critical altitude, then
@@ -374,8 +395,25 @@ impl FlightModel {
         }
     }
 
-    /// Thrust in newtons at airspeed `v`, altitude `h`, throttle 0..=1.
+    /// Highest throttle setting: 1, or [`AFTERBURNER_THROTTLE`] with an
+    /// afterburner.
+    pub fn max_throttle(&self) -> f32 {
+        if self.ab_power > 0.0 {
+            AFTERBURNER_THROTTLE
+        } else {
+            1.0
+        }
+    }
+
+    /// Thrust in newtons at airspeed `v`, altitude `h`, throttle 0..=1 (up
+    /// to [`AFTERBURNER_THROTTLE`] with the afterburner).
     pub fn thrust(&self, v: f32, h: f32, throttle: f32) -> f32 {
+        if throttle > 1.0 && self.ab_power > 0.0 {
+            let ab = ((throttle - 1.0) / (AFTERBURNER_THROTTLE - 1.0)).min(1.0);
+            let dry = self.efficiency * self.power;
+            let wet = self.efficiency * self.ab_power;
+            return self.altitude_factor(h) * (dry + (wet - dry) * ab);
+        }
         let f = self.altitude_factor(h) * throttle.clamp(0.0, 1.0);
         match self.engine {
             EngineKind::Prop => {
@@ -407,7 +445,7 @@ impl FlightModel {
         let mut best = f32::MIN;
         let mut v = vs * 1.1;
         while v < 320.0 {
-            let excess = (self.thrust(v, h, 1.0) - self.drag(v, h, 1.0)) * v;
+            let excess = (self.thrust(v, h, self.max_throttle()) - self.drag(v, h, 1.0)) * v;
             best = best.max(excess / (self.mass * G));
             v += 2.0;
         }
@@ -419,7 +457,7 @@ impl FlightModel {
     pub fn sustained_turn_rate_at(&self, v: f32, h: f32) -> f32 {
         let q = 0.5 * air_density(h) * v * v;
         let s = self.wing_area;
-        let t = self.thrust(v, h, 1.0);
+        let t = self.thrust(v, h, self.max_throttle());
         let cl_thrust = ((t / (q * s) - self.cd0) / self.k).max(0.0).sqrt();
         let n = (cl_thrust.min(self.cl_max) * q * s / (self.mass * G)).min(self.g_limit);
         if n > 1.0 {
@@ -450,7 +488,7 @@ impl FlightModel {
         let mut v = self.stall_speed(h);
         while v < 320.0 {
             let q = 0.5 * rho * v * v;
-            let t = self.thrust(v, h, 1.0);
+            let t = self.thrust(v, h, self.max_throttle());
             let cl_thrust = ((t / (q * s) - self.cd0) / self.k).max(0.0).sqrt();
             let cl = cl_thrust.min(self.cl_max);
             let n = (cl * q * s / w).min(self.g_limit);
@@ -465,7 +503,9 @@ impl FlightModel {
     /// Level top speed (m/s) at altitude `h`.
     pub fn top_speed(&self, h: f32) -> f32 {
         let lo = self.stall_speed(h) * 1.3;
-        bisect(lo, 400.0, |v| self.thrust(v, h, 1.0) - self.drag(v, h, 1.0))
+        bisect(lo, 400.0, |v| {
+            self.thrust(v, h, self.max_throttle()) - self.drag(v, h, 1.0)
+        })
     }
 
     pub fn performance(&self, card: &AircraftCard) -> Performance {
@@ -569,6 +609,9 @@ pub struct Body {
     /// first call), and how fast it's turning (world rad/s).
     pub aim_smoothed: Vec3,
     pub aim_rate: Vec3,
+    /// How far the instructor is into "roll over and pull" (0..1), eased
+    /// so it doesn't flick between that and pitch-and-rudder.
+    pub roll_mode: f32,
 }
 
 impl Body {
@@ -583,6 +626,7 @@ impl Body {
             trim: 0.0,
             aim_smoothed: Vec3::ZERO,
             aim_rate: Vec3::ZERO,
+            roll_mode: 0.0,
         }
     }
 
@@ -610,6 +654,16 @@ pub fn alpha_beta(rotation: Quat, velocity: Vec3) -> (f32, f32) {
 /// stall angle. A bit over 1 so you can stall it by yanking at low speed.
 const ELEVATOR_ALPHA: f32 = 1.2;
 const RUDDER_BETA: f32 = 0.12;
+/// Side force per radian of sideslip (times dynamic pressure and wing
+/// area). Enough that the rudder alone can swing the flight path a few
+/// degrees a second, as in the game, so small aim moves need little bank.
+const SIDE_FORCE: f32 = 1.6;
+
+/// How fast the rudder alone (wings level, a full slip) turns the flight
+/// path, rad/s.
+fn rudder_turn_rate(model: &FlightModel, q: f32, v: f32) -> f32 {
+    (q * model.wing_area * SIDE_FORCE * RUDDER_BETA * 0.8 / (model.mass * v.max(20.0))).max(0.005)
+}
 
 /// Advance one aircraft by `dt` seconds. Splits large steps for stability.
 pub fn step(model: &FlightModel, body: &mut Body, controls: &Controls, dt: f32) {
@@ -644,7 +698,7 @@ fn substep(m: &FlightModel, b: &mut Body, c: &Controls, dt: f32) {
     let side_dir = (right - vhat * right.dot(vhat)).normalize_or_zero();
     let lift = lift_dir * (q * s * cl);
     let drag = -vhat * (q * s * cd);
-    let side = side_dir * (-q * s * 0.8 * beta);
+    let side = side_dir * (-q * s * SIDE_FORCE * beta);
     let thrust = fwd * m.thrust(v, b.position.y, c.throttle);
     let gravity = Vec3::NEG_Y * (m.mass * G);
     let accel = (lift + drag + side + thrust + gravity) / m.mass;
@@ -788,8 +842,31 @@ fn instructor_tuned(
     let yaw_err = local.x.atan2(-local.z);
     let wanted_left_bank = (-yaw_err * tune.heading_bank).clamp(-0.3, 0.3);
     let bank_to_level = right.y.clamp(-1.0, 1.0).asin() - wanted_left_bank;
-    let w = smoothstep(tune.level_below, tune.bank_above, predicted_off);
-    let roll_err = w * bank_to_target + (1.0 - w) * bank_to_level;
+    // Diving or climbing steeply, this controller flies even the small
+    // moves (the coordinated one can't tell its heading there). Roll only
+    // when rolling is the faster way; otherwise pitch and rudder with the
+    // wings held, as the game does.
+    let fwd = body.forward();
+    let steep = smoothstep(0.85, 1.1, fwd.y.abs().clamp(0.0, 1.0).asin());
+    let q = 0.5 * air_density(body.position.y) * v * v;
+    if tune.roll_choice {
+        let target = roll_over_weight(model, local, v, q, tune);
+        let tau = if target > body.roll_mode {
+            tune.roll_in
+        } else {
+            tune.roll_out
+        };
+        body.roll_mode += (target - body.roll_mode) * (1.0 - (-dt / tau.max(1e-3)).exp());
+    }
+    let roll_gate = if tune.roll_choice {
+        1.0 - steep * (1.0 - body.roll_mode)
+    } else {
+        1.0
+    };
+    let w = smoothstep(tune.level_below, tune.bank_above, predicted_off) * roll_gate;
+    // Pointing steeply down or up, "wings level" means little and chasing
+    // it would roll the plane around as it yaws: just hold the roll.
+    let roll_err = w * bank_to_target + (1.0 - w) * bank_to_level * (1.0 - steep);
     // Roll error -> desired roll rate -> stick, with damping on roll rate.
     let roll_rate_wanted = roll_err * tune.roll_gain;
     let roll_rate_now = -body.omega.z;
@@ -803,7 +880,6 @@ fn instructor_tuned(
     let roll_lag = (w * bank_to_target.abs() / 1.2).clamp(0.0, 0.85);
     // Feed-forward: the angle of attack that holds the nose up against
     // gravity, so the nose doesn't sag below the aim in level flight.
-    let q = 0.5 * air_density(body.position.y) * v * v;
     let up = body.rotation * Vec3::Y;
     let alpha_hold = if q > 50.0 {
         (model.mass * G * up.y.max(0.0) / (q * model.wing_area * model.cl_alpha))
@@ -825,9 +901,10 @@ fn instructor_tuned(
     let pitch = (alpha_wanted.clamp(-0.5 * alpha_limit, alpha_limit) / alpha_max).clamp(-1.0, 1.0);
 
     // Rudder puts the nose right on the aim for the last few degrees.
-    let yaw = ((yaw_err * tune.rudder_gain + rel.y * tune.rudder_damp)
-        * (1.0 - w * tune.rudder_fade))
-        .clamp(-1.0, 1.0);
+    // While rolling over toward the aim, the rudder backs right off: it's
+    // only for fine tuning.
+    let yaw = (yaw_err * tune.rudder_gain + rel.y * tune.rudder_damp).clamp(-1.0, 1.0)
+        * (1.0 - w * tune.rudder_fade);
     let large = Controls {
         pitch,
         roll,
@@ -839,9 +916,13 @@ fn instructor_tuned(
     // smooth "turn this way at this rate" command sets the bank, the pull
     // and the rudder together, so all three move in step.
     let fine = coordinated(model, body, aim, q, tune, dt);
-    let fwd = body.forward();
-    let steep = smoothstep(1.1, 1.35, fwd.y.abs().clamp(0.0, 1.0).asin());
-    let wl = smoothstep(tune.big_lo, tune.big_hi, off_nose).max(steep);
+    let wl = if !tune.roll_choice {
+        smoothstep(tune.big_lo, tune.big_hi, off_nose)
+    } else {
+        // Commit to rolling quickly, let go of it slowly (eased above).
+        body.roll_mode
+    }
+    .max(steep);
     if wl <= 0.0 {
         return fine;
     }
@@ -854,6 +935,58 @@ fn instructor_tuned(
         yaw: fine.yaw + (large.yaw - fine.yaw) * wl,
         throttle: 0.0,
     }
+}
+
+/// How much to fly "roll the aim over the canopy and pull" rather than
+/// "pitch and rudder straight at it, wings steady" (0..1), the way War
+/// Thunder's instructor picks the faster path. Rudder only reaches a few
+/// degrees quickly, so small moves are pitch and yaw; once rolling and
+/// pulling gets there sooner, it rolls (over onto its back if the aim is
+/// below) and pulls, leaving the rudder for the last bit.
+fn roll_over_weight(
+    model: &FlightModel,
+    local: Vec3,
+    v: f32,
+    q: f32,
+    tune: InstructorTuning,
+) -> f32 {
+    let off = local.angle_between(Vec3::NEG_Z);
+    if off < 0.01 || q < 50.0 {
+        return 0.0;
+    }
+    let v = v.max(20.0);
+    let w = model.mass * G;
+    let n_avail = (0.85 * model.cl_max * q * model.wing_area / w)
+        .min(model.g_limit)
+        .max(1.0);
+    // Pitch rate pulling (pushing gets much less), roll rate, and how fast
+    // the rudder swings the flight path once the nose is slipped over.
+    let pull_rate = (G * (n_avail * n_avail - 1.0).sqrt() / v).max(0.05);
+    let roll_rate = roll_authority(model, v).max(0.3);
+    let slip_rate = rudder_turn_rate(model, q, v);
+    // Rudder plus a shallow coordinated bank covers this much sideways
+    // quickly.
+    let reach = tune.flat_reach;
+    let ex = local.x.atan2(-local.z);
+    let ey = local.y.atan2(-local.z);
+    // Without rolling: elevator up or down, rudder sideways.
+    let t_pitch = if ey >= 0.0 {
+        ey / pull_rate
+    } else {
+        -ey / (tune.push_share * pull_rate)
+    };
+    let t_yaw = 0.25 + (ex.abs() - reach).max(0.0) / slip_rate;
+    // The rudder and elevator share the work, but a slipping, pushing plane
+    // doesn't do both at full rate.
+    let t_flat = t_pitch + t_yaw;
+    // Rolling the aim above the canopy, then pulling.
+    let t_roll = local.x.atan2(local.y).abs() / roll_rate + off / pull_rate;
+    // The last few degrees are always pitch and rudder.
+    smoothstep(
+        -tune.roll_margin,
+        tune.roll_margin,
+        t_flat - t_roll - tune.roll_bias,
+    ) * smoothstep(0.03, 0.08, off)
 }
 
 /// Coordinated-turn mouse aim for aims near the nose. The heading and
@@ -903,7 +1036,11 @@ fn coordinated(
     let cos_t = theta.cos().max(0.2);
     // Small corrections need only a little bank; the rudder does the rest.
     // (The bank that follows the aim's own motion isn't capped.)
-    let phi_follow = (v * psi_rate_aim.clamp(-w_max, w_max) * cos_t / G).atan();
+    // Only the part of the aim's sideways motion the rudder can't follow on
+    // its own: slow drags are flown nearly wings level, like the game.
+    let rudder_rate = rudder_turn_rate(model, q, v) * tune.rudder_follow;
+    let follow = psi_rate_aim.signum() * (psi_rate_aim.abs() - rudder_rate).max(0.0);
+    let phi_follow = (v * follow.clamp(-w_max, w_max) * cos_t / G).atan();
     let bank_cap = (tune.k_phi_cap * psi_err.abs()).min(1.4);
     let phi_wanted = (phi_follow
         + ((v * turn * cos_t / G).atan() - phi_follow).clamp(-bank_cap, bank_cap))
@@ -990,6 +1127,21 @@ struct InstructorTuning {
     k_rudder_rate: f32,
     /// Bank allowed per radian of heading error.
     k_phi_cap: f32,
+    /// Pick roll-and-pull by which path is faster (else by `big_lo`/`big_hi`).
+    roll_choice: bool,
+    /// Pushing's pitch rate as a share of pulling's (for choosing to roll).
+    push_share: f32,
+    /// Seconds over which the choice to roll fades in, and how much sooner
+    /// rolling must be to be chosen.
+    roll_margin: f32,
+    roll_bias: f32,
+    /// How far sideways (rad) pitch-and-rudder covers quickly.
+    flat_reach: f32,
+    /// Share of the rudder's own turn rate to fly without banking.
+    rudder_follow: f32,
+    /// Time constants for easing into and out of rolling, s.
+    roll_in: f32,
+    roll_out: f32,
 }
 
 impl InstructorTuning {
@@ -1004,7 +1156,7 @@ impl InstructorTuning {
             pitch_damp: 0.1,
             rudder_gain: 150.0,
             rudder_damp: 8.0,
-            rudder_fade: 0.5,
+            rudder_fade: 0.85,
             aim_smooth: 0.22,
             rate_smooth: 0.1,
             aim_feed: 1.0,
@@ -1019,7 +1171,15 @@ impl InstructorTuning {
             trim_gain: 1.0,
             k_rudder: 80.0,
             k_rudder_rate: 8.0,
-            k_phi_cap: 16.0,
+            k_phi_cap: 6.0,
+            roll_choice: true,
+            push_share: 0.5,
+            roll_margin: 0.3,
+            roll_bias: -0.2,
+            flat_reach: 0.17,
+            rudder_follow: 0.8,
+            roll_in: 0.08,
+            roll_out: 0.4,
         }
     }
 }
@@ -1291,11 +1451,27 @@ mod tests {
             cl_max: None,
             roll_rate: None,
             roll_speed: None,
+            afterburner: false,
+            afterburner_thrust: None,
             weapons: Default::default(),
         };
         let m = FlightModel::from_card(&card);
         println!("jet {:?}", m.check);
         assert!((m.check.top_speed - card.top_speed).abs() < 5.0);
+
+        // With an afterburner the card's figures are at full afterburner,
+        // and 100% dry throttle gives less.
+        let ab = AircraftCard {
+            afterburner: true,
+            afterburner_thrust: Some(4000.0),
+            ..card
+        };
+        let m = FlightModel::from_card(&ab);
+        println!("jet with afterburner {:?}", m.check);
+        assert!((m.check.top_speed - ab.top_speed).abs() < 5.0);
+        assert_eq!(m.max_throttle(), AFTERBURNER_THROTTLE);
+        let (v, h) = (250.0, 1000.0);
+        assert!(m.thrust(v, h, 1.0) < m.thrust(v, h, AFTERBURNER_THROTTLE) * 0.75);
     }
 }
 
@@ -1785,6 +1961,306 @@ mod compare_probe {
                 line += &format!("[{rate}/s c{c:.1} j{j:.2} e{e:.2}] ");
             }
             println!("{line}");
+        }
+    }
+}
+
+/// How the instructor answers an aim step: settle time and how much each
+/// control is used. `cargo test wt_probe -- --ignored --nocapture`.
+#[cfg(test)]
+mod wt_probe {
+    use super::*;
+
+    /// Step the aim `mag` degrees off the nose toward `dir` degrees (0 =
+    /// right, 90 = up, -45 = down and right).
+    pub(super) fn step_response(t: InstructorTuning, mag: f32, dir: f32) -> [f32; 5] {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 140.0);
+        let (s, c) = mag.to_radians().sin_cos();
+        let (ds, dc) = dir.to_radians().sin_cos();
+        let aim = (Vec3::NEG_Z * c + (Vec3::X * dc + Vec3::Y * ds) * s).normalize();
+        let dt = 1.0 / 120.0;
+        let mut settled = 0.0;
+        let (mut roll, mut pitch, mut yaw, mut bank) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for i in 0..(120 * 8) {
+            let mut ctl = instructor_tuned(&m, &mut b, aim, dt, t);
+            ctl.throttle = 1.0;
+            step(&m, &mut b, &ctl, dt);
+            let tt = i as f32 * dt;
+            if b.forward().angle_between(aim).to_degrees() > 0.5 {
+                settled = tt;
+            }
+            if tt < 1.5 {
+                roll += ctl.roll.abs() * dt;
+                pitch += ctl.pitch.abs() * dt;
+                yaw += ctl.yaw.abs() * dt;
+                let up = b.rotation * Vec3::Y;
+                let right = b.rotation * Vec3::X;
+                bank = bank.max((-right.y).atan2(up.y).abs().to_degrees());
+            }
+        }
+        [settled, roll, pitch, yaw, bank]
+    }
+
+    pub(super) const CASES: [(f32, f32); 11] = [
+        (2.0, 0.0),
+        (3.0, -45.0),
+        (4.0, 90.0),
+        (5.0, 0.0),
+        (8.0, -45.0),
+        (12.0, -45.0),
+        (15.0, -45.0),
+        (20.0, 0.0),
+        (30.0, -45.0),
+        (60.0, 0.0),
+        (90.0, -45.0),
+    ];
+
+    pub(super) fn report(name: &str, t: InstructorTuning) {
+        println!("{name}:  mag/dir  settle  roll  pitch  yaw  maxbank");
+        for (mag, dir) in CASES {
+            let r = step_response(t, mag, dir);
+            println!(
+                "  {mag:>4}/{dir:<4} {:>6.2} {:>5.2} {:>5.2} {:>5.2} {:>5.0}",
+                r[0], r[1], r[2], r[3], r[4]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn wt_flips() {
+        let cur = InstructorTuning::get();
+        for (name, t) in [
+            ("cur", cur),
+            (
+                "before",
+                InstructorTuning {
+                    roll_choice: false,
+                    k_phi_cap: 16.0,
+                    rudder_fade: 0.5,
+                    ..cur
+                },
+            ),
+            (
+                "reach .22",
+                InstructorTuning {
+                    flat_reach: 0.22,
+                    ..cur
+                },
+            ),
+        ] {
+            for a in [3.0, 5.0, 8.0, 12.0, 16.0, 20.0] {
+                let (f, b) = super::smooth_sweep_pub::reversals(t, -a);
+                println!("{name} {a}: flips {f} bank {b:.0}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn wt_probe() {
+        let cur = InstructorTuning::get();
+        report(
+            "before (by angle)",
+            InstructorTuning {
+                roll_choice: false,
+                k_phi_cap: 16.0,
+                rudder_fade: 0.5,
+                ..cur
+            },
+        );
+        report("current", cur);
+        report(
+            "wider flat reach",
+            InstructorTuning {
+                flat_reach: 0.22,
+                ..cur
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod wt_trace {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn wt_trace() {
+        let t = InstructorTuning::get();
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 150.0);
+        let dt = 1.0 / 60.0;
+        let aim = super::jump_probe::dir(-20.0, 0.0);
+        for i in 0..150 {
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, t);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            if i % 4 == 0 {
+                let up = b.rotation * Vec3::Y;
+                let right = b.rotation * Vec3::X;
+                println!(
+                    "{:.2} off {:5.1} mode {:.2} bank {:5.0} roll {:5.2} pitch {:5.2} yaw {:5.2}",
+                    i as f32 * dt,
+                    b.forward().angle_between(aim).to_degrees(),
+                    b.roll_mode,
+                    (-right.y).atan2(up.y).to_degrees(),
+                    c.roll,
+                    c.pitch,
+                    c.yaw
+                );
+            }
+        }
+    }
+}
+
+/// Tracking an aim that sweeps sideways at a steady rate, like a slow
+/// mouse drag: how much it banks and how far behind the nose lags.
+#[cfg(test)]
+mod track_probe {
+    use super::*;
+
+    pub(super) fn track(t: InstructorTuning, rate_deg: f32, up_deg: f32) -> (f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 140.0);
+        let dt = 1.0 / 120.0;
+        let (mut bank, mut err) = (0.0f32, 0.0f32);
+        let n = 120 * 3;
+        for i in 0..n {
+            let tt = i as f32 * dt;
+            let aim = Quat::from_euler(
+                bevy::math::EulerRot::YXZ,
+                -(rate_deg * tt).to_radians(),
+                (up_deg * tt).to_radians(),
+                0.0,
+            ) * Vec3::NEG_Z;
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, t);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            if tt > 1.0 {
+                let up = b.rotation * Vec3::Y;
+                let right = b.rotation * Vec3::X;
+                bank = bank.max((-right.y).atan2(up.y).abs().to_degrees());
+                err += b.forward().angle_between(aim).to_degrees() / (n as f32 - 120.0);
+            }
+        }
+        (bank, err)
+    }
+
+    #[test]
+    #[ignore]
+    fn track_probe() {
+        let cur = InstructorTuning::get();
+        for (name, t) in [
+            ("cur", cur),
+            (
+                "cap 3",
+                InstructorTuning {
+                    k_phi_cap: 3.0,
+                    ..cur
+                },
+            ),
+            (
+                "follow 1.2",
+                InstructorTuning {
+                    rudder_follow: 1.2,
+                    ..cur
+                },
+            ),
+        ] {
+            for (r, u) in [
+                (1.0, 0.0),
+                (2.0, 0.0),
+                (4.0, 0.0),
+                (8.0, 0.0),
+                (15.0, 0.0),
+                (3.0, 2.0),
+            ] {
+                let (bank, err) = track(t, r, u);
+                println!(
+                    "{name}: {r} deg/s right, {u} up: max bank {bank:.0}, mean lag {err:.2} deg"
+                );
+            }
+        }
+    }
+}
+
+/// Diving steeply with the aim a few degrees off the nose: how much it
+/// rolls to get there.
+#[cfg(test)]
+mod dive_probe {
+    use super::*;
+
+    pub(super) fn dive_step(t: InstructorTuning, dive: f32, mag: f32, dir: f32) -> (f32, f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let rot = Quat::from_rotation_x(-dive.to_radians());
+        let mut b = Body::new(Vec3::new(0.0, 3000.0, 0.0), rot, 150.0);
+        let (s, c) = mag.to_radians().sin_cos();
+        let (ds, dc) = dir.to_radians().sin_cos();
+        let aim = rot * (Vec3::NEG_Z * c + (Vec3::X * dc + Vec3::Y * ds) * s).normalize();
+        let dt = 1.0 / 120.0;
+        let (mut roll_turned, mut settled, mut rollsum) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..(120 * 4) {
+            // Keep the aim fixed relative to the flight path direction's
+            // start, like a target dead ahead in the dive.
+            let mut ctl = instructor_tuned(&m, &mut b, aim, dt, t);
+            ctl.throttle = 1.0;
+            step(&m, &mut b, &ctl, dt);
+            let tt = i as f32 * dt;
+            if b.forward().angle_between(aim).to_degrees() > 0.5 {
+                settled = tt;
+            }
+            if tt < 2.0 {
+                rollsum += ctl.roll.abs() * dt;
+                roll_turned += b.omega.z.abs().to_degrees() * dt;
+            }
+        }
+        (settled, rollsum, roll_turned)
+    }
+
+    pub(super) fn dive_track(t: InstructorTuning, dive: f32, rate: f32) -> (f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let rot = Quat::from_rotation_x(-dive.to_radians());
+        let mut b = Body::new(Vec3::new(0.0, 4000.0, 0.0), rot, 150.0);
+        let dt = 1.0 / 120.0;
+        let (mut rolled, mut err) = (0.0f32, 0.0f32);
+        for i in 0..(120 * 3) {
+            let tt = i as f32 * dt;
+            let aim = Quat::from_rotation_y(-(rate * tt).to_radians()) * rot * Vec3::NEG_Z;
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, t);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            if tt > 1.0 {
+                rolled += b.omega.z.abs().to_degrees() * dt;
+                err = err.max(b.forward().angle_between(aim).to_degrees());
+            }
+        }
+        (rolled, err)
+    }
+
+    #[test]
+    #[ignore]
+    fn dive_probe() {
+        for dive in [50.0, 65.0, 75.0, 85.0] {
+            for rate in [3.0, 8.0, 20.0] {
+                let (r, e) = dive_track(InstructorTuning::get(), dive, rate);
+                println!("track dive {dive} at {rate} deg/s: rolled {r:.0} max err {e:.1}");
+            }
+        }
+        let t = InstructorTuning::get();
+        println!("dive mag/dir: settle  roll-stick  wing-turn(deg)");
+        for dive in [0.0, 30.0, 50.0, 60.0, 70.0, 85.0] {
+            for (mag, dir) in [
+                (3.0, 0.0),
+                (6.0, 0.0),
+                (6.0, -60.0),
+                (10.0, 180.0),
+                (15.0, -90.0),
+                (25.0, 0.0),
+            ] {
+                let (s, r, w) = dive_step(t, dive, mag, dir);
+                println!("  {dive} {mag}/{dir}: {s:.2} {r:.2} {w:.0}");
+            }
         }
     }
 }
