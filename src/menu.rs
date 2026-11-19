@@ -23,7 +23,9 @@ use crate::settings::{
     Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, RangeId, Scenario,
     Settings, UnitKind, Units, default_bindings, is_builtin, key_name,
 };
-use crate::weapons::{GunCard, Loadout, Slot, TracerColor, ballistics_at, is_builtin_gun};
+use crate::weapons::{
+    GunCard, Loadout, MILS_TO_M_AT_500, Slot, TracerColor, ballistics_at, is_builtin_gun,
+};
 
 pub struct MenuPlugin;
 
@@ -396,7 +398,7 @@ impl GunField {
             GunField::Mass => ("Projectile mass", "kg"),
             GunField::FireRate => ("Fire rate", "rpm"),
             GunField::Caliber => ("Caliber (optional)", "mm"),
-            GunField::Spread => ("Spread (optional)", "mils"),
+            GunField::Spread => ("Spread at 500 m (optional)", "m"),
             GunField::Hits => ("Hits to kill (optional)", "hits"),
         }
     }
@@ -422,7 +424,10 @@ impl GunDraft {
                 GunField::Mass => n(gun.projectile_mass),
                 GunField::FireRate => n(gun.fire_rate),
                 GunField::Caliber => gun.caliber.map(n).unwrap_or_default(),
-                GunField::Spread => gun.spread.map(n).unwrap_or_default(),
+                GunField::Spread => gun
+                    .spread
+                    .map(|v| n(v * MILS_TO_M_AT_500))
+                    .unwrap_or_default(),
                 GunField::Hits => gun.hits_to_kill.map(n).unwrap_or_default(),
             };
         }
@@ -463,7 +468,7 @@ impl GunDraft {
             projectile_mass: need(GunField::Mass)?,
             fire_rate: need(GunField::FireRate)?,
             caliber: num(GunField::Caliber)?,
-            spread: num(GunField::Spread)?,
+            spread: num(GunField::Spread)?.map(|m| m / MILS_TO_M_AT_500),
             tracer: self.tracer,
             hits_to_kill: num(GunField::Hits)?.map(|h| h.round().max(1.0)),
         };
@@ -1286,7 +1291,7 @@ fn weapons_page(
                             filled.push(format!("caliber {:.1} mm", gun.caliber_mm()));
                         }
                         if gun.spread.is_none() {
-                            filled.push(format!("spread {:.1} mils", gun.spread_mils()));
+                            filled.push(format!("spread {:.1} m at 500 m", gun.spread_at_500()));
                         }
                         if gun.hits_to_kill.is_none() {
                             filled.push(format!("{} hits to destroy", gun.hits_to_destroy()));

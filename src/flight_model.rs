@@ -609,6 +609,9 @@ pub struct Body {
     /// first call), and how fast it's turning (world rad/s).
     pub aim_smoothed: Vec3,
     pub aim_rate: Vec3,
+    /// How far the instructor is into "roll over and pull" (0..1), eased
+    /// so it doesn't flick between that and pitch-and-rudder.
+    pub roll_mode: f32,
 }
 
 impl Body {
@@ -623,6 +626,7 @@ impl Body {
             trim: 0.0,
             aim_smoothed: Vec3::ZERO,
             aim_rate: Vec3::ZERO,
+            roll_mode: 0.0,
         }
     }
 
@@ -865,9 +869,10 @@ fn instructor_tuned(
     let pitch = (alpha_wanted.clamp(-0.5 * alpha_limit, alpha_limit) / alpha_max).clamp(-1.0, 1.0);
 
     // Rudder puts the nose right on the aim for the last few degrees.
-    let yaw = ((yaw_err * tune.rudder_gain + rel.y * tune.rudder_damp)
-        * (1.0 - w * tune.rudder_fade))
-        .clamp(-1.0, 1.0);
+    // While rolling over toward the aim, the rudder backs right off: it's
+    // only for fine tuning.
+    let yaw = (yaw_err * tune.rudder_gain + rel.y * tune.rudder_damp).clamp(-1.0, 1.0)
+        * (1.0 - w * tune.rudder_fade);
     let large = Controls {
         pitch,
         roll,
@@ -881,7 +886,20 @@ fn instructor_tuned(
     let fine = coordinated(model, body, aim, q, tune, dt);
     let fwd = body.forward();
     let steep = smoothstep(1.1, 1.35, fwd.y.abs().clamp(0.0, 1.0).asin());
-    let wl = smoothstep(tune.big_lo, tune.big_hi, off_nose).max(steep);
+    let wl = if !tune.roll_choice {
+        smoothstep(tune.big_lo, tune.big_hi, off_nose)
+    } else {
+        // Commit to rolling quickly, let go of it slowly.
+        let target = roll_over_weight(model, local, v, q, tune);
+        let tau = if target > body.roll_mode {
+            tune.roll_in
+        } else {
+            tune.roll_out
+        };
+        body.roll_mode += (target - body.roll_mode) * (1.0 - (-dt / tau.max(1e-3)).exp());
+        body.roll_mode
+    }
+    .max(steep);
     if wl <= 0.0 {
         return fine;
     }
@@ -894,6 +912,59 @@ fn instructor_tuned(
         yaw: fine.yaw + (large.yaw - fine.yaw) * wl,
         throttle: 0.0,
     }
+}
+
+/// How much to fly "roll the aim over the canopy and pull" rather than
+/// "pitch and rudder straight at it, wings steady" (0..1), the way War
+/// Thunder's instructor picks the faster path. Rudder only reaches a few
+/// degrees quickly, so small moves are pitch and yaw; once rolling and
+/// pulling gets there sooner, it rolls (over onto its back if the aim is
+/// below) and pulls, leaving the rudder for the last bit.
+fn roll_over_weight(
+    model: &FlightModel,
+    local: Vec3,
+    v: f32,
+    q: f32,
+    tune: InstructorTuning,
+) -> f32 {
+    let off = local.angle_between(Vec3::NEG_Z);
+    if off < 0.01 || q < 50.0 {
+        return 0.0;
+    }
+    let v = v.max(20.0);
+    let w = model.mass * G;
+    let n_avail = (0.85 * model.cl_max * q * model.wing_area / w)
+        .min(model.g_limit)
+        .max(1.0);
+    // Pitch rate pulling (pushing gets much less), roll rate, and how fast
+    // the rudder swings the flight path once the nose is slipped over.
+    let pull_rate = (G * (n_avail * n_avail - 1.0).sqrt() / v).max(0.05);
+    let roll_rate = roll_authority(model, v).max(0.3);
+    let slip = RUDDER_BETA * 0.8;
+    let slip_rate = (q * model.wing_area * 0.8 * slip / (model.mass * v)).max(0.005);
+    // Rudder plus a shallow coordinated bank covers this much sideways
+    // quickly.
+    let reach = tune.flat_reach;
+    let ex = local.x.atan2(-local.z);
+    let ey = local.y.atan2(-local.z);
+    // Without rolling: elevator up or down, rudder sideways.
+    let t_pitch = if ey >= 0.0 {
+        ey / pull_rate
+    } else {
+        -ey / (tune.push_share * pull_rate)
+    };
+    let t_yaw = 0.25 + (ex.abs() - reach).max(0.0) / slip_rate;
+    // The rudder and elevator share the work, but a slipping, pushing plane
+    // doesn't do both at full rate.
+    let t_flat = t_pitch + t_yaw;
+    // Rolling the aim above the canopy, then pulling.
+    let t_roll = local.x.atan2(local.y).abs() / roll_rate + off / pull_rate;
+    // The last few degrees are always pitch and rudder.
+    smoothstep(
+        -tune.roll_margin,
+        tune.roll_margin,
+        t_flat - t_roll - tune.roll_bias,
+    ) * smoothstep(0.03, 0.08, off)
 }
 
 /// Coordinated-turn mouse aim for aims near the nose. The heading and
@@ -1030,6 +1101,19 @@ struct InstructorTuning {
     k_rudder_rate: f32,
     /// Bank allowed per radian of heading error.
     k_phi_cap: f32,
+    /// Pick roll-and-pull by which path is faster (else by `big_lo`/`big_hi`).
+    roll_choice: bool,
+    /// Pushing's pitch rate as a share of pulling's (for choosing to roll).
+    push_share: f32,
+    /// Seconds over which the choice to roll fades in, and how much sooner
+    /// rolling must be to be chosen.
+    roll_margin: f32,
+    roll_bias: f32,
+    /// How far sideways (rad) pitch-and-rudder covers quickly.
+    flat_reach: f32,
+    /// Time constants for easing into and out of rolling, s.
+    roll_in: f32,
+    roll_out: f32,
 }
 
 impl InstructorTuning {
@@ -1044,7 +1128,7 @@ impl InstructorTuning {
             pitch_damp: 0.1,
             rudder_gain: 150.0,
             rudder_damp: 8.0,
-            rudder_fade: 0.5,
+            rudder_fade: 0.85,
             aim_smooth: 0.22,
             rate_smooth: 0.1,
             aim_feed: 1.0,
@@ -1059,7 +1143,14 @@ impl InstructorTuning {
             trim_gain: 1.0,
             k_rudder: 80.0,
             k_rudder_rate: 8.0,
-            k_phi_cap: 16.0,
+            k_phi_cap: 6.0,
+            roll_choice: true,
+            push_share: 0.5,
+            roll_margin: 0.3,
+            roll_bias: -0.2,
+            flat_reach: 0.17,
+            roll_in: 0.08,
+            roll_out: 0.4,
         }
     }
 }
@@ -1841,6 +1932,155 @@ mod compare_probe {
                 line += &format!("[{rate}/s c{c:.1} j{j:.2} e{e:.2}] ");
             }
             println!("{line}");
+        }
+    }
+}
+
+/// How the instructor answers an aim step: settle time and how much each
+/// control is used. `cargo test wt_probe -- --ignored --nocapture`.
+#[cfg(test)]
+mod wt_probe {
+    use super::*;
+
+    /// Step the aim `mag` degrees off the nose toward `dir` degrees (0 =
+    /// right, 90 = up, -45 = down and right).
+    pub(super) fn step_response(t: InstructorTuning, mag: f32, dir: f32) -> [f32; 5] {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 140.0);
+        let (s, c) = mag.to_radians().sin_cos();
+        let (ds, dc) = dir.to_radians().sin_cos();
+        let aim = (Vec3::NEG_Z * c + (Vec3::X * dc + Vec3::Y * ds) * s).normalize();
+        let dt = 1.0 / 120.0;
+        let mut settled = 0.0;
+        let (mut roll, mut pitch, mut yaw, mut bank) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for i in 0..(120 * 8) {
+            let mut ctl = instructor_tuned(&m, &mut b, aim, dt, t);
+            ctl.throttle = 1.0;
+            step(&m, &mut b, &ctl, dt);
+            let tt = i as f32 * dt;
+            if b.forward().angle_between(aim).to_degrees() > 0.5 {
+                settled = tt;
+            }
+            if tt < 1.5 {
+                roll += ctl.roll.abs() * dt;
+                pitch += ctl.pitch.abs() * dt;
+                yaw += ctl.yaw.abs() * dt;
+                let up = b.rotation * Vec3::Y;
+                let right = b.rotation * Vec3::X;
+                bank = bank.max((-right.y).atan2(up.y).abs().to_degrees());
+            }
+        }
+        [settled, roll, pitch, yaw, bank]
+    }
+
+    pub(super) const CASES: [(f32, f32); 11] = [
+        (2.0, 0.0),
+        (3.0, -45.0),
+        (4.0, 90.0),
+        (5.0, 0.0),
+        (8.0, -45.0),
+        (12.0, -45.0),
+        (15.0, -45.0),
+        (20.0, 0.0),
+        (30.0, -45.0),
+        (60.0, 0.0),
+        (90.0, -45.0),
+    ];
+
+    pub(super) fn report(name: &str, t: InstructorTuning) {
+        println!("{name}:  mag/dir  settle  roll  pitch  yaw  maxbank");
+        for (mag, dir) in CASES {
+            let r = step_response(t, mag, dir);
+            println!(
+                "  {mag:>4}/{dir:<4} {:>6.2} {:>5.2} {:>5.2} {:>5.2} {:>5.0}",
+                r[0], r[1], r[2], r[3], r[4]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn wt_flips() {
+        let cur = InstructorTuning::get();
+        for (name, t) in [
+            ("cur", cur),
+            (
+                "before",
+                InstructorTuning {
+                    roll_choice: false,
+                    k_phi_cap: 16.0,
+                    rudder_fade: 0.5,
+                    ..cur
+                },
+            ),
+            (
+                "reach .22",
+                InstructorTuning {
+                    flat_reach: 0.22,
+                    ..cur
+                },
+            ),
+        ] {
+            for a in [3.0, 5.0, 8.0, 12.0, 16.0, 20.0] {
+                let (f, b) = super::smooth_sweep_pub::reversals(t, -a);
+                println!("{name} {a}: flips {f} bank {b:.0}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn wt_probe() {
+        let cur = InstructorTuning::get();
+        report(
+            "before (by angle)",
+            InstructorTuning {
+                roll_choice: false,
+                k_phi_cap: 16.0,
+                rudder_fade: 0.5,
+                ..cur
+            },
+        );
+        report("current", cur);
+        report(
+            "wider flat reach",
+            InstructorTuning {
+                flat_reach: 0.22,
+                ..cur
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod wt_trace {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn wt_trace() {
+        let t = InstructorTuning::get();
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 150.0);
+        let dt = 1.0 / 60.0;
+        let aim = super::jump_probe::dir(-20.0, 0.0);
+        for i in 0..150 {
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, t);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            if i % 4 == 0 {
+                let up = b.rotation * Vec3::Y;
+                let right = b.rotation * Vec3::X;
+                println!(
+                    "{:.2} off {:5.1} mode {:.2} bank {:5.0} roll {:5.2} pitch {:5.2} yaw {:5.2}",
+                    i as f32 * dt,
+                    b.forward().angle_between(aim).to_degrees(),
+                    b.roll_mode,
+                    (-right.y).atan2(up.y).to_degrees(),
+                    c.roll,
+                    c.pitch,
+                    c.yaw
+                );
+            }
         }
     }
 }

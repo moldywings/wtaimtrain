@@ -36,7 +36,8 @@ pub struct GunCard {
     /// Optional: bore in mm (sets drag and the size of the gun model).
     /// Estimated from the projectile mass when blank.
     pub caliber: Option<f32>,
-    /// Optional: dispersion, mils (1 mil = 1 m at 1 km).
+    /// Optional: dispersion, mils (1 mil = 1 m at 1 km): the width of the
+    /// circle the rounds land in. The editor shows it as meters at 500 m.
     pub spread: Option<f32>,
     /// Color of the tracer.
     pub tracer: TracerColor,
@@ -111,6 +112,8 @@ pub const BUILTIN_GUN: &str = "ShVAK 20 mm";
 
 /// Spread used when the preset leaves it blank, mils.
 pub const DEFAULT_SPREAD: f32 = 2.0;
+/// One mil of spread is half a meter wide at 500 m.
+pub const MILS_TO_M_AT_500: f32 = 0.5;
 
 impl GunCard {
     /// The Soviet 20 mm ShVAK cannon.
@@ -150,6 +153,11 @@ impl GunCard {
 
     pub fn spread_mils(&self) -> f32 {
         self.spread.unwrap_or(DEFAULT_SPREAD)
+    }
+
+    /// Width of the spread circle at 500 m, m.
+    pub fn spread_at_500(&self) -> f32 {
+        self.spread_mils() * MILS_TO_M_AT_500
     }
 
     /// Hits needed to destroy an aircraft. Left blank, it comes from the
@@ -835,8 +843,11 @@ fn fire_plane(
                 }
                 Slot::Belly | Slot::Wings => forward,
             };
-            let spread = gun.card.spread_mils() * 0.001 * 0.5;
-            let dir = (aim + right * rng.next() * spread + up * rng.next() * spread).normalize();
+            // Rounds land evenly over a circle `spread` wide.
+            let radius = gun.card.spread_mils() * 0.001 * 0.5;
+            let angle = rng.next() * std::f32::consts::PI;
+            let r = radius * (rng.next() * 0.5 + 0.5).sqrt();
+            let dir = (aim + (right * angle.cos() + up * angle.sin()) * r).normalize();
             let velocity = aircraft.body.velocity + dir * gun.card.muzzle_velocity;
             // A shot due partway through the frame has already flown a bit.
             let early = -gun.cooldown;
