@@ -950,7 +950,6 @@ fn roll_over_weight(
     // the rudder swings the flight path once the nose is slipped over.
     let pull_rate = (G * (n_avail * n_avail - 1.0).sqrt() / v).max(0.05);
     let roll_rate = roll_authority(model, v).max(0.3);
-    let slip = RUDDER_BETA * 0.8;
     let slip_rate = rudder_turn_rate(model, q, v);
     // Rudder plus a shallow coordinated bank covers this much sideways
     // quickly.
