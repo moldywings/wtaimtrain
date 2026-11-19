@@ -1,4 +1,4 @@
-//! Reference scenery: lighting, ground, scattered buildings and clouds so
+//! Reference scenery: lighting, ground and scattered buildings so
 //! speed, height and range are readable.
 
 use bevy::prelude::*;
@@ -93,32 +93,6 @@ fn spawn_world(
                 rng.range(15.0, 40.0),
             )),
         ));
-    }
-
-    // Clouds: clusters of flattened white spheres between 1 and 3 km.
-    let puff_mesh = meshes.add(Sphere::new(1.0).mesh().uv(16, 10));
-    let cloud_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.97, 0.97, 1.0),
-        perceptual_roughness: 1.0,
-        ..default()
-    });
-    for _ in 0..70 {
-        let center = rng.disc(SCATTER_RADIUS);
-        let alt = rng.range(1_000.0, 3_000.0);
-        for _ in 0..6 {
-            let offset = Vec3::new(
-                rng.range(-250.0, 250.0),
-                rng.range(-40.0, 40.0),
-                rng.range(-250.0, 250.0),
-            );
-            let r = rng.range(90.0, 200.0);
-            commands.spawn((
-                Mesh3d(puff_mesh.clone()),
-                MeshMaterial3d(cloud_mat.clone()),
-                Transform::from_translation(Vec3::new(center.x, alt, center.y) + offset)
-                    .with_scale(Vec3::new(r, r * 0.45, r)),
-            ));
-        }
     }
 }
 

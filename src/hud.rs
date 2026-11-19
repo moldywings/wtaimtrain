@@ -4,8 +4,10 @@
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 
+use crate::GameState;
 use crate::camera::{ChaseCamera, MouseAim};
 use crate::flight::Player;
+use crate::settings::Settings;
 use crate::target::Target;
 
 pub struct HudPlugin;
@@ -97,7 +99,7 @@ fn spawn_hud(mut commands: Commands) {
         FlightReadout,
     ));
     commands.spawn((
-        Text::new("Click to capture the mouse    Esc: release    W/S: throttle    R: reset"),
+        Text::new("Click to capture the mouse    Esc: pause menu"),
         TextFont {
             font_size: FontSize::Px(16.0),
             ..default()
@@ -115,6 +117,8 @@ fn spawn_hud(mut commands: Commands) {
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn update_hud(
     aim: Res<MouseAim>,
+    settings: Res<Settings>,
+    state: Res<State<GameState>>,
     cursor: Single<&CursorOptions>,
     camera: Single<(&Camera, &GlobalTransform), With<ChaseCamera>>,
     player: Single<(&GlobalTransform, &Player)>,
@@ -166,22 +170,23 @@ fn update_hud(
             Some(p) => {
                 node.left = px(p.x - BOX_SIZE / 2.0);
                 node.top = px(p.y + BOX_SIZE / 2.0 + 2.0);
-                text.0 = format!("{:.0} m", range);
+                text.0 = settings.units.distance(range);
                 *vis = Visibility::Visible;
             }
             None => *vis = Visibility::Hidden,
         }
     }
 
+    let units = settings.units;
     readout.0 = format!(
-        "IAS {:>4.0} km/h\nALT {:>5.0} m\nTHR {:>4.0} %\nTGT {:>5.0} m",
-        plane.speed * 3.6,
-        player_tf.translation().y,
+        "IAS {}\nALT {}\nTHR {:.0} %\nTGT {}",
+        units.speed(plane.speed),
+        units.distance(player_tf.translation().y),
         plane.throttle * 100.0,
-        range,
+        units.distance(range),
     );
 
-    **help = if cursor.grab_mode == CursorGrabMode::None {
+    **help = if cursor.grab_mode == CursorGrabMode::None && *state.get() == GameState::Playing {
         Visibility::Visible
     } else {
         Visibility::Hidden

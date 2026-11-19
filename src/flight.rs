@@ -1,17 +1,22 @@
 //! Player plane. A simple "instructor" turns the plane toward the mouse aim
 //! point, the way War Thunder's mouse aim does: roll toward the aim point,
-//! pull, then level the wings when the nose is on target.
+//! pull, then level the wings when the nose is on target. Holding a pitch,
+//! roll or yaw key takes over that axis until it's released.
 
 use bevy::prelude::*;
 
-use crate::camera::MouseAim;
+use crate::GameState;
+use crate::camera::{ChaseCamera, MouseAim, snap_view};
+use crate::settings::{Action, Settings};
 
 pub struct FlightPlugin;
 
 impl Plugin for FlightPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_player)
-            .add_systems(Update, (fly_player, reset_player));
+        app.add_systems(Startup, spawn_player).add_systems(
+            Update,
+            (fly_player, reset_player).run_if(in_state(GameState::Playing)),
+        );
     }
 }
 
@@ -25,7 +30,8 @@ pub struct Player {
 
 /// Handling limits for the player plane. Rough fighter-like numbers.
 const MAX_PITCH_RATE: f32 = 1.1; // rad/s, nose up
-const MAX_PUSH_RATE: f32 = 0.4; // rad/s, nose down
+const MAX_PUSH_RATE: f32 = 0.4; // rad/s, nose down (mouse aim)
+const KEY_PUSH_RATE: f32 = 0.6; // rad/s, nose down (keyboard)
 const MAX_YAW_RATE: f32 = 0.25; // rad/s
 const MAX_ROLL_RATE: f32 = 3.5; // rad/s
 const MIN_SPEED: f32 = 60.0;
@@ -59,6 +65,7 @@ fn spawn_player(mut commands: Commands, assets: Res<AssetServer>) {
 pub fn fly_player(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
+    settings: Res<Settings>,
     aim: Res<MouseAim>,
     player: Single<(&mut Transform, &mut Player)>,
 ) {
@@ -68,14 +75,11 @@ pub fn fly_player(
     }
     let (mut tf, mut plane) = player.into_inner();
 
-    // Throttle: W / S (or Shift / Ctrl).
-    let mut throttle_input = 0.0;
-    if keys.any_pressed([KeyCode::KeyW, KeyCode::ShiftLeft]) {
-        throttle_input += 1.0;
-    }
-    if keys.any_pressed([KeyCode::KeyS, KeyCode::ControlLeft]) {
-        throttle_input -= 1.0;
-    }
+    let axis = |plus: Action, minus: Action| -> f32 {
+        settings.pressed(&keys, plus) as i32 as f32 - settings.pressed(&keys, minus) as i32 as f32
+    };
+
+    let throttle_input = axis(Action::ThrottleUp, Action::ThrottleDown);
     plane.throttle = (plane.throttle + throttle_input * 0.5 * dt).clamp(0.0, 1.0);
 
     // Aim direction in the plane's local frame (forward = -Z, up = +Y).
@@ -103,7 +107,27 @@ pub fn fly_player(
     // Pull less while still rolling into the turn, like a real pilot.
     let pull_scale = 1.0 - (w * bank_to_target.abs() / 1.5).clamp(0.0, 0.8);
 
-    let delta = Quat::from_rotation_x(pitch_rate * pull_scale * dt)
+    let mut pitch_rate = pitch_rate * pull_scale;
+    let mut yaw_rate = yaw_rate;
+    let mut roll_rate = roll_rate;
+
+    // Keyboard overrides, one axis at a time.
+    let pitch_key = axis(Action::PitchUp, Action::PitchDown);
+    if pitch_key > 0.0 {
+        pitch_rate = MAX_PITCH_RATE;
+    } else if pitch_key < 0.0 {
+        pitch_rate = -KEY_PUSH_RATE;
+    }
+    let roll_key = axis(Action::RollRight, Action::RollLeft);
+    if roll_key != 0.0 {
+        roll_rate = -roll_key * MAX_ROLL_RATE;
+    }
+    let yaw_key = axis(Action::YawRight, Action::YawLeft);
+    if yaw_key != 0.0 {
+        yaw_rate = -yaw_key * MAX_YAW_RATE * 1.5;
+    }
+
+    let delta = Quat::from_rotation_x(pitch_rate * dt)
         * Quat::from_rotation_y(yaw_rate * dt)
         * Quat::from_rotation_z(roll_rate * dt);
     tf.rotation = (tf.rotation * delta).normalize();
@@ -123,18 +147,21 @@ pub fn fly_player(
     }
 }
 
-/// R resets the player to the start position.
+/// The reset key puts the player back at the start position.
 fn reset_player(
     keys: Res<ButtonInput<KeyCode>>,
+    settings: Res<Settings>,
     mut aim: ResMut<MouseAim>,
+    mut camera: Single<&mut ChaseCamera>,
     player: Single<(&mut Transform, &mut Player)>,
 ) {
-    if keys.just_pressed(KeyCode::KeyR) {
+    if settings.just_pressed(&keys, Action::Reset) {
         let (mut tf, mut plane) = player.into_inner();
         *tf = start_transform();
         plane.speed = 140.0;
         aim.yaw = 0.0;
         aim.pitch = 0.0;
+        snap_view(&mut camera, &aim);
     }
 }
 
