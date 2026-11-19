@@ -772,6 +772,7 @@ fn take_hits(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     targets: Query<(&mut Target, &Transform, &mut Visibility)>,
+    mut sphere: Local<Option<Handle<Mesh>>>,
 ) {
     let damage: f32 = hits.read().map(|h| h.damage).sum();
     if damage <= 0.0 {
@@ -794,7 +795,11 @@ fn take_hits(
             commands.spawn((
                 Explosion { age: 0.0 },
                 Transform::from_translation(tf.translation),
-                Mesh3d(meshes.add(Sphere::new(1.0))),
+                Mesh3d(
+                    sphere
+                        .get_or_insert_with(|| meshes.add(Sphere::new(1.0)))
+                        .clone(),
+                ),
                 MeshMaterial3d(materials.add(StandardMaterial {
                     base_color: Color::srgba(1.0, 0.8, 0.35, 0.95),
                     unlit: true,

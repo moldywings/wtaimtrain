@@ -552,6 +552,7 @@ impl Plugin for WeaponsPlugin {
                 (
                     record_target_pose.before(crate::target::fly_target),
                     (sync_gun_models, sync_player_guns),
+                    (warm_up, warm_gun_sounds),
                     (fire_guns, fly_bullets)
                         .chain()
                         .after(crate::flight::fly_player)
@@ -643,6 +644,88 @@ fn setup_assets(
     });
 }
 
+/// Draws every effect once, tiny and right in front of the camera, for the
+/// first frames after launch. The graphics driver builds each kind of
+/// material the first time it's drawn, which takes a moment; doing it now
+/// stops the game hitching at the first shot, hit or kill.
+#[derive(Component)]
+struct WarmUp;
+
+const WARM_UP_FRAMES: u32 = 20;
+
+fn warm_up(
+    mut commands: Commands,
+    mut frames: Local<u32>,
+    weapon_assets: Res<WeaponAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    camera: Query<Entity, With<Camera3d>>,
+    warm: Query<Entity, With<WarmUp>>,
+) {
+    if *frames > WARM_UP_FRAMES {
+        return;
+    }
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    *frames += 1;
+    if *frames == 1 {
+        let mut items: Vec<(Handle<Mesh>, Handle<StandardMaterial>)> = vec![];
+        for (core, glow) in weapon_assets.tracer_materials.values() {
+            items.push((weapon_assets.tracer_mesh.clone(), core.clone()));
+            items.push((weapon_assets.glow_mesh.clone(), glow.clone()));
+        }
+        items.push((
+            weapon_assets.spark_mesh.clone(),
+            weapon_assets.spark_material.clone(),
+        ));
+        // Same kind of material as the kill explosion.
+        items.push((
+            meshes.add(Sphere::new(1.0)),
+            materials.add(StandardMaterial {
+                base_color: Color::srgba(1.0, 0.8, 0.35, 0.95),
+                unlit: true,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            }),
+        ));
+        commands.entity(camera).with_children(|c| {
+            for (i, (mesh, material)) in items.into_iter().enumerate() {
+                c.spawn((
+                    WarmUp,
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material),
+                    Transform::from_xyz(i as f32 * 0.001, 0.0, -1.0)
+                        .with_scale(Vec3::splat(0.0005)),
+                ));
+            }
+            c.spawn((
+                WarmUp,
+                WorldAssetRoot(weapon_assets.gun_scene.clone()),
+                Transform::from_xyz(0.0, 0.0, -1.0).with_scale(Vec3::splat(0.0005)),
+            ));
+        });
+    } else if *frames == WARM_UP_FRAMES {
+        for e in &warm {
+            commands.entity(e).despawn();
+        }
+    }
+}
+
+/// Make each gun preset's shot sound ahead of time, not at its first shot.
+fn warm_gun_sounds(
+    settings: Res<Settings>,
+    mut sounds: ResMut<Sounds>,
+    mut sources: ResMut<Assets<AudioSource>>,
+) {
+    if !settings.is_changed() {
+        return;
+    }
+    for g in &settings.guns {
+        sounds.gunshot(&mut sources, g.caliber_mm(), g.muzzle_velocity);
+    }
+}
+
 /// Put gun models on each plane where its preset's loadout says.
 #[allow(clippy::type_complexity)]
 fn sync_gun_models(
@@ -729,14 +812,17 @@ fn sync_guns(
     aircraft: &Aircraft,
     guns: Option<Mut<Guns>>,
 ) {
-    let loadout = aircraft.card.weapons.clone();
-    let key = (loadout.clone(), settings.guns.clone());
-    if guns
-        .as_ref()
-        .is_some_and(|g| g.built_from.as_ref() == Some(&key))
-    {
+    // Nothing to do unless the loadout or a gun changed (checked without
+    // copying anything, since this runs every frame).
+    if guns.as_ref().is_some_and(|g| {
+        g.built_from
+            .as_ref()
+            .is_some_and(|(l, c)| *l == aircraft.card.weapons && *c == settings.guns)
+    }) {
         return;
     }
+    let loadout = aircraft.card.weapons.clone();
+    let key = (loadout.clone(), settings.guns.clone());
     let correction = crate::model_correction();
     let built = Guns {
         last_sound: HashMap::new(),
