@@ -23,7 +23,7 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | Mouse | Move the aim circle. The camera swings after it and the plane turns to follow |
 | Left click (hold) | Fire all guns |
 | Right click | Toggle zoom |
-| L Shift / L Ctrl | Throttle up / down |
+| L Shift / L Ctrl | Throttle up / down (you start at 100%; jets with an afterburner go to 110% to light it) |
 | S / W | Pitch up / down (overrides mouse aim while held) |
 | A / D | Roll left / right |
 | Q / E | Yaw left / right |
@@ -31,18 +31,21 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | R | Restart the scenario |
 | Esc | Pause menu |
 
-The pause menu has four pages. **Settings** covers units (metric, imperial or nautical), aim and free look sensitivity (aim feels the same zoomed or not), crosshair style and color, the lead indicator, and every key binding. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies from drop-down lists. **Weapons** has gun presets and each aircraft preset's loadout. **Scenario** picks what you practice. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
+The pause menu has five pages. **Settings** covers aim, zoomed aim and free look sensitivity, crosshair style and color, the lead indicator, and every key binding. **Units** picks the unit for each kind of number on its own: airspeed (km/h, mph, kn, m/s), altitude (m, ft), distance and range (km, mi, nmi, m, ft, yd), climb rate (m/s, ft/min, ft/s), engine power (hp, kW), thrust (kgf, lbf, kN), mass (kg, lb) and wing area (sq m, sq ft). Presets are stored in fixed units, so switching a unit converts everything shown, presets included. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies from drop-down lists. **Weapons** has gun presets and each aircraft preset's loadout. **Scenario** picks what you practice and sets that scenario's start distances. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
 
 The white circle is where you're aiming. The crosshair is where the nose points. The target shows its preset name, a bracket marker and its range. When it's off screen, a red arrow at the screen edge points to it. The readout shows indicated (IAS) and true (TAS) airspeed. Hits and accuracy show in the top right, and "HIT" flashes when a round connects. With the lead indicator on, a green circle shows where to put your gun crosshair to hit the target. It's worked out for the biggest gun on your plane, counting your speed, the target's speed, bullet drop and drag.
 
 ## Scenarios
 
 - **Head on:** you fly straight at each other. The target holds a straight line at a random speed, from a slightly different height and toward a different point near you each time.
-- **Chase:** you start behind the target, a random distance between the two you set (300 to 800 m by default). It keeps its heading but weaves and dodges: some runs hard, some gently, some not at all.
+- **Chase:** you start behind the target (300 to 800 m by default). It keeps its heading but weaves and dodges: some runs hard, some gently, some not at all.
 - **Stall:** the target starts just above and ahead of you and pulls straight up, rolling and dodging.
 - **Dogfight:** the target starts close by, usually ahead of you, at a random spot, height, heading and speed, and tries to ram you. With **Enemy shoots back** on (Scenario page), it hunts you with its own guns instead: it fires when lined up, breaks off if it gets too close, and its hits show as "Your damage". At 100% you're shot down and the scenario resets 2 seconds later. Enemy fire works in the other scenarios too.
-- **Banking:** the target starts 500 to 1300 m ahead, off to one side and above, below or level with you, then pulls a hard banked turn, usually across your nose and sometimes away. The path changes every run (low to high, high to low, or straight across, from either side). After turning 150 to 300 degrees it rolls out, and the run ends after about 22 seconds.
-- **All in one:** a random one of the others each time.
+- **Banking:** the target starts ahead (500 to 1300 m by default), off to one side and above, below or level with you, then pulls a hard banked turn, usually across your nose and sometimes away. The path changes every run (low to high, high to low, or straight across, from either side). After turning 150 to 300 degrees it rolls out, and the run ends after about 22 seconds.
+- **Diving:** you start above the target (300 to 1200 m higher and 800 to 2000 m ahead by default) and dive on it. Half the time it hasn't seen you and flies straight on until you open fire. The other half it's watching and reacts as soon as you dive at it. Once alerted it goes to full throttle and dives away from you, leveling off near the ground, while jinking, rolling or corkscrewing (some hard, some gently, some not at all).
+- **All in one:** a random one of the others each time, using each scenario's own start distances.
+
+Each scenario's start distances (and the Diving height) are set on the Scenario page: click the scenario and its ranges show on the right. Each run picks a random value in each range.
 
 When the target takes enough hits it's destroyed, with a sound and a "TARGET DESTROYED" notice, and the scenario restarts 2 seconds later. It also restarts when a plane crashes, the planes collide, the target gets more than 4 km away, a head-on pass is over, or you press R.
 
@@ -50,7 +53,7 @@ When the target takes enough hits it's destroyed, with a sound and a "TARGET DES
 
 The default flight model is the Yak-3. Planes are flown with physics: lift, drag, thrust, gravity, and stalls once the angle of attack is too high. Mouse aim works through an instructor that keeps you out of a stall. Near the nose it flies coordinated turns: bank, pitch and rudder are worked out together from one wanted turn, so small aim moves don't make the crosshair jump. Holding a pitch key takes over every axis from it, but like the game's instructor it still stops you just short of a stall. Roll and yaw keys only take over their own axis. The aim circle can go straight up and over the top, and the view keeps the horizon level.
 
-A preset is a stat card. It has power per engine (hp, or kgf of thrust for jets), the number of engines, climb rate, top speed, and the max sustained and max instantaneous turn rates, each in degrees per second at a speed (the Yak-3: 23.59 deg/s at 175 kt sustained, 41.1 deg/s at 302 kt instantaneous). The sustained turn sets the induced drag. The instantaneous turn sets the G limit and, unless you enter one, the max lift coefficient. Top speed altitude, mass, wing area, max lift coefficient and best roll rate (in deg/s at a speed) are optional: leave them blank and the game fills them in from typical values for the engine type and power, and the editor lists what it picked. The game solves for drag, induced drag and propeller efficiency so the plane reproduces those numbers. The editor shows a "model check" with the figures the solved model actually reaches.
+A preset is a stat card. It has power per engine (or thrust for jets, with an optional afterburner and its thrust; leave the afterburner thrust blank for 1.5 times dry thrust), the number of engines, climb rate, top speed, and the max sustained and max instantaneous turn rates, each in degrees per second at a speed (the Yak-3: 23.59 deg/s at 175 kt sustained, 41.1 deg/s at 302 kt instantaneous). The sustained turn sets the induced drag. The instantaneous turn sets the G limit and, unless you enter one, the max lift coefficient. Top speed altitude, mass, wing area, max lift coefficient and best roll rate (in deg/s at a speed) are optional: leave them blank and the game fills them in from typical values for the engine type and power, and the editor lists what it picked. The game solves for drag, induced drag and propeller efficiency so the plane reproduces those numbers. The editor shows a "model check" with the figures the solved model actually reaches.
 
 Save as many presets as you like. Saving under a new name makes a new preset and keeps the old one. The built-in Yak-3 can't be changed or deleted: edits to it are saved as a copy.
 

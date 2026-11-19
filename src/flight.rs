@@ -41,7 +41,7 @@ impl Aircraft {
             model: FlightModel::from_card(card),
             body,
             controls: Controls {
-                throttle: 0.8,
+                throttle: 1.0,
                 ..default()
             },
         }
@@ -139,7 +139,8 @@ pub fn fly_player(
 
     let throttle_input = axis(Action::ThrottleUp, Action::ThrottleDown);
     let mut controls = aircraft.controls;
-    controls.throttle = (controls.throttle + throttle_input * 0.5 * dt).clamp(0.0, 1.0);
+    controls.throttle =
+        (controls.throttle + throttle_input * 0.5 * dt).clamp(0.0, aircraft.model.max_throttle());
 
     // Keys ease in and out so a tap isn't a full-deflection jolt.
     let wanted = Vec3::new(

@@ -173,10 +173,11 @@ fn update_mouse_aim(
     if cursor.grab_mode == CursorGrabMode::None {
         return;
     }
-    // Zoomed in, the same hand movement moves the circle the same distance
-    // across the screen as it does unzoomed.
-    let zoom =
+    // Zoomed in, the aim slows down a bit (less than the view narrows, so
+    // it doesn't feel sluggish), times the zoomed sensitivity setting.
+    let narrowing =
         (current_fov(camera.zoom).to_radians() * 0.5).tan() / (NORMAL_FOV.to_radians() * 0.5).tan();
+    let zoom = narrowing.sqrt() * (1.0 + (settings.zoom_sensitivity - 1.0) * camera.zoom);
     if camera.free_looking {
         let delta = motion.delta * settings.look_per_pixel() * zoom;
         camera.look_goal.x = (camera.look_goal.x - delta.x).clamp(-3.0, 3.0);

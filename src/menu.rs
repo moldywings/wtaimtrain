@@ -20,8 +20,8 @@ use bevy::ui_widgets::{Activate, Button, SelectAllOnFocus, TextInput};
 use crate::GameState;
 use crate::flight_model::{AircraftCard, EngineKind, FlightModel};
 use crate::settings::{
-    Action, CHASE_MAX, CHASE_MIN, CHASE_STEP, Crosshair, CrosshairColor, MAX_SENSITIVITY,
-    MIN_SENSITIVITY, Scenario, Settings, Units, default_bindings, is_builtin, key_name,
+    Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, RangeId, Scenario,
+    Settings, UnitKind, Units, default_bindings, is_builtin, key_name,
 };
 use crate::weapons::{GunCard, Loadout, Slot, TracerColor, ballistics_at, is_builtin_gun};
 
@@ -67,6 +67,7 @@ struct PauseMenu;
 enum Page {
     #[default]
     Settings,
+    Units,
     Aircraft,
     Weapons,
     Scenario,
@@ -140,6 +141,7 @@ const PRESET_ROWS: f32 = 7.5;
 #[derive(Clone, Default)]
 struct Draft {
     engine: Option<EngineKind>,
+    afterburner: Option<bool>,
     fields: [String; Field::ALL.len()],
 }
 
@@ -148,6 +150,7 @@ enum Field {
     Name,
     Power,
     Engines,
+    AbThrust,
     Climb,
     SustainedRate,
     SustainedSpeed,
@@ -163,10 +166,11 @@ enum Field {
 }
 
 impl Field {
-    const ALL: [Field; 15] = [
+    const ALL: [Field; 16] = [
         Field::Name,
         Field::Power,
         Field::Engines,
+        Field::AbThrust,
         Field::Climb,
         Field::InstantRate,
         Field::InstantSpeed,
@@ -190,10 +194,14 @@ impl Field {
         match self {
             Field::Name => ("Name", ""),
             Field::Power => match engine {
-                EngineKind::Prop => ("Power per engine", "hp"),
-                EngineKind::Jet => ("Thrust per engine", "kgf"),
+                EngineKind::Prop => ("Power per engine", units.get(UnitKind::Power).name),
+                EngineKind::Jet => ("Thrust per engine", units.get(UnitKind::Thrust).name),
             },
             Field::Engines => ("Engines", ""),
+            Field::AbThrust => (
+                "  with afterburner (optional)",
+                units.get(UnitKind::Thrust).name,
+            ),
             Field::Climb => ("Climb rate", units.climb_unit().0),
             Field::SustainedRate => ("Max sustained turn", "deg/s"),
             Field::SustainedSpeed => ("  sustained turn speed", units.speed_unit().0),
@@ -201,8 +209,8 @@ impl Field {
             Field::InstantSpeed => ("  instantaneous turn speed", units.speed_unit().0),
             Field::TopSpeed => ("Top speed", units.speed_unit().0),
             Field::TopSpeedAltitude => ("  at altitude (optional)", units.altitude_unit().0),
-            Field::Mass => ("Mass (optional)", "kg"),
-            Field::WingArea => ("Wing area (optional)", "sq m"),
+            Field::Mass => ("Mass (optional)", units.get(UnitKind::Mass).name),
+            Field::WingArea => ("Wing area (optional)", units.get(UnitKind::Area).name),
             Field::ClMax => ("Max lift coeff. (optional)", ""),
             Field::RollRate => ("Best roll (optional)", "deg/s"),
             Field::RollSpeed => ("  best roll speed", units.speed_unit().0),
@@ -215,6 +223,9 @@ impl Draft {
         let (_, spd) = units.speed_unit();
         let (_, clm) = units.climb_unit();
         let (_, alt) = units.altitude_unit();
+        let pwr = power_factor(units, card.engine);
+        let (_, kg) = units.unit(UnitKind::Mass);
+        let (_, area) = units.unit(UnitKind::Area);
         let n = |v: f32, decimals: usize| {
             let s = format!("{v:.decimals$}");
             if s.contains('.') {
@@ -228,8 +239,13 @@ impl Draft {
         for f in Field::ALL {
             fields[f.index()] = match f {
                 Field::Name => card.name.clone(),
-                Field::Power => n(card.power, 0),
+                Field::Power => n(card.power * pwr, power_decimals(units, card.engine)),
                 Field::Engines => card.engines.to_string(),
+                Field::AbThrust => opt(
+                    card.afterburner_thrust
+                        .map(|v| v * units.unit(UnitKind::Thrust).1),
+                    units.get(UnitKind::Thrust).decimals,
+                ),
                 Field::Climb => n(card.climb_rate * clm, 1),
                 Field::SustainedRate => n(card.sustained_turn_rate, 2),
                 Field::SustainedSpeed => n(card.sustained_turn_speed * spd, 0),
@@ -237,8 +253,8 @@ impl Draft {
                 Field::InstantSpeed => n(card.instant_turn_speed * spd, 0),
                 Field::TopSpeed => n(card.top_speed * spd, 0),
                 Field::TopSpeedAltitude => opt(card.top_speed_altitude.map(|v| v * alt), 0),
-                Field::Mass => opt(card.mass, 0),
-                Field::WingArea => opt(card.wing_area, 2),
+                Field::Mass => opt(card.mass.map(|v| v * kg), 0),
+                Field::WingArea => opt(card.wing_area.map(|v| v * area), 2),
                 Field::ClMax => opt(card.cl_max, 2),
                 Field::RollRate => opt(card.roll_rate, 0),
                 Field::RollSpeed => opt(card.roll_speed.map(|v| v * spd), 0),
@@ -246,6 +262,7 @@ impl Draft {
         }
         Draft {
             engine: Some(card.engine),
+            afterburner: Some(card.afterburner),
             fields,
         }
     }
@@ -260,6 +277,10 @@ impl Draft {
         let (_, spd) = units.speed_unit();
         let (_, clm) = units.climb_unit();
         let (_, alt) = units.altitude_unit();
+        let engine = self.engine.unwrap_or(base.engine);
+        let pwr = power_factor(units, engine);
+        let (_, kg) = units.unit(UnitKind::Mass);
+        let (_, area) = units.unit(UnitKind::Area);
         let name = self.get(Field::Name).to_string();
         if name.is_empty() {
             return Err("Give the preset a name.".into());
@@ -290,8 +311,8 @@ impl Draft {
         };
         let card = AircraftCard {
             name,
-            engine: self.engine.unwrap_or(base.engine),
-            power: num(Field::Power, true, base.power, 1.0)?,
+            engine,
+            power: num(Field::Power, true, base.power, pwr)?,
             engines: num(Field::Engines, true, base.engines as f32, 1.0)?
                 .round()
                 .max(1.0) as u32,
@@ -302,11 +323,13 @@ impl Draft {
             instant_turn_speed: num(Field::InstantSpeed, true, base.instant_turn_speed, spd)?,
             top_speed: num(Field::TopSpeed, true, base.top_speed, spd)?,
             top_speed_altitude: optional(Field::TopSpeedAltitude, alt)?,
-            mass: optional(Field::Mass, 1.0)?,
-            wing_area: optional(Field::WingArea, 1.0)?,
+            mass: optional(Field::Mass, kg)?,
+            wing_area: optional(Field::WingArea, area)?,
             cl_max: optional(Field::ClMax, 1.0)?,
             roll_rate: optional(Field::RollRate, 1.0)?,
             roll_speed: optional(Field::RollSpeed, spd)?,
+            afterburner: self.afterburner.unwrap_or(base.afterburner),
+            afterburner_thrust: optional(Field::AbThrust, units.unit(UnitKind::Thrust).1)?,
             weapons: base.weapons.clone(),
         };
         if card.power <= 0.0 || card.climb_rate <= 0.0 || card.top_speed <= 0.0 {
@@ -321,6 +344,21 @@ impl Draft {
             return Err("Give a speed for each turn rate.".into());
         }
         Ok(card)
+    }
+}
+
+/// Factor from the stored power (hp) or thrust (kgf) to the shown unit.
+fn power_factor(units: Units, engine: EngineKind) -> f32 {
+    match engine {
+        EngineKind::Prop => units.unit(UnitKind::Power).1,
+        EngineKind::Jet => units.unit(UnitKind::Thrust).1,
+    }
+}
+
+fn power_decimals(units: Units, engine: EngineKind) -> usize {
+    match engine {
+        EngineKind::Prop => units.get(UnitKind::Power).decimals,
+        EngineKind::Jet => units.get(UnitKind::Thrust).decimals,
     }
 }
 
@@ -440,16 +478,18 @@ impl GunDraft {
 enum MenuAction {
     Resume,
     Page(Page),
-    CycleUnits,
+    CycleUnit(UnitKind),
     ToggleLead,
     ToggleEnemyFire,
     PickScenario(Scenario),
-    /// Move the chase start distance: (which end: 0 near, 1 far; steps).
-    ChaseDistance(u8, i32),
+    /// Move a start distance: (which, which end: 0 near, 1 far; steps).
+    Range(RangeId, u8, i32),
     SensitivityDown,
     SensitivityUp,
     LookSensitivityDown,
     LookSensitivityUp,
+    ZoomSensitivityDown,
+    ZoomSensitivityUp,
     ToggleDropdown(Dropdown),
     PickCrosshair(Crosshair),
     PickColor(CrosshairColor),
@@ -460,6 +500,7 @@ enum MenuAction {
     NewPreset,
     DeletePreset,
     ToggleEngine,
+    ToggleAfterburner,
     SavePreset,
     PickPlayerAircraft(String),
     PickTargetAircraft(String),
@@ -550,6 +591,7 @@ fn open_menu(settings: Res<Settings>, mut ui: ResMut<MenuUi>) {
         Ok("aircraft") => ui.page = Page::Aircraft,
         Ok("weapons") => ui.page = Page::Weapons,
         Ok("scenario") => ui.page = Page::Scenario,
+        Ok("units") => ui.page = Page::Units,
         _ => {}
     }
 }
@@ -632,11 +674,12 @@ fn rebuild_menu(
                     ));
                     for (page, name) in [
                         (Page::Settings, "Settings"),
+                        (Page::Units, "Units"),
                         (Page::Aircraft, "Aircraft"),
                         (Page::Weapons, "Weapons"),
                         (Page::Scenario, "Scenario"),
                     ] {
-                        let mut b = r.spawn(button(MenuAction::Page(page), name, px(120)));
+                        let mut b = r.spawn(button(MenuAction::Page(page), name, px(104)));
                         if ui.page == page {
                             b.insert(Selected);
                         }
@@ -644,6 +687,7 @@ fn rebuild_menu(
                 });
                 match ui.page {
                     Page::Settings => settings_page(panel, &settings, &rebinding, &ui, &scroll),
+                    Page::Units => units_page(panel, &settings),
                     Page::Aircraft => aircraft_page(panel, &settings, &ui, &scroll),
                     Page::Weapons => weapons_page(panel, &settings, &ui, &scroll),
                     Page::Scenario => scenario_page(panel, &settings),
@@ -669,13 +713,6 @@ fn settings_page(
             // Left column: general settings.
             cols.spawn(column(px(300))).with_children(|col| {
                 col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
-
-                col.spawn(section_header("Units"));
-                col.spawn(button(
-                    MenuAction::CycleUnits,
-                    settings.units.label(),
-                    percent(100),
-                ));
 
                 col.spawn(section_header("Aim sensitivity"));
                 col.spawn(row()).with_children(|r| {
@@ -705,6 +742,21 @@ fn settings_page(
                         TextLayout::justify(Justify::Center),
                     ));
                     r.spawn(button(MenuAction::LookSensitivityUp, "+", px(44)));
+                });
+
+                col.spawn(section_header("Zoomed aim sensitivity"));
+                col.spawn(row()).with_children(|r| {
+                    r.spawn(button(MenuAction::ZoomSensitivityDown, "-", px(44)));
+                    r.spawn((
+                        label(&format!("{:.2}x", settings.zoom_sensitivity), 18.0, TEXT),
+                        Node {
+                            flex_grow: 1.0,
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                        TextLayout::justify(Justify::Center),
+                    ));
+                    r.spawn(button(MenuAction::ZoomSensitivityUp, "+", px(44)));
                 });
 
                 col.spawn(section_header("Crosshair"));
@@ -941,7 +993,25 @@ fn aircraft_page(
                         ..default()
                     });
                 });
+                let afterburner = engine == EngineKind::Jet && ui.draft.afterburner == Some(true);
+                if engine == EngineKind::Jet {
+                    col.spawn(row()).with_children(|r| {
+                        r.spawn((label("Afterburner", 15.0, TEXT), grow()));
+                        r.spawn(button(
+                            MenuAction::ToggleAfterburner,
+                            if afterburner { "On" } else { "Off" },
+                            px(150),
+                        ));
+                        r.spawn(Node {
+                            width: px(52),
+                            ..default()
+                        });
+                    });
+                }
                 for field in Field::ALL {
+                    if field == Field::AbThrust && !afterburner {
+                        continue;
+                    }
                     // Turn rates share a row with their speed:
                     // "Max sustained turn [23.59] deg/s at [175] kt".
                     let speed_of = match field {
@@ -1032,10 +1102,10 @@ fn aircraft_page(
                         filled.push(format!("top speed altitude {:.0} {au}", e.top_speed_altitude * af));
                     }
                     if card.mass.is_none() {
-                        filled.push(format!("mass {:.0} kg", e.mass));
+                        filled.push(format!("mass {}", units.fmt(UnitKind::Mass, e.mass)));
                     }
                     if card.wing_area.is_none() {
-                        filled.push(format!("wing area {:.1} sq m", e.wing_area));
+                        filled.push(format!("wing area {}", units.fmt(UnitKind::Area, e.wing_area)));
                     }
                     if card.cl_max.is_none() {
                         filled.push(format!("max lift {:.2}", e.cl_max));
@@ -1363,6 +1433,28 @@ fn weapons_page(
         });
 }
 
+fn units_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
+    panel.spawn(column(px(560))).with_children(|col| {
+        col.spawn(label(
+            "Click a unit to switch it. Presets, the readout and the menus all \
+             convert by themselves.",
+            14.0,
+            DIM,
+        ));
+        for kind in UnitKind::ALL {
+            col.spawn(row()).with_children(|r| {
+                r.spawn((label(kind.label(), 16.0, TEXT), grow()));
+                r.spawn(button(
+                    MenuAction::CycleUnit(kind),
+                    settings.units.get(kind).name,
+                    px(140),
+                ));
+            });
+        }
+        col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
+    });
+}
+
 fn scenario_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
     panel
         .spawn(Node {
@@ -1404,32 +1496,58 @@ fn scenario_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
                 ));
             });
             cols.spawn(column(px(330))).with_children(|col| {
-                col.spawn(section_header("Chase: target starts this far ahead"));
-                for (end, name, value) in [
-                    (0u8, "Nearest", settings.chase_min),
-                    (1u8, "Farthest", settings.chase_max),
-                ] {
-                    col.spawn(row()).with_children(|r| {
-                        r.spawn((
-                            label(name, 15.0, TEXT),
-                            Node {
-                                width: px(80),
-                                ..default()
-                            },
-                        ));
-                        r.spawn((
-                            label(&convergence_text(settings.units, value), 17.0, TEXT),
-                            grow(),
-                        ));
-                        r.spawn(button(MenuAction::ChaseDistance(end, -1), "-", px(36)));
-                        r.spawn(button(MenuAction::ChaseDistance(end, 1), "+", px(36)));
-                    });
+                let ids = settings.scenario.ranges();
+                if ids.is_empty() {
+                    col.spawn(section_header("Start distances"));
+                    col.spawn(label(
+                        "All in one uses the distances set on each scenario. Pick a \
+                         scenario to change its own.",
+                        13.0,
+                        DIM,
+                    ));
                 }
-                col.spawn(label(
-                    "Each run picks a random distance between these two.",
-                    13.0,
-                    DIM,
-                ));
+                for id in ids {
+                    col.spawn(section_header(&format!(
+                        "{}: {}",
+                        settings.scenario.label(),
+                        id.label().to_lowercase()
+                    )));
+                    let span = settings.ranges.get(*id);
+                    for (end, name, value) in
+                        [(0u8, "Nearest", span.min), (1u8, "Farthest", span.max)]
+                    {
+                        let name = match (id.is_height(), end) {
+                            (true, 0) => "Lowest",
+                            (true, _) => "Highest",
+                            _ => name,
+                        };
+                        let text = if id.is_height() {
+                            settings.units.altitude(value)
+                        } else {
+                            settings.units.range(value)
+                        };
+                        col.spawn(row()).with_children(|r| {
+                            r.spawn((
+                                label(name, 15.0, TEXT),
+                                Node {
+                                    width: px(80),
+                                    ..default()
+                                },
+                            ));
+                            r.spawn((label(&text, 17.0, TEXT), grow()));
+                            r.spawn(button(MenuAction::Range(*id, end, -1), "-", px(36)));
+                            r.spawn(button(MenuAction::Range(*id, end, 1), "+", px(36)));
+                        });
+                    }
+                }
+                if !ids.is_empty() {
+                    col.spawn(label(
+                        "Each run picks a random value between these. All in one uses \
+                         them too.",
+                        13.0,
+                        DIM,
+                    ));
+                }
                 col.spawn(Node {
                     flex_grow: 1.0,
                     min_height: px(16),
@@ -1442,10 +1560,7 @@ fn scenario_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
 
 /// Convergence range in meters, with feet too outside metric.
 fn convergence_text(units: Units, m: f32) -> String {
-    match units {
-        Units::Metric => format!("{m:.0} m"),
-        _ => format!("{m:.0} m ({:.0} ft)", m * 3.280_84),
-    }
+    units.range(m)
 }
 
 /// Higher rows draw over lower ones, so an open gun list covers the rows
@@ -1705,18 +1820,11 @@ fn on_menu_click(
         MenuAction::ToggleLead => settings.lead_indicator = !settings.lead_indicator,
         MenuAction::ToggleEnemyFire => settings.enemy_fires = !settings.enemy_fires,
         MenuAction::PickScenario(sc) => settings.scenario = sc,
-        MenuAction::ChaseDistance(end, steps) => {
-            let d = steps as f32 * CHASE_STEP;
-            if end == 0 {
-                settings.chase_min = (settings.chase_min + d).clamp(CHASE_MIN, CHASE_MAX);
-                settings.chase_max = settings.chase_max.max(settings.chase_min);
-            } else {
-                settings.chase_max = (settings.chase_max + d).clamp(CHASE_MIN, CHASE_MAX);
-                settings.chase_min = settings.chase_min.min(settings.chase_max);
-            }
+        MenuAction::Range(id, end, steps) => {
+            settings.ranges.step(id, end, steps);
         }
-        MenuAction::CycleUnits => {
-            settings.units = settings.units.next();
+        MenuAction::CycleUnit(kind) => {
+            settings.units.cycle(kind);
             // Re-show the editor in the new units.
             let card = settings.card(&ui.editing).clone();
             ui.draft = Draft::from_card(&card, settings.units);
@@ -1732,6 +1840,12 @@ fn on_menu_click(
         }
         MenuAction::LookSensitivityUp => {
             settings.look_sensitivity = step_sensitivity(settings.look_sensitivity, 1.0);
+        }
+        MenuAction::ZoomSensitivityDown => {
+            settings.zoom_sensitivity = step_sensitivity(settings.zoom_sensitivity, -1.0);
+        }
+        MenuAction::ZoomSensitivityUp => {
+            settings.zoom_sensitivity = step_sensitivity(settings.zoom_sensitivity, 1.0);
         }
         MenuAction::ToggleDropdown(d) => {
             if ui.open == Some(d) {
@@ -1815,6 +1929,10 @@ fn on_menu_click(
                 EngineKind::Prop => EngineKind::Jet,
                 EngineKind::Jet => EngineKind::Prop,
             });
+        }
+        MenuAction::ToggleAfterburner => {
+            let ui = ui.as_mut();
+            ui.draft.afterburner = Some(!ui.draft.afterburner.unwrap_or(false));
         }
         MenuAction::SavePreset => {
             let base = settings.card(&ui.editing).clone();
@@ -2110,10 +2228,19 @@ mod tests {
     #[test]
     fn stat_card_round_trips_through_the_editor() {
         let yak = AircraftCard::yak3();
-        for units in [Units::Metric, Units::Imperial, Units::Nautical] {
+        for units in [Units::METRIC, Units::IMPERIAL, Units::NAUTICAL] {
             let back = Draft::from_card(&yak, units).to_card(&yak, units).unwrap();
             assert!((back.top_speed - yak.top_speed).abs() < 0.3, "{units:?}");
             assert!((back.climb_rate - yak.climb_rate).abs() < 0.05, "{units:?}");
+            assert!((back.power - yak.power).abs() < 0.1, "{units:?}");
+            assert!(
+                (back.mass.unwrap() - yak.mass.unwrap()).abs() < 0.6,
+                "{units:?}"
+            );
+            assert!(
+                (back.wing_area.unwrap() - yak.wing_area.unwrap()).abs() < 0.01,
+                "{units:?}"
+            );
             assert_eq!(back.engines, 1);
         }
     }
@@ -2121,14 +2248,14 @@ mod tests {
     #[test]
     fn editor_reads_war_thunder_style_numbers() {
         let yak = AircraftCard::yak3();
-        let mut d = Draft::from_card(&yak, Units::Nautical);
+        let mut d = Draft::from_card(&yak, Units::NAUTICAL);
         d.fields[Field::Climb.index()] = "4,193".into();
         d.fields[Field::TopSpeed.index()] = "352".into();
-        let card = d.to_card(&yak, Units::Nautical).unwrap();
+        let card = d.to_card(&yak, Units::NAUTICAL).unwrap();
         assert!((card.climb_rate - 21.30).abs() < 0.01);
         assert!((card.top_speed - 181.08).abs() < 0.05);
         d.fields[Field::Power.index()] = "lots".into();
-        assert!(d.to_card(&yak, Units::Nautical).is_err());
+        assert!(d.to_card(&yak, Units::NAUTICAL).is_err());
     }
 
     #[test]

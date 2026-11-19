@@ -66,6 +66,10 @@ pub struct AircraftCard {
     /// Airspeed of that best roll rate, m/s. Below it the ailerons have less
     /// bite; above it they slowly stiffen.
     pub roll_speed: Option<f32>,
+    /// Jets only: has an afterburner, lit by pushing the throttle past 100%.
+    pub afterburner: bool,
+    /// Thrust per engine with the afterburner lit, kgf (blank: 1.5x dry).
+    pub afterburner_thrust: Option<f32>,
     /// Guns and where they're mounted.
     pub weapons: crate::weapons::Loadout,
 }
@@ -108,8 +112,15 @@ impl AircraftCard {
             cl_max: None,
             roll_rate: Some(165.0),
             roll_speed: Some(480.0 / 3.6),
+            afterburner: false,
+            afterburner_thrust: None,
             weapons: crate::weapons::Loadout::default(),
         }
+    }
+
+    /// Whether this card's afterburner is in use (jets only).
+    pub fn has_afterburner(&self) -> bool {
+        self.engine == EngineKind::Jet && self.afterburner
     }
 
     /// Fill in any blank optional figures with typical values for the
@@ -201,6 +212,8 @@ pub struct FlightModel {
     pub efficiency: f32,
     /// Static thrust cap for props, N.
     pub static_thrust: f32,
+    /// Total thrust with the afterburner lit, N (0 without one).
+    pub ab_power: f32,
     /// Altitude up to which engine output holds (supercharger), m.
     pub critical_altitude: f32,
     /// Zero-lift drag coefficient. Solved.
@@ -274,6 +287,8 @@ pub fn roll_authority(m: &FlightModel, v: f32) -> f32 {
     m.roll_rate * build / (1.0 + 0.9 * over * over)
 }
 const ASPECT_RATIO: f32 = 6.0;
+/// Throttle setting with the afterburner fully lit (shown as 110%, like the game).
+pub const AFTERBURNER_THROTTLE: f32 = 1.1;
 
 impl FlightModel {
     pub fn from_card(card: &AircraftCard) -> FlightModel {
@@ -302,6 +317,12 @@ impl FlightModel {
             power,
             efficiency: 0.8,
             static_thrust,
+            ab_power: if card.has_afterburner() {
+                let per = card.afterburner_thrust.unwrap_or(card.power.max(1.0) * 1.5);
+                (per * engines * KGF).max(power)
+            } else {
+                0.0
+            },
             critical_altitude,
             cd0: 0.02,
             k: 1.0 / (std::f32::consts::PI * 0.8 * ASPECT_RATIO),
@@ -342,7 +363,7 @@ impl FlightModel {
                 let mut m = self.clone();
                 m.k = k;
                 m.fit_cd0(card);
-                m.drag(turn_speed, 0.0, n) - m.thrust(turn_speed, 0.0, 1.0)
+                m.drag(turn_speed, 0.0, n) - m.thrust(turn_speed, 0.0, m.max_throttle())
             });
             self.fit_cd0(card);
         }
@@ -356,7 +377,7 @@ impl FlightModel {
         let s = self.wing_area;
         let w = self.mass * G;
         let induced = self.k * (w / (q * s)).powi(2);
-        self.cd0 = (self.thrust(v, h, 1.0) / (q * s) - induced).max(0.004);
+        self.cd0 = (self.thrust(v, h, self.max_throttle()) / (q * s) - induced).max(0.004);
     }
 
     /// Engine output at altitude: constant up to the critical altitude, then
@@ -374,8 +395,25 @@ impl FlightModel {
         }
     }
 
-    /// Thrust in newtons at airspeed `v`, altitude `h`, throttle 0..=1.
+    /// Highest throttle setting: 1, or [`AFTERBURNER_THROTTLE`] with an
+    /// afterburner.
+    pub fn max_throttle(&self) -> f32 {
+        if self.ab_power > 0.0 {
+            AFTERBURNER_THROTTLE
+        } else {
+            1.0
+        }
+    }
+
+    /// Thrust in newtons at airspeed `v`, altitude `h`, throttle 0..=1 (up
+    /// to [`AFTERBURNER_THROTTLE`] with the afterburner).
     pub fn thrust(&self, v: f32, h: f32, throttle: f32) -> f32 {
+        if throttle > 1.0 && self.ab_power > 0.0 {
+            let ab = ((throttle - 1.0) / (AFTERBURNER_THROTTLE - 1.0)).min(1.0);
+            let dry = self.efficiency * self.power;
+            let wet = self.efficiency * self.ab_power;
+            return self.altitude_factor(h) * (dry + (wet - dry) * ab);
+        }
         let f = self.altitude_factor(h) * throttle.clamp(0.0, 1.0);
         match self.engine {
             EngineKind::Prop => {
@@ -407,7 +445,7 @@ impl FlightModel {
         let mut best = f32::MIN;
         let mut v = vs * 1.1;
         while v < 320.0 {
-            let excess = (self.thrust(v, h, 1.0) - self.drag(v, h, 1.0)) * v;
+            let excess = (self.thrust(v, h, self.max_throttle()) - self.drag(v, h, 1.0)) * v;
             best = best.max(excess / (self.mass * G));
             v += 2.0;
         }
@@ -419,7 +457,7 @@ impl FlightModel {
     pub fn sustained_turn_rate_at(&self, v: f32, h: f32) -> f32 {
         let q = 0.5 * air_density(h) * v * v;
         let s = self.wing_area;
-        let t = self.thrust(v, h, 1.0);
+        let t = self.thrust(v, h, self.max_throttle());
         let cl_thrust = ((t / (q * s) - self.cd0) / self.k).max(0.0).sqrt();
         let n = (cl_thrust.min(self.cl_max) * q * s / (self.mass * G)).min(self.g_limit);
         if n > 1.0 {
@@ -450,7 +488,7 @@ impl FlightModel {
         let mut v = self.stall_speed(h);
         while v < 320.0 {
             let q = 0.5 * rho * v * v;
-            let t = self.thrust(v, h, 1.0);
+            let t = self.thrust(v, h, self.max_throttle());
             let cl_thrust = ((t / (q * s) - self.cd0) / self.k).max(0.0).sqrt();
             let cl = cl_thrust.min(self.cl_max);
             let n = (cl * q * s / w).min(self.g_limit);
@@ -465,7 +503,9 @@ impl FlightModel {
     /// Level top speed (m/s) at altitude `h`.
     pub fn top_speed(&self, h: f32) -> f32 {
         let lo = self.stall_speed(h) * 1.3;
-        bisect(lo, 400.0, |v| self.thrust(v, h, 1.0) - self.drag(v, h, 1.0))
+        bisect(lo, 400.0, |v| {
+            self.thrust(v, h, self.max_throttle()) - self.drag(v, h, 1.0)
+        })
     }
 
     pub fn performance(&self, card: &AircraftCard) -> Performance {
@@ -1291,11 +1331,27 @@ mod tests {
             cl_max: None,
             roll_rate: None,
             roll_speed: None,
+            afterburner: false,
+            afterburner_thrust: None,
             weapons: Default::default(),
         };
         let m = FlightModel::from_card(&card);
         println!("jet {:?}", m.check);
         assert!((m.check.top_speed - card.top_speed).abs() < 5.0);
+
+        // With an afterburner the card's figures are at full afterburner,
+        // and 100% dry throttle gives less.
+        let ab = AircraftCard {
+            afterburner: true,
+            afterburner_thrust: Some(4000.0),
+            ..card
+        };
+        let m = FlightModel::from_card(&ab);
+        println!("jet with afterburner {:?}", m.check);
+        assert!((m.check.top_speed - ab.top_speed).abs() < 5.0);
+        assert_eq!(m.max_throttle(), AFTERBURNER_THROTTLE);
+        let (v, h) = (250.0, 1000.0);
+        assert!(m.thrust(v, h, 1.0) < m.thrust(v, h, AFTERBURNER_THROTTLE) * 0.75);
     }
 }
 

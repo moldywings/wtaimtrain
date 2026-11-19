@@ -889,15 +889,18 @@ fn fire_plane(
     for (card, count) in fired {
         let key = card.name.clone();
         let last = guns.last_sound.get(&key).copied().unwrap_or(f32::MIN);
-        // Every shot up to about 25 a second; faster guns blend together.
-        if now - last < card.interval().max(0.04) * 0.95 {
+        // Every shot gets its sound, up to 25 a second (faster guns blend
+        // together). Shots land on whole frames, so the gap between two can
+        // be most of a frame shorter than the gun's interval: only skip a
+        // sound that comes far too soon, or slow guns drop shots at random.
+        if now - last < (card.interval() * 0.5).max(0.04) {
             continue;
         }
         guns.last_sound.insert(key, now);
         let sound = sounds.gunshot(sources, card.caliber_mm(), card.muzzle_velocity);
         let loud = (card.caliber_mm() / 20.0).clamp(0.4, 1.6).sqrt();
         let volume = 0.22 * loud * (count as f32).powf(0.35) * loudness;
-        let speed = 1.0 + rng.next() * 0.04;
+        let speed = 1.0 + rng.next() * 0.015;
         sound::play(commands, sound, volume, speed);
     }
 }

@@ -42,80 +42,224 @@ impl Plugin for SettingsPlugin {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Units {
-    #[default]
-    Metric,
-    Imperial,
-    Nautical,
+/// A kind of quantity whose display unit the player can pick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitKind {
+    Speed,
+    Altitude,
+    Distance,
+    Climb,
+    Power,
+    Thrust,
+    Mass,
+    Area,
 }
 
-impl Units {
-    pub fn next(self) -> Self {
-        match self {
-            Units::Metric => Units::Imperial,
-            Units::Imperial => Units::Nautical,
-            Units::Nautical => Units::Metric,
-        }
+/// One display unit: its name, how many of it make one stored (SI-ish)
+/// unit, and how many decimals to show.
+pub struct UnitDef {
+    pub name: &'static str,
+    pub per_base: f32,
+    pub decimals: usize,
+}
+
+const fn u(name: &'static str, per_base: f32, decimals: usize) -> UnitDef {
+    UnitDef {
+        name,
+        per_base,
+        decimals,
     }
+}
+
+const FT: f32 = 3.280_84;
+const SPEED_UNITS: [UnitDef; 4] = [
+    u("km/h", 3.6, 0),
+    u("mph", 2.236_936, 0),
+    u("kn", 1.943_844, 0),
+    u("m/s", 1.0, 0),
+];
+const ALTITUDE_UNITS: [UnitDef; 2] = [u("m", 1.0, 0), u("ft", FT, 0)];
+const DISTANCE_UNITS: [UnitDef; 6] = [
+    u("km", 0.001, 2),
+    u("mi", 1.0 / 1609.344, 2),
+    u("nmi", 1.0 / 1852.0, 2),
+    u("m", 1.0, 0),
+    u("ft", FT, 0),
+    u("yd", FT / 3.0, 0),
+];
+const CLIMB_UNITS: [UnitDef; 3] = [
+    u("m/s", 1.0, 1),
+    u("ft/min", FT * 60.0, 0),
+    u("ft/s", FT, 1),
+];
+/// Stored in horsepower.
+const POWER_UNITS: [UnitDef; 2] = [u("hp", 1.0, 0), u("kW", 0.745_7, 0)];
+/// Stored in kgf.
+const THRUST_UNITS: [UnitDef; 3] = [
+    u("kgf", 1.0, 0),
+    u("lbf", 2.204_623, 0),
+    u("kN", 0.009_806_65, 2),
+];
+const MASS_UNITS: [UnitDef; 2] = [u("kg", 1.0, 0), u("lb", 2.204_623, 0)];
+const AREA_UNITS: [UnitDef; 2] = [u("sq m", 1.0, 2), u("sq ft", 10.763_91, 1)];
+
+impl UnitKind {
+    pub const ALL: [UnitKind; 8] = [
+        UnitKind::Speed,
+        UnitKind::Altitude,
+        UnitKind::Distance,
+        UnitKind::Climb,
+        UnitKind::Power,
+        UnitKind::Thrust,
+        UnitKind::Mass,
+        UnitKind::Area,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Units::Metric => "Metric (km/h, m)",
-            Units::Imperial => "Imperial (mph, ft)",
-            Units::Nautical => "Nautical (kn, ft)",
+            UnitKind::Speed => "Airspeed",
+            UnitKind::Altitude => "Altitude",
+            UnitKind::Distance => "Distance and range",
+            UnitKind::Climb => "Climb rate",
+            UnitKind::Power => "Engine power",
+            UnitKind::Thrust => "Engine thrust",
+            UnitKind::Mass => "Mass",
+            UnitKind::Area => "Wing area",
         }
+    }
+
+    pub fn options(self) -> &'static [UnitDef] {
+        match self {
+            UnitKind::Speed => &SPEED_UNITS,
+            UnitKind::Altitude => &ALTITUDE_UNITS,
+            UnitKind::Distance => &DISTANCE_UNITS,
+            UnitKind::Climb => &CLIMB_UNITS,
+            UnitKind::Power => &POWER_UNITS,
+            UnitKind::Thrust => &THRUST_UNITS,
+            UnitKind::Mass => &MASS_UNITS,
+            UnitKind::Area => &AREA_UNITS,
+        }
+    }
+
+    fn index(self) -> usize {
+        UnitKind::ALL.iter().position(|k| *k == self).unwrap()
+    }
+}
+
+/// The display unit picked for each kind of quantity. Everything is stored
+/// in fixed units (m, m/s, hp, kgf, kg, sq m), so changing a unit only
+/// changes what's shown and typed: presets convert by themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Units {
+    choice: [u8; 8],
+}
+
+impl Default for Units {
+    fn default() -> Self {
+        Units::METRIC
+    }
+}
+
+impl Units {
+    pub const METRIC: Units = Units {
+        choice: [0, 0, 0, 0, 0, 0, 0, 0],
+    };
+    pub const IMPERIAL: Units = Units {
+        choice: [1, 1, 1, 1, 0, 1, 1, 1],
+    };
+    pub const NAUTICAL: Units = Units {
+        choice: [2, 1, 2, 1, 0, 1, 1, 1],
+    };
+
+    pub fn get(self, kind: UnitKind) -> &'static UnitDef {
+        let options = kind.options();
+        &options[(self.choice[kind.index()] as usize).min(options.len() - 1)]
+    }
+
+    /// Switch a kind to its next unit.
+    pub fn cycle(&mut self, kind: UnitKind) {
+        let i = kind.index();
+        self.choice[i] = ((self.choice[i] as usize + 1) % kind.options().len()) as u8;
+    }
+
+    /// Unit name and factor from the stored unit, for editing.
+    pub fn unit(self, kind: UnitKind) -> (&'static str, f32) {
+        let d = self.get(kind);
+        (d.name, d.per_base)
+    }
+
+    /// Format a stored value with its unit.
+    pub fn fmt(self, kind: UnitKind, value: f32) -> String {
+        let d = self.get(kind);
+        format!("{:.*} {}", d.decimals, value * d.per_base, d.name)
     }
 
     /// Format a speed given in m/s.
     pub fn speed(self, mps: f32) -> String {
-        match self {
-            Units::Metric => format!("{:.0} km/h", mps * 3.6),
-            Units::Imperial => format!("{:.0} mph", mps * 2.236_936),
-            Units::Nautical => format!("{:.0} kn", mps * 1.943_844),
-        }
+        self.fmt(UnitKind::Speed, mps)
     }
 
-    /// Format a target range given in meters (km, mi or nmi).
+    /// Format a distance or range given in meters.
     pub fn range(self, m: f32) -> String {
-        match self {
-            Units::Metric => format!("{:.2} km", m / 1000.0),
-            Units::Imperial => format!("{:.2} mi", m / 1609.344),
-            Units::Nautical => format!("{:.2} nmi", m / 1852.0),
-        }
+        self.fmt(UnitKind::Distance, m)
     }
 
-    /// Speed unit for editing, with the factor from m/s.
+    /// Format an altitude given in meters.
+    pub fn altitude(self, m: f32) -> String {
+        self.fmt(UnitKind::Altitude, m)
+    }
+
     pub fn speed_unit(self) -> (&'static str, f32) {
-        match self {
-            Units::Metric => ("km/h", 3.6),
-            Units::Imperial => ("mph", 2.236_936),
-            Units::Nautical => ("kt", 1.943_844),
-        }
+        self.unit(UnitKind::Speed)
     }
 
-    /// Climb rate unit for editing, with the factor from m/s.
     pub fn climb_unit(self) -> (&'static str, f32) {
-        match self {
-            Units::Metric => ("m/s", 1.0),
-            Units::Imperial | Units::Nautical => ("ft/min", 196.850_4),
-        }
+        self.unit(UnitKind::Climb)
     }
 
-    /// Altitude unit for editing, with the factor from meters.
     pub fn altitude_unit(self) -> (&'static str, f32) {
-        match self {
-            Units::Metric => ("m", 1.0),
-            Units::Imperial | Units::Nautical => ("ft", 3.280_84),
-        }
+        self.unit(UnitKind::Altitude)
     }
+}
 
-    /// Format a distance or altitude given in meters.
-    pub fn distance(self, m: f32) -> String {
-        match self {
-            Units::Metric => format!("{:.0} m", m),
-            Units::Imperial | Units::Nautical => format!("{:.0} ft", m * 3.280_84),
+// Saved as {"Speed": "km/h", ...}. Older saves had one word for everything
+// ("Metric", "Imperial" or "Nautical"), which still loads.
+impl Serialize for Units {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let map: BTreeMap<String, &str> = UnitKind::ALL
+            .iter()
+            .map(|k| (format!("{k:?}"), self.get(*k).name))
+            .collect();
+        map.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Units {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Saved {
+            Old(String),
+            New(BTreeMap<String, String>),
         }
+        Ok(match Saved::deserialize(d)? {
+            Saved::Old(name) => match name.as_str() {
+                "Imperial" => Units::IMPERIAL,
+                "Nautical" => Units::NAUTICAL,
+                _ => Units::METRIC,
+            },
+            Saved::New(map) => {
+                let mut units = Units::METRIC;
+                for kind in UnitKind::ALL {
+                    if let Some(name) = map.get(&format!("{kind:?}"))
+                        && let Some(i) = kind.options().iter().position(|o| o.name == name)
+                    {
+                        units.choice[kind.index()] = i as u8;
+                    }
+                }
+                units
+            }
+        })
     }
 }
 
@@ -273,6 +417,8 @@ pub struct Settings {
     pub sensitivity: f32,
     /// Multiplier on [`BASE_SENSITIVITY`] for free look.
     pub look_sensitivity: f32,
+    /// Extra aim sensitivity while zoomed in, multiplied on top.
+    pub zoom_sensitivity: f32,
     pub bindings: BTreeMap<Action, KeyCode>,
     pub crosshair: Crosshair,
     pub crosshair_color: CrosshairColor,
@@ -285,10 +431,8 @@ pub struct Settings {
     pub guns: Vec<GunCard>,
     /// Which practice scenario runs.
     pub scenario: Scenario,
-    /// Chase scenario: the target starts this far ahead, m (random
-    /// between the two).
-    pub chase_min: f32,
-    pub chase_max: f32,
+    /// Each scenario's start distances (random within each range).
+    pub ranges: Ranges,
     /// Show where to aim to hit the target.
     pub lead_indicator: bool,
     /// The target shoots back.
@@ -304,17 +448,19 @@ pub enum Scenario {
     Stall,
     Dogfight,
     Banking,
+    Diving,
     /// A random one of the others each time.
     AllInOne,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 6] = [
+    pub const ALL: [Scenario; 7] = [
         Scenario::HeadOn,
         Scenario::Chase,
         Scenario::Stall,
         Scenario::Dogfight,
         Scenario::Banking,
+        Scenario::Diving,
         Scenario::AllInOne,
     ];
 
@@ -325,6 +471,7 @@ impl Scenario {
             Scenario::Stall => "Stall",
             Scenario::Dogfight => "Dogfight",
             Scenario::Banking => "Banking",
+            Scenario::Diving => "Diving",
             Scenario::AllInOne => "All in one",
         }
     }
@@ -354,22 +501,155 @@ impl Scenario {
                  sometimes away. Each run takes a different path across the screen: \
                  low to high, high to low, or straight across."
             }
-            Scenario::AllInOne => "A random scenario every time it resets.",
+            Scenario::Diving => {
+                "You start above the target and dive on it. Some targets haven't seen \
+                 you and fly straight until you open fire; others spot you as you dive \
+                 in. Once alerted it dives away and runs, jinking, rolling or \
+                 corkscrewing."
+            }
+            Scenario::AllInOne => {
+                "A random scenario every time it resets, using each scenario's own \
+                 start distances."
+            }
         }
     }
 }
 
-/// Limits and step for the chase start distance, m.
-pub const CHASE_MIN: f32 = 100.0;
-pub const CHASE_MAX: f32 = 3000.0;
-pub const CHASE_STEP: f32 = 100.0;
+impl Scenario {
+    /// The start distances you can set for this scenario.
+    pub fn ranges(self) -> &'static [RangeId] {
+        match self {
+            Scenario::HeadOn => &[RangeId::HeadOn],
+            Scenario::Chase => &[RangeId::Chase],
+            Scenario::Stall => &[RangeId::Stall],
+            Scenario::Dogfight => &[RangeId::Dogfight],
+            Scenario::Banking => &[RangeId::Banking],
+            Scenario::Diving => &[RangeId::Diving, RangeId::DivingHeight],
+            Scenario::AllInOne => &[],
+        }
+    }
+}
+
+/// A min..max range, m.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Span {
+    pub min: f32,
+    pub max: f32,
+}
+
+const fn span(min: f32, max: f32) -> Span {
+    Span { min, max }
+}
+
+/// Each scenario's start distance range (and the diving height).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ranges {
+    pub head_on: Span,
+    pub chase: Span,
+    pub stall: Span,
+    pub dogfight: Span,
+    pub banking: Span,
+    pub diving: Span,
+    pub diving_height: Span,
+}
+
+impl Default for Ranges {
+    fn default() -> Self {
+        Ranges {
+            head_on: span(1800.0, 2600.0),
+            chase: span(300.0, 800.0),
+            stall: span(100.0, 200.0),
+            dogfight: span(400.0, 1000.0),
+            banking: span(500.0, 1300.0),
+            diving: span(800.0, 2000.0),
+            diving_height: span(300.0, 1200.0),
+        }
+    }
+}
+
+/// One settable range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeId {
+    HeadOn,
+    Chase,
+    Stall,
+    Dogfight,
+    Banking,
+    Diving,
+    DivingHeight,
+}
+
+/// Limits and step for start distances, m.
+pub const RANGE_MIN: f32 = 50.0;
+pub const RANGE_MAX: f32 = 5000.0;
+pub const RANGE_STEP: f32 = 50.0;
+
+impl RangeId {
+    pub fn label(self) -> &'static str {
+        match self {
+            RangeId::HeadOn => "Target starts this far ahead",
+            RangeId::Chase => "Target starts this far ahead",
+            RangeId::Stall => "Target starts this far ahead",
+            RangeId::Dogfight => "Target starts this far away",
+            RangeId::Banking => "Target starts this far ahead",
+            RangeId::Diving => "Target starts this far ahead",
+            RangeId::DivingHeight => "You start this high above it",
+        }
+    }
+
+    /// Whether this is a height (shown in altitude units).
+    pub fn is_height(self) -> bool {
+        self == RangeId::DivingHeight
+    }
+}
+
+impl Ranges {
+    pub fn get(&self, id: RangeId) -> Span {
+        *self.get_ref(id)
+    }
+
+    fn get_ref(&self, id: RangeId) -> &Span {
+        match id {
+            RangeId::HeadOn => &self.head_on,
+            RangeId::Chase => &self.chase,
+            RangeId::Stall => &self.stall,
+            RangeId::Dogfight => &self.dogfight,
+            RangeId::Banking => &self.banking,
+            RangeId::Diving => &self.diving,
+            RangeId::DivingHeight => &self.diving_height,
+        }
+    }
+
+    /// Move one end (0 near, 1 far) by some steps, keeping min <= max.
+    pub fn step(&mut self, id: RangeId, end: u8, steps: i32) {
+        let r = match id {
+            RangeId::HeadOn => &mut self.head_on,
+            RangeId::Chase => &mut self.chase,
+            RangeId::Stall => &mut self.stall,
+            RangeId::Dogfight => &mut self.dogfight,
+            RangeId::Banking => &mut self.banking,
+            RangeId::Diving => &mut self.diving,
+            RangeId::DivingHeight => &mut self.diving_height,
+        };
+        let d = steps as f32 * RANGE_STEP;
+        if end == 0 {
+            r.min = (r.min + d).clamp(RANGE_MIN, RANGE_MAX);
+            r.max = r.max.max(r.min);
+        } else {
+            r.max = (r.max + d).clamp(RANGE_MIN, RANGE_MAX);
+            r.min = r.min.min(r.max);
+        }
+    }
+}
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            units: Units::Metric,
+            units: Units::METRIC,
             sensitivity: 1.0,
             look_sensitivity: 1.0,
+            zoom_sensitivity: 1.0,
             bindings: default_bindings(),
             crosshair: Crosshair::Cross,
             crosshair_color: CrosshairColor::Default,
@@ -378,8 +658,7 @@ impl Default for Settings {
             target_aircraft: "Yak-3".into(),
             guns: vec![GunCard::shvak(), GunCard::ubs()],
             scenario: Scenario::Chase,
-            chase_min: 300.0,
-            chase_max: 800.0,
+            ranges: Ranges::default(),
             lead_indicator: false,
             enemy_fires: false,
         }
@@ -612,15 +891,32 @@ mod tests {
     #[test]
     fn settings_round_trip_through_json() {
         let mut s = Settings {
-            units: Units::Nautical,
+            units: Units::NAUTICAL,
             sensitivity: 1.7,
             ..Default::default()
         };
         s.rebind(Action::FreeLook, KeyCode::KeyC);
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-        assert_eq!(back.units, Units::Nautical);
+        assert_eq!(back.units, Units::NAUTICAL);
         assert_eq!(back.key(Action::FreeLook), KeyCode::KeyC);
         assert!((back.sensitivity - 1.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn units_load_old_and_new_saves() {
+        let old: Settings = serde_json::from_str(r#"{"units": "Imperial"}"#).unwrap();
+        assert_eq!(old.units.speed(100.0), "224 mph");
+        let mut u = Units::METRIC;
+        u.cycle(UnitKind::Distance);
+        u.cycle(UnitKind::Distance);
+        u.cycle(UnitKind::Distance);
+        let s = Settings {
+            units: u,
+            ..Default::default()
+        };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.units.range(1234.0), "1234 m");
+        assert_eq!(back.units.speed(100.0), "360 km/h");
     }
 
     #[test]
