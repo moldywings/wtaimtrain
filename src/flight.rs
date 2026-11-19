@@ -145,7 +145,10 @@ pub fn fly_player(
     player.keys = current + (wanted - current).clamp(Vec3::splat(-step), Vec3::splat(step));
 
     // Instructor for whatever the keys aren't doing; keys blend in on top.
-    let auto = flight_model::instructor(&aircraft.model, &aircraft.body, aim.direction());
+    let auto = {
+        let Aircraft { model, body, .. } = &mut *aircraft;
+        flight_model::instructor(model, body, aim.direction(), dt)
+    };
     let blend = |auto: f32, key: f32| auto * (1.0 - key.abs()) + key;
     controls.pitch = blend(auto.pitch, player.keys.x);
     controls.roll = blend(auto.roll, player.keys.y);

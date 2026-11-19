@@ -9,11 +9,12 @@
 
 use bevy::input::ButtonState;
 use bevy::input::keyboard::KeyboardInput;
+use bevy::input_focus::tab_navigation::{TabGroup, TabIndex};
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::text::{EditableText, TextCursorStyle};
 use bevy::ui::Pressed;
-use bevy::ui_widgets::{Activate, Button, TextInput};
+use bevy::ui_widgets::{Activate, Button, SelectAllOnFocus, TextInput};
 
 use crate::GameState;
 use crate::flight_model::{AircraftCard, EngineKind, FlightModel};
@@ -25,7 +26,8 @@ pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Rebinding>()
+        app.add_plugins(bevy::input_focus::tab_navigation::TabNavigationPlugin)
+            .init_resource::<Rebinding>()
             .init_resource::<MenuUi>()
             .add_observer(on_menu_click)
             .add_systems(OnEnter(GameState::Paused), open_menu)
@@ -235,6 +237,7 @@ enum MenuAction {
     SensitivityDown,
     SensitivityUp,
     CycleCrosshair,
+    CycleCrosshairColor,
     Rebind(Action),
     ResetBindings,
     Quit,
@@ -425,11 +428,18 @@ fn settings_page(panel: &mut ChildSpawnerCommands, settings: &Settings, rebindin
                 });
 
                 col.spawn(section_header("Crosshair"));
-                col.spawn(button(
-                    MenuAction::CycleCrosshair,
-                    settings.crosshair.label(),
-                    percent(100),
-                ));
+                col.spawn(row()).with_children(|r| {
+                    r.spawn(button(
+                        MenuAction::CycleCrosshair,
+                        settings.crosshair.label(),
+                        percent(56),
+                    ));
+                    r.spawn(button(
+                        MenuAction::CycleCrosshairColor,
+                        settings.crosshair_color.label(),
+                        percent(41),
+                    ));
+                });
 
                 col.spawn(section_header("Mouse"));
                 col.spawn(label(
@@ -527,7 +537,7 @@ fn aircraft_page(panel: &mut ChildSpawnerCommands, settings: &Settings, ui: &Men
 
             // Right: the stat card editor.
             let engine = ui.draft.engine.unwrap_or(EngineKind::Prop);
-            cols.spawn(column(px(460))).with_children(|col| {
+            cols.spawn((column(px(460)), TabGroup::new(0))).with_children(|col| {
                 col.spawn(section_header(
                     "Stat card: enter what you know, the rest is worked out",
                 ));
@@ -586,6 +596,28 @@ fn aircraft_page(panel: &mut ChildSpawnerCommands, settings: &Settings, ui: &Men
                         13.0,
                         DIM,
                     ));
+                    // Say so when a card asks for something the model can't do.
+                    let mut misses = vec![];
+                    if (p.top_speed - card.top_speed).abs() > card.top_speed * 0.03 {
+                        misses.push("top speed");
+                    }
+                    if (p.climb_rate - card.climb_rate).abs() > card.climb_rate * 0.05 {
+                        misses.push("climb rate");
+                    }
+                    if (p.turn_time - card.turn_time).abs() > card.turn_time * 0.05 {
+                        misses.push("turn time");
+                    }
+                    if !misses.is_empty() {
+                        col.spawn(label(
+                            &format!(
+                                "Can't fully match the {} with these numbers. Check the units, \
+                                 or adjust mass, wing area or max lift.",
+                                misses.join(" and ")
+                            ),
+                            13.0,
+                            ACCENT,
+                        ));
+                    }
                 }
             });
         });
@@ -623,6 +655,9 @@ fn text_field(field: Field, value: &str) -> impl Bundle {
         },
         TextColor(TEXT),
         TextCursorStyle::default(),
+        // Clicking only focuses widgets that have a tab index.
+        TabIndex(field.index() as i32),
+        SelectAllOnFocus,
         field,
     )
 }
@@ -668,6 +703,9 @@ fn on_menu_click(
             settings.sensitivity = step_sensitivity(settings.sensitivity, 1.0);
         }
         MenuAction::CycleCrosshair => settings.crosshair = settings.crosshair.next(),
+        MenuAction::CycleCrosshairColor => {
+            settings.crosshair_color = settings.crosshair_color.next();
+        }
         MenuAction::Rebind(a) => rebinding.0 = Some(a),
         MenuAction::ResetBindings => settings.bindings = default_bindings(),
         MenuAction::Quit => {

@@ -7,7 +7,7 @@ use bevy::window::{CursorGrabMode, CursorOptions};
 use crate::GameState;
 use crate::camera::{ChaseCamera, MouseAim};
 use crate::flight::{Aircraft, Player};
-use crate::settings::{Crosshair, Settings};
+use crate::settings::{Crosshair, CrosshairColor, Settings};
 use crate::target::Target;
 
 pub struct HudPlugin;
@@ -218,7 +218,16 @@ fn spawn_hud(mut commands: Commands) {
                         ));
                     }
                 });
-                d.spawn(dot(DIAMOND_BOX, 6.0, TARGET_RED));
+                // Red dot sits at the top tip of the diamond, like the game.
+                let tip = (DIAMOND_BOX - side * std::f32::consts::SQRT_2) / 2.0;
+                d.spawn(rect(
+                    DIAMOND_BOX / 2.0 - 3.5,
+                    tip - 1.0,
+                    7.0,
+                    7.0,
+                    TARGET_RED,
+                    true,
+                ));
             });
             m.spawn((
                 Text::new(""),
@@ -286,34 +295,37 @@ fn spawn_hud(mut commands: Commands) {
 fn rebuild_crosshair(
     mut commands: Commands,
     settings: Res<Settings>,
-    mut current: Local<Option<Crosshair>>,
+    mut current: Local<Option<(Crosshair, CrosshairColor)>>,
     crosshair: Single<Entity, With<GunCrosshair>>,
 ) {
     let style = settings.crosshair;
-    if *current == Some(style) {
+    let choice = settings.crosshair_color;
+    if *current == Some((style, choice)) {
         return;
     }
-    *current = Some(style);
+    *current = Some((style, choice));
+    let white = choice.color().unwrap_or(RETICLE_WHITE);
+    let gold = choice.color().unwrap_or(RETICLE_GOLD);
     let s = CROSSHAIR_SIZE;
     let mut root = commands.entity(*crosshair);
     root.despawn_children();
     root.with_children(|c| match style {
         Crosshair::Cross => {
-            ticks(c, s, 6.0, 10.0, 2.0, RETICLE_WHITE);
-            c.spawn(dot(s, 3.0, RETICLE_WHITE));
+            ticks(c, s, 6.0, 10.0, 2.0, white);
+            c.spawn(dot(s, 3.0, white));
         }
         Crosshair::Circle => {
-            c.spawn(ring(s, 22.0, 2.0, RETICLE_GOLD));
+            c.spawn(ring(s, 22.0, 2.0, gold));
         }
         Crosshair::CircleDot => {
-            c.spawn(ring(s, 22.0, 2.0, RETICLE_GOLD));
-            c.spawn(dot(s, 3.0, RETICLE_GOLD));
+            c.spawn(ring(s, 22.0, 2.0, gold));
+            c.spawn(dot(s, 3.0, gold));
         }
         Crosshair::Dot => {
-            c.spawn(dot(s, 4.0, RETICLE_GOLD));
+            c.spawn(dot(s, 4.0, gold));
         }
         Crosshair::SmallCross => {
-            ticks(c, s, 2.0, 5.0, 2.0, RETICLE_GOLD);
+            ticks(c, s, 2.0, 5.0, 2.0, gold);
         }
     });
 }
@@ -353,7 +365,7 @@ fn update_hud(
     };
 
     // Mouse aim circle: a point far along the aim direction.
-    let aim_point = cam_tf.translation() + aim.direction() * 2_000.0;
+    let aim_point = cam_tf.translation() + aim.direction() * 20_000.0;
     place(
         nodes.p0().into_inner(),
         project(aim_point),
@@ -361,7 +373,7 @@ fn update_hud(
     );
 
     // Gun crosshair: where the nose is actually pointing.
-    let nose_point = player_tf.translation() + player_tf.forward().as_vec3() * 2_000.0;
+    let nose_point = player_tf.translation() + player_tf.forward().as_vec3() * 20_000.0;
     place(
         nodes.p1().into_inner(),
         project(nose_point),

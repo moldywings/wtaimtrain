@@ -395,6 +395,8 @@ pub struct Body {
     /// Readouts from the last step.
     pub alpha: f32,
     pub g_load: f32,
+    /// Instructor's slowly built-up pitch correction (integral term), rad.
+    pub trim: f32,
 }
 
 impl Body {
@@ -406,6 +408,7 @@ impl Body {
             omega: Vec3::ZERO,
             alpha: 0.0,
             g_load: 1.0,
+            trim: 0.0,
         }
     }
 
@@ -552,7 +555,8 @@ fn substep(m: &FlightModel, b: &mut Body, c: &Controls, dt: f32) {
 /// Turn toward `aim` (a world direction) the way War Thunder's instructor
 /// does: roll the aim point over the canopy, pull, and level the wings when
 /// the nose is on target. Keeps the angle of attack below the stall.
-pub fn instructor(model: &FlightModel, body: &Body, aim: Vec3) -> Controls {
+/// `dt` lets it build up a small trim so the nose settles exactly on the aim.
+pub fn instructor(model: &FlightModel, body: &mut Body, aim: Vec3, dt: f32) -> Controls {
     let local = body.rotation.inverse() * aim.normalize_or(Vec3::NEG_Z);
     let off_nose = local.angle_between(Vec3::NEG_Z);
     let v = body.speed();
@@ -562,7 +566,11 @@ pub fn instructor(model: &FlightModel, body: &Body, aim: Vec3) -> Controls {
     // Close to the nose, roll the wings level instead.
     let bank_to_target = local.x.atan2(local.y);
     let right = body.rotation * Vec3::X;
-    let bank_to_level = right.y.clamp(-1.0, 1.0).asin();
+    // Near the nose, a shallow bank toward the aim nudges the heading over
+    // (the rudder alone would take ages); dead on target, wings level.
+    let yaw_err = local.x.atan2(-local.z);
+    let wanted_left_bank = (-yaw_err * 10.0).clamp(-0.35, 0.35);
+    let bank_to_level = right.y.clamp(-1.0, 1.0).asin() - wanted_left_bank;
     let w = smoothstep(0.03, 0.15, off_nose);
     let roll_err = w * bank_to_target + (1.0 - w) * bank_to_level;
     // Roll error -> desired roll rate -> stick, with damping on roll rate.
@@ -576,13 +584,30 @@ pub fn instructor(model: &FlightModel, body: &Body, aim: Vec3) -> Controls {
     let pitch_err = local.y.atan2(-local.z);
     let alpha_max = ELEVATOR_ALPHA * model.alpha_stall;
     let roll_lag = (w * bank_to_target.abs() / 1.2).clamp(0.0, 0.85);
-    let alpha_wanted = (pitch_err * 1.6 - body.omega.x * 0.25) * (1.0 - roll_lag);
+    // Feed-forward: the angle of attack that holds the nose up against
+    // gravity, so the nose doesn't sag below the aim in level flight.
+    let q = 0.5 * air_density(body.position.y) * v * v;
+    let up = body.rotation * Vec3::Y;
+    let alpha_hold = if q > 50.0 {
+        (model.mass * G * up.y.max(0.0) / (q * model.wing_area * model.cl_alpha))
+            .min(model.alpha_stall)
+    } else {
+        0.0
+    };
+    // Integral: soak up whatever small error is left once on target.
+    if off_nose < 0.1 {
+        body.trim = (body.trim + pitch_err * 2.0 * dt).clamp(-0.05, 0.05);
+    } else {
+        body.trim *= 1.0 - (2.0 * dt).min(1.0);
+    }
+    let alpha_wanted = (pitch_err * 1.6 - body.omega.x * 0.25) * (1.0 - roll_lag)
+        + alpha_hold * (1.0 - w)
+        + body.trim;
     // Stay just under the stall (the real instructor does the same).
     let alpha_limit = 0.88 * model.alpha_stall;
     let pitch = (alpha_wanted.clamp(-0.5 * alpha_limit, alpha_limit) / alpha_max).clamp(-1.0, 1.0);
 
     // Rudder for fine aiming near the nose.
-    let yaw_err = local.x.atan2(-local.z);
     let yaw = ((yaw_err * 6.0) * (1.0 - w)).clamp(-1.0, 1.0);
 
     Controls {
@@ -642,11 +667,8 @@ mod tests {
         // Level flight at 4000 m: hold altitude with a simple autopilot.
         let mut b = Body::new(Vec3::new(0.0, 4000.0, 0.0), Quat::IDENTITY, 150.0);
         for _ in 0..(240 * 120) {
-            let mut c = instructor(
-                &m,
-                &b,
-                Vec3::new(0.0, (4000.0 - b.position.y) * 0.002, -1.0),
-            );
+            let aim = Vec3::new(0.0, (4000.0 - b.position.y) * 0.002, -1.0);
+            let mut c = instructor(&m, &mut b, aim, 1.0 / 240.0);
             c.throttle = full.throttle;
             step(&m, &mut b, &c, 1.0 / 240.0);
         }
@@ -657,27 +679,26 @@ mod tests {
         );
         assert!((b.speed() - card.top_speed).abs() < 6.0, "sim top speed");
 
-        // Climb: hold the best climb speed and measure vertical speed.
+        // Climb: hold a fixed climb attitude, let speed settle, and measure
+        // vertical speed. The best attitude gives the best climb.
         let vy_best = card.climb_rate;
         let mut best = 0.0f32;
-        for target_kmh in [240.0, 270.0, 300.0, 330.0] {
-            let target = target_kmh / 3.6;
-            let mut b = Body::new(Vec3::new(0.0, 300.0, 0.0), Quat::IDENTITY, target);
-            let mut pitch_cmd = 0.0f32;
+        for deg in [6.0f32, 8.0, 10.0, 12.0, 14.0, 16.0] {
+            let mut b = Body::new(Vec3::new(0.0, 300.0, 0.0), Quat::IDENTITY, 75.0);
+            let aim = Quat::from_rotation_x(deg.to_radians()) * Vec3::NEG_Z;
             let mut climbs = vec![];
-            for i in 0..(240 * 40) {
-                // Pitch the aim up or down to hold speed.
-                pitch_cmd = (pitch_cmd + (b.speed() - target) * 0.00002).clamp(-0.2, 0.6);
-                let aim = Quat::from_rotation_x(pitch_cmd) * Vec3::NEG_Z;
-                let mut c = instructor(&m, &b, aim);
+            for i in 0..(240 * 60) {
+                let mut c = instructor(&m, &mut b, aim, 1.0 / 240.0);
                 c.throttle = 1.0;
                 step(&m, &mut b, &c, 1.0 / 240.0);
-                if i > 240 * 25 {
+                // Measure low down, where the card's sea-level figure applies.
+                if i > 240 * 40 && b.position.y < 1500.0 {
                     climbs.push(b.velocity.y);
                 }
             }
-            let avg = climbs.iter().sum::<f32>() / climbs.len() as f32;
-            best = best.max(avg);
+            if !climbs.is_empty() {
+                best = best.max(climbs.iter().sum::<f32>() / climbs.len() as f32);
+            }
         }
         println!("sim best climb {:.1} m/s (card {:.1})", best, vy_best);
         assert!(best > vy_best * 0.8 && best < vy_best * 1.15, "sim climb");
@@ -690,7 +711,7 @@ mod tests {
         let aim = Quat::from_rotation_y(2.0) * Vec3::NEG_Z; // 115° left
         let mut stalled_frames = 0;
         for _ in 0..(240 * 12) {
-            let mut c = instructor(&m, &b, aim);
+            let mut c = instructor(&m, &mut b, aim, 1.0 / 240.0);
             c.throttle = 1.0;
             step(&m, &mut b, &c, 1.0 / 240.0);
             if m.is_stalled(b.alpha) {
@@ -698,8 +719,22 @@ mod tests {
             }
         }
         let err = b.forward().angle_between(aim).to_degrees();
-        println!("nose error after 12 s: {err:.2}°, stalled frames {stalled_frames}");
-        assert!(err < 2.0, "nose on aim");
+        let l = b.rotation.inverse() * aim;
+        println!(
+            "nose error after 12 s: {err:.2}° (local {l:?}), stalled frames {stalled_frames}, speed {:.0}",
+            b.speed()
+        );
+        // And in plain level flight the nose should sit on the aim, not below it.
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 110.0);
+        for _ in 0..(240 * 8) {
+            let mut c = instructor(&m, &mut b, Vec3::NEG_Z, 1.0 / 240.0);
+            c.throttle = 0.8;
+            step(&m, &mut b, &c, 1.0 / 240.0);
+        }
+        let level_err = b.forward().angle_between(Vec3::NEG_Z).to_degrees();
+        println!("level flight nose error: {level_err:.3}°");
+        assert!(level_err < 0.15, "nose sits on the aim in level flight");
+        assert!(err < 0.3, "nose on aim");
         assert_eq!(stalled_frames, 0, "instructor never stalls");
     }
 

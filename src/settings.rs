@@ -196,6 +196,65 @@ impl Crosshair {
     }
 }
 
+/// Crosshair color. `Default` uses each style's own color like the game.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CrosshairColor {
+    #[default]
+    Default,
+    White,
+    Gold,
+    Green,
+    Cyan,
+    Yellow,
+    Red,
+    Magenta,
+}
+
+impl CrosshairColor {
+    const ALL: [CrosshairColor; 8] = [
+        CrosshairColor::Default,
+        CrosshairColor::White,
+        CrosshairColor::Gold,
+        CrosshairColor::Green,
+        CrosshairColor::Cyan,
+        CrosshairColor::Yellow,
+        CrosshairColor::Red,
+        CrosshairColor::Magenta,
+    ];
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CrosshairColor::Default => "Default color",
+            CrosshairColor::White => "White",
+            CrosshairColor::Gold => "Gold",
+            CrosshairColor::Green => "Green",
+            CrosshairColor::Cyan => "Cyan",
+            CrosshairColor::Yellow => "Yellow",
+            CrosshairColor::Red => "Red",
+            CrosshairColor::Magenta => "Magenta",
+        }
+    }
+
+    /// The chosen color, or `None` to use the style's own.
+    pub fn color(self) -> Option<Color> {
+        Some(match self {
+            CrosshairColor::Default => return None,
+            CrosshairColor::White => Color::srgb(0.95, 0.95, 0.95),
+            CrosshairColor::Gold => Color::srgb(0.85, 0.72, 0.45),
+            CrosshairColor::Green => Color::srgb(0.30, 1.0, 0.40),
+            CrosshairColor::Cyan => Color::srgb(0.30, 0.95, 1.0),
+            CrosshairColor::Yellow => Color::srgb(1.0, 0.95, 0.25),
+            CrosshairColor::Red => Color::srgb(1.0, 0.25, 0.2),
+            CrosshairColor::Magenta => Color::srgb(1.0, 0.35, 0.95),
+        })
+    }
+}
+
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -204,6 +263,7 @@ pub struct Settings {
     pub sensitivity: f32,
     pub bindings: BTreeMap<Action, KeyCode>,
     pub crosshair: Crosshair,
+    pub crosshair_color: CrosshairColor,
     /// Saved flight model presets.
     pub aircraft: Vec<AircraftCard>,
     /// Preset names flown by the player and the target.
@@ -218,6 +278,7 @@ impl Default for Settings {
             sensitivity: 1.0,
             bindings: default_bindings(),
             crosshair: Crosshair::Cross,
+            crosshair_color: CrosshairColor::Default,
             aircraft: vec![AircraftCard::yak3()],
             player_aircraft: "Yak-3".into(),
             target_aircraft: "Yak-3".into(),

@@ -93,7 +93,7 @@ fn fly_target(time: Res<Time>, mut targets: Query<(&mut Transform, &mut Aircraft
             controls,
             ..
         } = &mut *aircraft;
-        *controls = flight_model::instructor(model, body, aim);
+        *controls = flight_model::instructor(model, body, aim, dt);
         controls.throttle = target.throttle;
         flight_model::step(model, body, controls, dt);
 

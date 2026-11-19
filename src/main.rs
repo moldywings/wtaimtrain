@@ -69,6 +69,11 @@ fn main() {
 }
 
 fn capture_cursor(mut cursor: Single<&mut CursorOptions>) {
+    // Automated screenshot runs drive the window with synthetic input; a
+    // pointer grab would swallow it.
+    if std::env::var("WTAT_SCREENSHOT").is_ok() {
+        return;
+    }
     cursor.visible = false;
     cursor.grab_mode = CursorGrabMode::Locked;
 }
@@ -94,7 +99,8 @@ fn resume_time(mut time: ResMut<Time<Virtual>>) {
 }
 
 /// Testing aid: with `WTAT_SCREENSHOT=out.png`, save a screenshot after a few
-/// seconds and quit. `WTAT_PAUSE=1` opens the pause menu first. Does nothing
+/// seconds (`WTAT_SHOT_AT`, default 6) and quit. `WTAT_PAUSE=1` opens the
+/// pause menu first. Does nothing
 /// otherwise.
 fn debug_screenshot(
     mut commands: Commands,
@@ -108,17 +114,21 @@ fn debug_screenshot(
         return;
     };
     let t = time.elapsed_secs();
+    let shot_at: f32 = std::env::var("WTAT_SHOT_AT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6.0);
     if !*paused && t > 4.0 && std::env::var("WTAT_PAUSE").is_ok() {
         next_state.set(GameState::Paused);
         *paused = true;
     }
-    if !*taken && t > 6.0 {
+    if !*taken && t > shot_at {
         commands
             .spawn(bevy::render::view::screenshot::Screenshot::primary_window())
             .observe(bevy::render::view::screenshot::save_to_disk(path));
         *taken = true;
     }
-    if t > 9.0 {
+    if t > shot_at + 3.0 {
         exit.write(AppExit::Success);
     }
 }
