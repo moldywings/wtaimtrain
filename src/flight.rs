@@ -5,10 +5,10 @@
 use bevy::prelude::*;
 
 use crate::GameState;
-use crate::camera::{ChaseCamera, MouseAim, snap_view};
+use crate::camera::MouseAim;
 use crate::flight_model::{self, AircraftCard, Body, Controls, FlightModel};
 use crate::settings::{Action, Settings};
-use crate::target::Target;
+use crate::target::{ResetScenario, Target};
 
 pub struct FlightPlugin;
 
@@ -71,7 +71,7 @@ pub const START_SPEED_FRACTION: f32 = 0.85;
 /// How quickly keyboard inputs reach full deflection (per second).
 const KEY_RAMP: f32 = 4.0;
 
-fn start_body(model: &FlightModel) -> Body {
+pub fn start_body(model: &FlightModel) -> Body {
     Body::new(
         Vec3::new(0.0, START_ALTITUDE, 0.0),
         Quat::IDENTITY,
@@ -125,6 +125,7 @@ pub fn fly_player(
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
     aim: Res<MouseAim>,
+    mut reset: MessageWriter<ResetScenario>,
     player: Single<(&mut Transform, &mut Aircraft, &mut Player)>,
 ) {
     let dt = time.delta_secs();
@@ -155,10 +156,20 @@ pub fn fly_player(
         let Aircraft { model, body, .. } = &mut *aircraft;
         flight_model::instructor(model, body, aim.direction(), dt)
     };
-    let blend = |auto: f32, key: f32| auto * (1.0 - key.abs()) + key;
+    // The pitch keys take over every axis from the instructor (so it
+    // doesn't yaw or roll against you while you pull). Roll and yaw keys
+    // only take over their own axis.
+    let pitching = player.keys.x.abs();
+    let blend = |auto: f32, key: f32| auto * (1.0 - pitching.max(key.abs())) + key;
     controls.pitch = blend(auto.pitch, player.keys.x);
     controls.roll = blend(auto.roll, player.keys.y);
     controls.yaw = blend(auto.yaw, player.keys.z);
+    // Like the game's instructor, keyboard pitch stops just short of a
+    // stall.
+    if pitching > 0.0 {
+        let (pull, push) = flight_model::safe_pitch_stick(&aircraft.model, &aircraft.body);
+        controls.pitch = controls.pitch.clamp(-push, pull);
+    }
     aircraft.controls = controls;
 
     let Aircraft { model, body, .. } = &mut *aircraft;
@@ -166,7 +177,7 @@ pub fn fly_player(
 
     // No crash damage yet: hitting the ground just restarts you.
     if body.position.y < 3.0 {
-        *body = start_body(model);
+        reset.write(ResetScenario);
     }
 
     tf.translation = body.position;
@@ -174,24 +185,13 @@ pub fn fly_player(
 }
 
 /// The reset key puts the player back at the start and the target ahead.
-#[allow(clippy::type_complexity)]
+/// R starts the scenario over.
 fn reset(
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
-    mut aim: ResMut<MouseAim>,
-    mut camera: Single<&mut ChaseCamera>,
-    mut player: Single<&mut Aircraft, (With<Player>, Without<Target>)>,
-    mut targets: Query<(&mut Aircraft, &mut Target), Without<Player>>,
+    mut reset: MessageWriter<ResetScenario>,
 ) {
-    if !settings.just_pressed(&keys, Action::Reset) {
-        return;
-    }
-    player.body = start_body(&player.model);
-    player.controls.throttle = 0.8;
-    aim.yaw = 0.0;
-    aim.pitch = 0.0;
-    snap_view(&mut camera, &aim);
-    for (mut aircraft, mut target) in &mut targets {
-        target.reset(&mut aircraft);
+    if settings.just_pressed(&keys, Action::Reset) {
+        reset.write(ResetScenario);
     }
 }

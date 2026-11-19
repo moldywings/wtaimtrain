@@ -1,0 +1,43 @@
+# Builds the game for Windows and posts it on the Releases page as
+# "WT-Aim-Trainer-Windows.zip", every time main changes (or on demand from
+# the Actions tab). The release is always called "Latest build".
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "WT Aim Trainer"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target/release/wtaimtrain.exe "$dir/WT Aim Trainer.exe"
+          Copy-Item -Recurse assets "$dir/assets"
+          Copy-Item README.md "$dir/README.md"
+          Compress-Archive -Path $dir -DestinationPath WT-Aim-Trainer-Windows.zip
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>$null
+          $notes = "Download WT-Aim-Trainer-Windows.zip below, unzip it, and double-click ``WT Aim Trainer.exe``. If Windows says it protected your PC, click More info, then Run anyway.`n`nBuilt from commit ${{ github.sha }}."
+          gh release create latest WT-Aim-Trainer-Windows.zip --title "Latest build" --notes "$notes" --target ${{ github.sha }}

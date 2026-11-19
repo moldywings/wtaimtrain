@@ -7,6 +7,7 @@ use bevy::window::{CursorGrabMode, CursorOptions};
 use crate::GameState;
 use crate::camera::{ChaseCamera, MouseAim};
 use crate::flight::{Aircraft, Player};
+use crate::flight_model::air_density;
 use crate::settings::{Crosshair, CrosshairColor, Settings};
 use crate::target::Target;
 
@@ -34,6 +35,22 @@ struct TargetMarker;
 
 #[derive(Component)]
 struct TargetName;
+
+/// Points toward the target from the edge of the screen when it's off
+/// screen.
+#[derive(Component)]
+struct TargetArrow;
+
+const ARROW_BOX: f32 = 28.0;
+/// Distance of the arrow from the screen edge, px.
+const ARROW_INSET: f32 = 36.0;
+
+/// Where to point the guns to hit the target.
+#[derive(Component)]
+struct LeadMarker;
+
+const LEAD_SIZE: f32 = 18.0;
+const LEAD_COLOR: Color = Color::srgb(0.55, 1.0, 0.55);
 
 #[derive(Component)]
 struct TargetRange;
@@ -144,6 +161,42 @@ fn spawn_hud(mut commands: Commands) {
         Visibility::Hidden,
         GunCrosshair,
     ));
+
+    // Edge arrow: a red chevron, turned to point at the target.
+    commands
+        .spawn((
+            absolute(ARROW_BOX, ARROW_BOX),
+            Visibility::Hidden,
+            TargetArrow,
+        ))
+        .with_children(|a| {
+            for (size, top) in [(18.0, 3.0), (11.0, 13.0)] {
+                a.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: px((ARROW_BOX - size) / 2.0),
+                        top: px(top),
+                        width: px(size),
+                        height: px(size),
+                        border: UiRect::new(px(4), px(0), px(4), px(0)),
+                        ..default()
+                    },
+                    BorderColor::all(TARGET_RED),
+                    UiTransform::from_rotation(Rot2::degrees(45.0)),
+                ));
+            }
+        });
+
+    commands
+        .spawn((
+            absolute(LEAD_SIZE, LEAD_SIZE),
+            Visibility::Hidden,
+            LeadMarker,
+        ))
+        .with_children(|m| {
+            m.spawn(ring(LEAD_SIZE, LEAD_SIZE, 2.0, LEAD_COLOR));
+            m.spawn(dot(LEAD_SIZE, 4.0, LEAD_COLOR));
+        });
 
     // Target marker: red name, bracket diamond with a red dot, red range.
     commands
@@ -338,13 +391,15 @@ fn update_hud(
     cursor: Single<&CursorOptions>,
     camera: Single<(&Camera, &GlobalTransform), With<ChaseCamera>>,
     player: Single<(&GlobalTransform, &Aircraft), With<Player>>,
-    target: Single<(&GlobalTransform, &Aircraft), With<Target>>,
+    target: Single<(&GlobalTransform, &Aircraft, &Target)>,
     mut nodes: ParamSet<(
         Single<(&mut Node, &mut Visibility), With<AimCircle>>,
         Single<(&mut Node, &mut Visibility), With<GunCrosshair>>,
         Single<(&mut Node, &mut Visibility), With<TargetMarker>>,
         Single<&mut Visibility, With<StallWarning>>,
         Single<&mut Visibility, With<HelpText>>,
+        Single<(&mut Node, &mut Visibility), With<LeadMarker>>,
+        Single<(&mut Node, &mut Visibility, &mut UiTransform), With<TargetArrow>>,
     )>,
     mut texts: ParamSet<(
         Single<&mut Text, With<TargetName>>,
@@ -354,7 +409,7 @@ fn update_hud(
 ) {
     let (cam, cam_tf) = *camera;
     let (player_tf, plane) = *player;
-    let (target_tf, target_plane) = *target;
+    let (target_tf, target_plane, target_state) = *target;
     let units = settings.units;
     let project = |world: Vec3| -> Option<Vec2> {
         // Behind the camera means not on screen.
@@ -385,16 +440,73 @@ fn update_hud(
     let range = player_tf.translation().distance(target_pos);
     place(
         nodes.p2().into_inner(),
-        project(target_pos),
+        project(target_pos).filter(|_| !target_state.destroyed()),
         Vec2::new(MARKER_WIDTH / 2.0, NAME_HEIGHT + DIAMOND_BOX / 2.0),
     );
+    // Lead indicator, worked out for the biggest gun on the plane.
+    let lead = settings
+        .lead_indicator
+        .then(|| {
+            plane
+                .card
+                .weapons
+                .guns()
+                .iter()
+                .map(|(_, g, _)| settings.gun(g))
+                .max_by(|a, b| a.caliber_mm().total_cmp(&b.caliber_mm()))
+                .cloned()
+        })
+        .flatten()
+        .filter(|_| !target_state.destroyed())
+        .and_then(|gun| {
+            crate::weapons::lead_direction(
+                &gun,
+                player_tf.translation(),
+                plane.body.velocity,
+                target_pos,
+                target_plane.body.velocity,
+            )
+        })
+        .and_then(|dir| project(player_tf.translation() + dir * 2_000.0));
+    place(nodes.p5().into_inner(), lead, Vec2::splat(LEAD_SIZE / 2.0));
+
+    // Edge arrow when the target is off screen.
+    {
+        let (mut node, mut vis, mut turn) = nodes.p6().into_inner();
+        let size = cam
+            .logical_viewport_size()
+            .unwrap_or(Vec2::new(1280.0, 720.0));
+        let on_screen = project(target_pos)
+            .is_some_and(|p| p.x >= 0.0 && p.y >= 0.0 && p.x <= size.x && p.y <= size.y);
+        if on_screen || target_state.destroyed() {
+            *vis = Visibility::Hidden;
+        } else {
+            let local = cam_tf.rotation().inverse() * (target_pos - cam_tf.translation());
+            // Screen direction (x right, y down). Straight behind: point down.
+            let dir = Vec2::new(local.x, -local.y)
+                .try_normalize()
+                .unwrap_or(Vec2::Y);
+            let half = size / 2.0 - Vec2::splat(ARROW_INSET);
+            let scale = (half.x / dir.x.abs().max(1e-6)).min(half.y / dir.y.abs().max(1e-6));
+            let at = size / 2.0 + dir * scale;
+            node.left = px(at.x - ARROW_BOX / 2.0);
+            node.top = px(at.y - ARROW_BOX / 2.0);
+            // The chevron points up when unturned.
+            turn.rotation = Rot2::radians(dir.x.atan2(-dir.y));
+            *vis = Visibility::Visible;
+        }
+    }
+
     texts.p0().0 = target_plane.model.name.clone();
     texts.p1().0 = units.range(range);
 
     let body = &plane.body;
     texts.p2().0 = format!(
-        "{}\nIAS {}\nALT {}\nTHR {:.0} %\nG {:.1}",
+        "{}\nIAS {}\nTAS {}\nALT {}\nTHR {:.0} %\nG {:.1}",
         plane.model.name,
+        units.speed(
+            body.speed() * (air_density(body.position.y.max(0.0)) / air_density(0.0)).sqrt()
+        ),
         units.speed(body.speed()),
         units.distance(body.position.y),
         plane.controls.throttle * 100.0,

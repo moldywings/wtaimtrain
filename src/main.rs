@@ -4,6 +4,9 @@
 //! circle and nose marker, a reference world, a target aircraft, and a
 //! pause menu with settings.
 
+// No console window behind the game in release builds on Windows.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod camera;
 mod flight;
 mod flight_model;

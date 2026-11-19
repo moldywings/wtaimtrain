@@ -20,8 +20,8 @@ use bevy::ui_widgets::{Activate, Button, SelectAllOnFocus, TextInput};
 use crate::GameState;
 use crate::flight_model::{AircraftCard, EngineKind, FlightModel};
 use crate::settings::{
-    Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, Settings, Units,
-    default_bindings, is_builtin, key_name,
+    Action, CHASE_MAX, CHASE_MIN, CHASE_STEP, Crosshair, CrosshairColor, MAX_SENSITIVITY,
+    MIN_SENSITIVITY, Scenario, Settings, Units, default_bindings, is_builtin, key_name,
 };
 use crate::weapons::{GunCard, Loadout, Slot, TracerColor, ballistics_at, is_builtin_gun};
 
@@ -69,6 +69,7 @@ enum Page {
     Settings,
     Aircraft,
     Weapons,
+    Scenario,
 }
 
 /// Menu state that isn't a saved setting.
@@ -97,6 +98,8 @@ enum Dropdown {
     Gun(Slot),
     LoadoutAircraft,
     Tracer,
+    PlayerAircraft,
+    TargetAircraft,
 }
 
 /// Scrollable lists, so their scroll position survives a menu rebuild.
@@ -156,24 +159,26 @@ enum Field {
     WingArea,
     ClMax,
     RollRate,
+    RollSpeed,
 }
 
 impl Field {
-    const ALL: [Field; 14] = [
+    const ALL: [Field; 15] = [
         Field::Name,
         Field::Power,
         Field::Engines,
         Field::Climb,
-        Field::SustainedRate,
-        Field::SustainedSpeed,
         Field::InstantRate,
         Field::InstantSpeed,
+        Field::SustainedRate,
+        Field::SustainedSpeed,
         Field::TopSpeed,
         Field::TopSpeedAltitude,
         Field::Mass,
         Field::WingArea,
         Field::ClMax,
         Field::RollRate,
+        Field::RollSpeed,
     ];
 
     fn index(self) -> usize {
@@ -199,7 +204,8 @@ impl Field {
             Field::Mass => ("Mass (optional)", "kg"),
             Field::WingArea => ("Wing area (optional)", "sq m"),
             Field::ClMax => ("Max lift coeff. (optional)", ""),
-            Field::RollRate => ("Roll rate (optional)", "deg/s"),
+            Field::RollRate => ("Best roll (optional)", "deg/s"),
+            Field::RollSpeed => ("  best roll speed", units.speed_unit().0),
         }
     }
 }
@@ -235,6 +241,7 @@ impl Draft {
                 Field::WingArea => opt(card.wing_area, 2),
                 Field::ClMax => opt(card.cl_max, 2),
                 Field::RollRate => opt(card.roll_rate, 0),
+                Field::RollSpeed => opt(card.roll_speed.map(|v| v * spd), 0),
             };
         }
         Draft {
@@ -299,6 +306,7 @@ impl Draft {
             wing_area: optional(Field::WingArea, 1.0)?,
             cl_max: optional(Field::ClMax, 1.0)?,
             roll_rate: optional(Field::RollRate, 1.0)?,
+            roll_speed: optional(Field::RollSpeed, spd)?,
             weapons: base.weapons.clone(),
         };
         if card.power <= 0.0 || card.climb_rate <= 0.0 || card.top_speed <= 0.0 {
@@ -325,16 +333,18 @@ enum GunField {
     FireRate,
     Caliber,
     Spread,
+    Hits,
 }
 
 impl GunField {
-    const ALL: [GunField; 6] = [
+    const ALL: [GunField; 7] = [
         GunField::Name,
         GunField::Velocity,
         GunField::Mass,
         GunField::FireRate,
         GunField::Caliber,
         GunField::Spread,
+        GunField::Hits,
     ];
 
     fn index(self) -> usize {
@@ -349,6 +359,7 @@ impl GunField {
             GunField::FireRate => ("Fire rate", "rpm"),
             GunField::Caliber => ("Caliber (optional)", "mm"),
             GunField::Spread => ("Spread (optional)", "mils"),
+            GunField::Hits => ("Hits to kill (optional)", "hits"),
         }
     }
 }
@@ -374,6 +385,7 @@ impl GunDraft {
                 GunField::FireRate => n(gun.fire_rate),
                 GunField::Caliber => gun.caliber.map(n).unwrap_or_default(),
                 GunField::Spread => gun.spread.map(n).unwrap_or_default(),
+                GunField::Hits => gun.hits_to_kill.map(n).unwrap_or_default(),
             };
         }
         GunDraft {
@@ -415,6 +427,7 @@ impl GunDraft {
             caliber: num(GunField::Caliber)?,
             spread: num(GunField::Spread)?,
             tracer: self.tracer,
+            hits_to_kill: num(GunField::Hits)?.map(|h| h.round().max(1.0)),
         };
         if gun.projectile_mass > 5.0 {
             return Err("Projectile mass is in kg (a 20 mm round is about 0.1).".into());
@@ -428,8 +441,15 @@ enum MenuAction {
     Resume,
     Page(Page),
     CycleUnits,
+    ToggleLead,
+    ToggleEnemyFire,
+    PickScenario(Scenario),
+    /// Move the chase start distance: (which end: 0 near, 1 far; steps).
+    ChaseDistance(u8, i32),
     SensitivityDown,
     SensitivityUp,
+    LookSensitivityDown,
+    LookSensitivityUp,
     ToggleDropdown(Dropdown),
     PickCrosshair(Crosshair),
     PickColor(CrosshairColor),
@@ -441,8 +461,8 @@ enum MenuAction {
     DeletePreset,
     ToggleEngine,
     SavePreset,
-    CyclePlayerAircraft,
-    CycleTargetAircraft,
+    PickPlayerAircraft(String),
+    PickTargetAircraft(String),
     EditGun(String),
     NewGun,
     DeleteGun,
@@ -453,6 +473,8 @@ enum MenuAction {
     MountCount(Slot, i32),
     /// Move wing gun convergence by this many steps.
     Convergence(i32),
+    /// Switch wing gun convergence off (parallel guns) or back on.
+    ConvergenceOff,
 }
 
 const PANEL_BG: Color = Color::srgba(0.08, 0.09, 0.11, 0.94);
@@ -527,6 +549,7 @@ fn open_menu(settings: Res<Settings>, mut ui: ResMut<MenuUi>) {
     match std::env::var("WTAT_PAGE").as_deref() {
         Ok("aircraft") => ui.page = Page::Aircraft,
         Ok("weapons") => ui.page = Page::Weapons,
+        Ok("scenario") => ui.page = Page::Scenario,
         _ => {}
     }
 }
@@ -611,6 +634,7 @@ fn rebuild_menu(
                         (Page::Settings, "Settings"),
                         (Page::Aircraft, "Aircraft"),
                         (Page::Weapons, "Weapons"),
+                        (Page::Scenario, "Scenario"),
                     ] {
                         let mut b = r.spawn(button(MenuAction::Page(page), name, px(120)));
                         if ui.page == page {
@@ -622,6 +646,7 @@ fn rebuild_menu(
                     Page::Settings => settings_page(panel, &settings, &rebinding, &ui, &scroll),
                     Page::Aircraft => aircraft_page(panel, &settings, &ui, &scroll),
                     Page::Weapons => weapons_page(panel, &settings, &ui, &scroll),
+                    Page::Scenario => scenario_page(panel, &settings),
                 }
             });
         });
@@ -652,7 +677,7 @@ fn settings_page(
                     percent(100),
                 ));
 
-                col.spawn(section_header("Mouse sensitivity"));
+                col.spawn(section_header("Aim sensitivity"));
                 col.spawn(row()).with_children(|r| {
                     r.spawn(button(MenuAction::SensitivityDown, "-", px(44)));
                     r.spawn((
@@ -665,6 +690,21 @@ fn settings_page(
                         TextLayout::justify(Justify::Center),
                     ));
                     r.spawn(button(MenuAction::SensitivityUp, "+", px(44)));
+                });
+
+                col.spawn(section_header("Free look sensitivity"));
+                col.spawn(row()).with_children(|r| {
+                    r.spawn(button(MenuAction::LookSensitivityDown, "-", px(44)));
+                    r.spawn((
+                        label(&format!("{:.2}x", settings.look_sensitivity), 18.0, TEXT),
+                        Node {
+                            flex_grow: 1.0,
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                        TextLayout::justify(Justify::Center),
+                    ));
+                    r.spawn(button(MenuAction::LookSensitivityUp, "+", px(44)));
                 });
 
                 col.spawn(section_header("Crosshair"));
@@ -708,6 +748,13 @@ fn settings_page(
                     &colors,
                     percent(100),
                 );
+
+                col.spawn(section_header("Lead indicator (biggest gun)"));
+                col.spawn(button(
+                    MenuAction::ToggleLead,
+                    if settings.lead_indicator { "On" } else { "Off" },
+                    percent(100),
+                ));
 
                 col.spawn(section_header("Mouse"));
                 col.spawn(label(
@@ -771,18 +818,46 @@ fn aircraft_page(
         .with_children(|cols| {
             // Left: presets and who flies what.
             cols.spawn(column(px(260))).with_children(|col| {
+                let choices = |pick: fn(String) -> MenuAction, current: &str| -> Vec<Choice> {
+                    settings
+                        .aircraft
+                        .iter()
+                        .map(|c| Choice {
+                            action: pick(c.name.clone()),
+                            label: c.name.clone(),
+                            selected: c.name == current,
+                            swatch: None,
+                        })
+                        .collect()
+                };
                 col.spawn(section_header("You fly"));
-                col.spawn(button(
-                    MenuAction::CyclePlayerAircraft,
-                    &settings.player_aircraft,
-                    percent(100),
-                ));
+                col.spawn((Node::default(), GlobalZIndex(22)))
+                    .with_children(|w| {
+                        dropdown(
+                            w,
+                            Dropdown::PlayerAircraft,
+                            ui,
+                            scroll,
+                            &settings.player_aircraft,
+                            None,
+                            &choices(MenuAction::PickPlayerAircraft, &settings.player_aircraft),
+                            px(260),
+                        );
+                    });
                 col.spawn(section_header("Target flies"));
-                col.spawn(button(
-                    MenuAction::CycleTargetAircraft,
-                    &settings.target_aircraft,
-                    percent(100),
-                ));
+                col.spawn((Node::default(), GlobalZIndex(21)))
+                    .with_children(|w| {
+                        dropdown(
+                            w,
+                            Dropdown::TargetAircraft,
+                            ui,
+                            scroll,
+                            &settings.target_aircraft,
+                            None,
+                            &choices(MenuAction::PickTargetAircraft, &settings.target_aircraft),
+                            px(260),
+                        );
+                    });
 
                 col.spawn(section_header(&format!(
                     "Presets ({}, click to edit)",
@@ -870,7 +945,8 @@ fn aircraft_page(
                     // Turn rates share a row with their speed:
                     // "Max sustained turn [23.59] deg/s at [175] kt".
                     let speed_of = match field {
-                        Field::SustainedSpeed | Field::InstantSpeed => continue,
+                        Field::SustainedSpeed | Field::InstantSpeed | Field::RollSpeed => continue,
+                        Field::RollRate => Some(Field::RollSpeed),
                         Field::SustainedRate => Some(Field::SustainedSpeed),
                         Field::InstantRate => Some(Field::InstantSpeed),
                         _ => None,
@@ -966,6 +1042,9 @@ fn aircraft_page(
                     }
                     if card.roll_rate.is_none() {
                         filled.push(format!("roll rate {:.0} deg/s", e.roll_rate));
+                    }
+                    if card.roll_speed.is_none() {
+                        filled.push(format!("best roll speed {}", units.speed(e.roll_speed)));
                     }
                     if !filled.is_empty() {
                         col.spawn(label(
@@ -1139,6 +1218,9 @@ fn weapons_page(
                         if gun.spread.is_none() {
                             filled.push(format!("spread {:.1} mils", gun.spread_mils()));
                         }
+                        if gun.hits_to_kill.is_none() {
+                            filled.push(format!("{} hits to destroy", gun.hits_to_destroy()));
+                        }
                         if !filled.is_empty() {
                             text += &format!(" Filled in for you: {}.", filled.join(", "));
                         }
@@ -1227,7 +1309,11 @@ fn weapons_page(
                 col.spawn(row()).with_children(|r| {
                     r.spawn((
                         label(
-                            &convergence_text(settings.units, loadout.convergence),
+                            &if loadout.convergence > 0.0 {
+                                convergence_text(settings.units, loadout.convergence)
+                            } else {
+                                "Off (parallel)".to_string()
+                            },
                             18.0,
                             TEXT,
                         ),
@@ -1235,6 +1321,11 @@ fn weapons_page(
                     ));
                     r.spawn(button(MenuAction::Convergence(-1), "-", px(36)));
                     r.spawn(button(MenuAction::Convergence(1), "+", px(36)));
+                    r.spawn(button(
+                        MenuAction::ConvergenceOff,
+                        if loadout.convergence > 0.0 { "Turn off" } else { "Turn on" },
+                        px(90),
+                    ));
                 });
                 let guns = loadout.guns();
                 let mass_per_s: f32 = guns
@@ -1246,11 +1337,18 @@ fn weapons_page(
                     .sum();
                 col.spawn(label(
                     &format!(
-                        "{} guns, {:.2} kg of rounds per second. Wing and belly guns \
-                         converge at {}; nose guns fire straight ahead.",
+                        "{} guns, {:.2} kg of rounds per second. {}; nose guns fire \
+                         straight ahead.",
                         loadout.total_guns(),
                         mass_per_s,
-                        convergence_text(settings.units, loadout.convergence)
+                        if loadout.convergence > 0.0 {
+                            format!(
+                                "Wing and belly guns converge at {}",
+                                convergence_text(settings.units, loadout.convergence)
+                            )
+                        } else {
+                            "Convergence is off, so wing and belly guns fire parallel".into()
+                        }
                     ),
                     13.0,
                     DIM,
@@ -1258,6 +1356,83 @@ fn weapons_page(
                 col.spawn(Node {
                     flex_grow: 1.0,
                     min_height: px(12),
+                    ..default()
+                });
+                col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
+            });
+        });
+}
+
+fn scenario_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: px(28),
+            ..default()
+        })
+        .with_children(|cols| {
+            cols.spawn(column(px(330))).with_children(|col| {
+                col.spawn(section_header("Scenario"));
+                for sc in Scenario::ALL {
+                    let mut b = col.spawn(button(
+                        MenuAction::PickScenario(sc),
+                        sc.label(),
+                        percent(100),
+                    ));
+                    if settings.scenario == sc {
+                        b.insert(Selected);
+                    }
+                }
+                col.spawn(label(settings.scenario.description(), 14.0, DIM));
+                col.spawn(section_header("Enemy shoots back"));
+                col.spawn(button(
+                    MenuAction::ToggleEnemyFire,
+                    if settings.enemy_fires { "On" } else { "Off" },
+                    percent(100),
+                ));
+                col.spawn(label(
+                    "When on, the target fires its own guns at you whenever they're \
+                     lined up, and in a dogfight it hunts you instead of ramming.",
+                    13.0,
+                    DIM,
+                ));
+                col.spawn(label(
+                    "Destroy the target and it resets 2 seconds later. It also resets \
+                     when a plane crashes, the target gets away, or you press R.",
+                    13.0,
+                    DIM,
+                ));
+            });
+            cols.spawn(column(px(330))).with_children(|col| {
+                col.spawn(section_header("Chase: target starts this far ahead"));
+                for (end, name, value) in [
+                    (0u8, "Nearest", settings.chase_min),
+                    (1u8, "Farthest", settings.chase_max),
+                ] {
+                    col.spawn(row()).with_children(|r| {
+                        r.spawn((
+                            label(name, 15.0, TEXT),
+                            Node {
+                                width: px(80),
+                                ..default()
+                            },
+                        ));
+                        r.spawn((
+                            label(&convergence_text(settings.units, value), 17.0, TEXT),
+                            grow(),
+                        ));
+                        r.spawn(button(MenuAction::ChaseDistance(end, -1), "-", px(36)));
+                        r.spawn(button(MenuAction::ChaseDistance(end, 1), "+", px(36)));
+                    });
+                }
+                col.spawn(label(
+                    "Each run picks a random distance between these two.",
+                    13.0,
+                    DIM,
+                ));
+                col.spawn(Node {
+                    flex_grow: 1.0,
+                    min_height: px(16),
                     ..default()
                 });
                 col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
@@ -1408,7 +1583,7 @@ fn dropdown(
                 },
                 BackgroundColor(Color::srgb(0.10, 0.11, 0.13)),
                 BorderColor::all(Color::srgb(0.35, 0.38, 0.44)),
-                GlobalZIndex(20),
+                GlobalZIndex(40),
             ))
             .with_children(|list| {
                 for choice in choices {
@@ -1527,6 +1702,19 @@ fn on_menu_click(
     match action.clone() {
         MenuAction::Resume => next.set(GameState::Playing),
         MenuAction::Page(page) => ui.page = page,
+        MenuAction::ToggleLead => settings.lead_indicator = !settings.lead_indicator,
+        MenuAction::ToggleEnemyFire => settings.enemy_fires = !settings.enemy_fires,
+        MenuAction::PickScenario(sc) => settings.scenario = sc,
+        MenuAction::ChaseDistance(end, steps) => {
+            let d = steps as f32 * CHASE_STEP;
+            if end == 0 {
+                settings.chase_min = (settings.chase_min + d).clamp(CHASE_MIN, CHASE_MAX);
+                settings.chase_max = settings.chase_max.max(settings.chase_min);
+            } else {
+                settings.chase_max = (settings.chase_max + d).clamp(CHASE_MIN, CHASE_MAX);
+                settings.chase_min = settings.chase_min.min(settings.chase_max);
+            }
+        }
         MenuAction::CycleUnits => {
             settings.units = settings.units.next();
             // Re-show the editor in the new units.
@@ -1538,6 +1726,12 @@ fn on_menu_click(
         }
         MenuAction::SensitivityUp => {
             settings.sensitivity = step_sensitivity(settings.sensitivity, 1.0);
+        }
+        MenuAction::LookSensitivityDown => {
+            settings.look_sensitivity = step_sensitivity(settings.look_sensitivity, -1.0);
+        }
+        MenuAction::LookSensitivityUp => {
+            settings.look_sensitivity = step_sensitivity(settings.look_sensitivity, 1.0);
         }
         MenuAction::ToggleDropdown(d) => {
             if ui.open == Some(d) {
@@ -1560,6 +1754,14 @@ fn on_menu_click(
                         .aircraft
                         .iter()
                         .position(|c| c.name == ui.loadout_for),
+                    Dropdown::PlayerAircraft => settings
+                        .aircraft
+                        .iter()
+                        .position(|c| c.name == settings.player_aircraft),
+                    Dropdown::TargetAircraft => settings
+                        .aircraft
+                        .iter()
+                        .position(|c| c.name == settings.target_aircraft),
                     Dropdown::Tracer => TracerColor::ALL
                         .iter()
                         .position(|c| *c == ui.gun_draft.tracer),
@@ -1650,12 +1852,8 @@ fn on_menu_click(
                 Err(e) => ui.message = e,
             }
         }
-        MenuAction::CyclePlayerAircraft => {
-            settings.player_aircraft = next_name(&settings, &settings.player_aircraft);
-        }
-        MenuAction::CycleTargetAircraft => {
-            settings.target_aircraft = next_name(&settings, &settings.target_aircraft);
-        }
+        MenuAction::PickPlayerAircraft(name) => settings.player_aircraft = name,
+        MenuAction::PickTargetAircraft(name) => settings.target_aircraft = name,
         MenuAction::EditGun(name) => {
             let gun = settings.gun(&name).clone();
             ui.gun_draft = GunDraft::from_card(&gun);
@@ -1746,9 +1944,26 @@ fn on_menu_click(
         MenuAction::Convergence(steps) => {
             use crate::weapons::{CONVERGENCE_MAX, CONVERGENCE_MIN, CONVERGENCE_STEP};
             edit_loadout(&mut settings, &mut ui, |l| {
-                let c = (l.convergence / CONVERGENCE_STEP).round() * CONVERGENCE_STEP
+                // From off, - and + start again at the nearest end.
+                let from = if l.convergence > 0.0 {
+                    l.convergence
+                } else if steps < 0 {
+                    CONVERGENCE_MAX + CONVERGENCE_STEP
+                } else {
+                    CONVERGENCE_MIN - CONVERGENCE_STEP
+                };
+                let c = (from / CONVERGENCE_STEP).round() * CONVERGENCE_STEP
                     + steps as f32 * CONVERGENCE_STEP;
                 l.convergence = c.clamp(CONVERGENCE_MIN, CONVERGENCE_MAX);
+            });
+        }
+        MenuAction::ConvergenceOff => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                l.convergence = if l.convergence > 0.0 {
+                    0.0
+                } else {
+                    crate::weapons::CONVERGENCE
+                };
             });
         }
     }
@@ -1792,12 +2007,6 @@ fn unique_gun_name(settings: &Settings, base: &str) -> String {
         .map(|i| format!("{base} {i}"))
         .find(|n| !taken(n))
         .unwrap()
-}
-
-fn next_name(settings: &Settings, current: &str) -> String {
-    let names: Vec<&String> = settings.aircraft.iter().map(|c| &c.name).collect();
-    let i = names.iter().position(|n| *n == current).unwrap_or(0);
-    names[(i + 1) % names.len()].clone()
 }
 
 fn unique_name(settings: &Settings, base: &str) -> String {

@@ -31,16 +31,68 @@ impl Plugin for CameraPlugin {
     }
 }
 
-/// Where the player wants to point, in world space.
-#[derive(Resource, Default)]
+/// Where the player wants to point, in world space: a full orientation, so
+/// the aim can go straight up and over the top. The mouse moves it across
+/// the screen, and it keeps itself upright (horizon level) except when
+/// pointing almost straight up or down.
+#[derive(Resource)]
 pub struct MouseAim {
-    pub yaw: f32,
-    pub pitch: f32,
+    pub rot: Quat,
 }
+
+impl Default for MouseAim {
+    fn default() -> Self {
+        MouseAim {
+            rot: Quat::IDENTITY,
+        }
+    }
+}
+
+/// How quickly the aim (and the view) rolls back level, 1/s.
+const LEVEL_RATE: f32 = 10.0;
 
 impl MouseAim {
     pub fn rotation(&self) -> Quat {
-        Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0)
+        self.rot
+    }
+
+    pub fn reset(&mut self) {
+        self.rot = Quat::IDENTITY;
+    }
+
+    /// Move the aim by a screen-space turn (rad): right and up.
+    fn turn(&mut self, right: f32, up: f32) {
+        // Side to side turns about the world's vertical, so the horizon
+        // stays level however far up or down you look. Only when pointing
+        // almost straight up or down does it turn about the view's own up,
+        // so the circle can still move across the screen there.
+        let f = self.rot * Vec3::NEG_Z;
+        let own_up = self.rot * Vec3::Y;
+        let world_up = if own_up.y >= 0.0 {
+            Vec3::Y
+        } else {
+            Vec3::NEG_Y
+        };
+        let t = ((f.y.abs() - 0.9) / 0.09).clamp(0.0, 1.0);
+        let axis = world_up
+            .lerp(own_up, t * t * (3.0 - 2.0 * t))
+            .normalize_or(Vec3::Y);
+        self.rot = (Quat::from_axis_angle(axis, -right) * self.rot * Quat::from_rotation_x(up))
+            .normalize();
+    }
+
+    /// Roll part of the way back toward level.
+    fn level(&mut self, dt: f32) {
+        let f = self.rot * Vec3::NEG_Z;
+        let up = self.rot * Vec3::Y;
+        let level_up = (Vec3::Y - f * f.y).normalize_or_zero();
+        if level_up == Vec3::ZERO {
+            return;
+        }
+        let err = f.dot(up.cross(level_up)).atan2(up.dot(level_up));
+        // Hardly at all when pointing straight up or down.
+        let k = (1.0 - f.y.abs()).sqrt() * (1.0 - (-LEVEL_RATE * dt).exp());
+        self.rot = (Quat::from_axis_angle(f, err * k) * self.rot).normalize();
     }
 
     pub fn direction(&self) -> Vec3 {
@@ -55,6 +107,8 @@ pub struct ChaseCamera {
     /// Free look offset from the view, radians.
     look_yaw: f32,
     look_pitch: f32,
+    /// Where free look is heading; the view eases toward it.
+    look_goal: Vec2,
     free_looking: bool,
     /// Whether zoom is toggled on.
     zoomed: bool,
@@ -72,7 +126,9 @@ const NORMAL_FOV: f32 = 60.0;
 const ZOOM_FOV: f32 = 25.0;
 /// How quickly zoom and free look settle (1/s).
 const ZOOM_RATE: f32 = 10.0;
-const LOOK_RETURN_RATE: f32 = 8.0;
+const LOOK_RETURN_RATE: f32 = 6.0;
+/// How quickly free look catches up with the mouse (1/s).
+const LOOK_FOLLOW_RATE: f32 = 10.0;
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
@@ -95,6 +151,7 @@ fn spawn_camera(mut commands: Commands) {
             view: Quat::IDENTITY,
             look_yaw: 0.0,
             look_pitch: 0.0,
+            look_goal: Vec2::ZERO,
             free_looking: false,
             zoomed: false,
             zoom: 0.0,
@@ -103,6 +160,7 @@ fn spawn_camera(mut commands: Commands) {
 }
 
 fn update_mouse_aim(
+    time: Res<Time<Real>>,
     motion: Res<AccumulatedMouseMotion>,
     keys: Res<ButtonInput<KeyCode>>,
     cursor: Single<&CursorOptions>,
@@ -111,18 +169,21 @@ fn update_mouse_aim(
     mut camera: Single<&mut ChaseCamera>,
 ) {
     camera.free_looking = settings.pressed(&keys, Action::FreeLook);
+    aim.level(time.delta_secs());
     if cursor.grab_mode == CursorGrabMode::None {
         return;
     }
-    // Same sensitivity zoomed or not.
-    let delta = motion.delta * settings.aim_per_pixel();
+    // Zoomed in, the same hand movement moves the circle the same distance
+    // across the screen as it does unzoomed.
+    let zoom =
+        (current_fov(camera.zoom).to_radians() * 0.5).tan() / (NORMAL_FOV.to_radians() * 0.5).tan();
     if camera.free_looking {
-        camera.look_yaw = (camera.look_yaw - delta.x).clamp(-3.0, 3.0);
-        camera.look_pitch = (camera.look_pitch - delta.y).clamp(-1.4, 1.4);
+        let delta = motion.delta * settings.look_per_pixel() * zoom;
+        camera.look_goal.x = (camera.look_goal.x - delta.x).clamp(-3.0, 3.0);
+        camera.look_goal.y = (camera.look_goal.y - delta.y).clamp(-1.4, 1.4);
     } else {
-        aim.yaw -= delta.x;
-        // Stop just short of straight up/down so the camera never flips.
-        aim.pitch = (aim.pitch - delta.y).clamp(-1.53, 1.53);
+        let delta = motion.delta * settings.aim_per_pixel() * zoom;
+        aim.turn(delta.x, -delta.y);
     }
 }
 
@@ -149,12 +210,16 @@ fn follow_player(
             .slerp(aim.rotation(), ease(CAMERA_FOLLOW_RATE))
             .normalize();
 
-        // Free look springs back once the key is released.
-        if !cam.free_looking {
-            let k = ease(LOOK_RETURN_RATE);
-            cam.look_yaw -= cam.look_yaw * k;
-            cam.look_pitch -= cam.look_pitch * k;
-        }
+        // Free look eases toward where the mouse put it, and springs back
+        // once the key is released.
+        let k = if cam.free_looking {
+            ease(LOOK_FOLLOW_RATE)
+        } else {
+            cam.look_goal = Vec2::ZERO;
+            ease(LOOK_RETURN_RATE)
+        };
+        cam.look_yaw += (cam.look_goal.x - cam.look_yaw) * k;
+        cam.look_pitch += (cam.look_goal.y - cam.look_pitch) * k;
 
         if mouse.just_pressed(MouseButton::Right) {
             cam.zoomed = !cam.zoomed;
@@ -192,4 +257,5 @@ pub fn snap_view(camera: &mut ChaseCamera, aim: &MouseAim) {
     camera.view = aim.rotation();
     camera.look_yaw = 0.0;
     camera.look_pitch = 0.0;
+    camera.look_goal = Vec2::ZERO;
 }

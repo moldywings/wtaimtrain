@@ -159,7 +159,7 @@ impl Action {
             Action::YawLeft => "Yaw left",
             Action::YawRight => "Yaw right",
             Action::FreeLook => "Free look (hold)",
-            Action::Reset => "Reset position",
+            Action::Reset => "Reset scenario",
         }
     }
 
@@ -271,6 +271,8 @@ pub struct Settings {
     pub units: Units,
     /// Multiplier on [`BASE_SENSITIVITY`].
     pub sensitivity: f32,
+    /// Multiplier on [`BASE_SENSITIVITY`] for free look.
+    pub look_sensitivity: f32,
     pub bindings: BTreeMap<Action, KeyCode>,
     pub crosshair: Crosshair,
     pub crosshair_color: CrosshairColor,
@@ -281,13 +283,84 @@ pub struct Settings {
     pub target_aircraft: String,
     /// Saved gun presets.
     pub guns: Vec<GunCard>,
+    /// Which practice scenario runs.
+    pub scenario: Scenario,
+    /// Chase scenario: the target starts this far ahead, m (random
+    /// between the two).
+    pub chase_min: f32,
+    pub chase_max: f32,
+    /// Show where to aim to hit the target.
+    pub lead_indicator: bool,
+    /// The target shoots back.
+    pub enemy_fires: bool,
 }
+
+/// Practice scenarios.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Scenario {
+    HeadOn,
+    #[default]
+    Chase,
+    Stall,
+    Dogfight,
+    /// A random one of the others each time.
+    AllInOne,
+}
+
+impl Scenario {
+    pub const ALL: [Scenario; 5] = [
+        Scenario::HeadOn,
+        Scenario::Chase,
+        Scenario::Stall,
+        Scenario::Dogfight,
+        Scenario::AllInOne,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Scenario::HeadOn => "Head on",
+            Scenario::Chase => "Chase",
+            Scenario::Stall => "Stall",
+            Scenario::Dogfight => "Dogfight",
+            Scenario::AllInOne => "All in one",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Scenario::HeadOn => {
+                "You fly straight at each other. The target holds a straight line at a \
+                 random speed, from a slightly different height and toward a different \
+                 point near you each time."
+            }
+            Scenario::Chase => {
+                "You start behind the target. It keeps its heading but weaves and \
+                 dodges: some runs hard, some gently, some not at all."
+            }
+            Scenario::Stall => {
+                "The target starts just above and ahead of you and pulls straight up, \
+                 rolling and dodging as it climbs."
+            }
+            Scenario::Dogfight => {
+                "The target starts close by, at a random spot, height, heading and \
+                 speed. It tries to ram you, or with enemy fire on, to shoot you down."
+            }
+            Scenario::AllInOne => "A random scenario every time it resets.",
+        }
+    }
+}
+
+/// Limits and step for the chase start distance, m.
+pub const CHASE_MIN: f32 = 100.0;
+pub const CHASE_MAX: f32 = 3000.0;
+pub const CHASE_STEP: f32 = 100.0;
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             units: Units::Metric,
             sensitivity: 1.0,
+            look_sensitivity: 1.0,
             bindings: default_bindings(),
             crosshair: Crosshair::Cross,
             crosshair_color: CrosshairColor::Default,
@@ -295,6 +368,11 @@ impl Default for Settings {
             player_aircraft: "Yak-3".into(),
             target_aircraft: "Yak-3".into(),
             guns: vec![GunCard::shvak(), GunCard::ubs()],
+            scenario: Scenario::Chase,
+            chase_min: 300.0,
+            chase_max: 800.0,
+            lead_indicator: false,
+            enemy_fires: false,
         }
     }
 }
@@ -420,6 +498,11 @@ impl Settings {
     /// Radians of aim movement per pixel of mouse movement.
     pub fn aim_per_pixel(&self) -> f32 {
         BASE_SENSITIVITY * self.sensitivity
+    }
+
+    /// Radians of free look per pixel of mouse movement.
+    pub fn look_per_pixel(&self) -> f32 {
+        BASE_SENSITIVITY * self.look_sensitivity
     }
 
     /// Bind `key` to `action`. Any other action already on that key swaps to
