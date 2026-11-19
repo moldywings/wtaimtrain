@@ -156,7 +156,10 @@ pub fn fly_player(
         let Aircraft { model, body, .. } = &mut *aircraft;
         flight_model::instructor(model, body, aim.direction(), dt)
     };
-    let blend = |auto: f32, key: f32| auto * (1.0 - key.abs()) + key;
+    // Any flight key takes over from the instructor on every axis, so it
+    // doesn't fight you (no instructor yaw while you pitch with the keys).
+    let manual = player.keys.abs().max_element();
+    let blend = |auto: f32, key: f32| auto * (1.0 - manual) + key;
     controls.pitch = blend(auto.pitch, player.keys.x);
     controls.roll = blend(auto.roll, player.keys.y);
     controls.yaw = blend(auto.yaw, player.keys.z);

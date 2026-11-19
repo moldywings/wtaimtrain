@@ -13,7 +13,7 @@ use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
 use crate::settings::Settings;
 use crate::sound::{self, Sounds};
-use crate::target::{Target, TargetHit};
+use crate::target::{ResetScenario, Target, TargetHit};
 
 /// Path of the gun model, relative to `assets/`.
 pub const GUN_MODEL: &str = "models/gun.glb";
@@ -469,6 +469,7 @@ impl Plugin for WeaponsPlugin {
                         .after(sync_player_guns)
                         .run_if(in_state(GameState::Playing)),
                     fade_sparks.run_if(in_state(GameState::Playing)),
+                    clear_rounds,
                     update_hit_ui,
                 ),
             );
@@ -833,56 +834,59 @@ struct TracerCore;
 struct TracerGlow;
 
 /// How a tracer is drawn, relative to the round's own position: a thin
-/// round streak trailing it, and a soft glow card around the streak that
-/// turns to face the camera.
+/// round streak trailing it, true to caliber, and a soft glow just wider
+/// than the streak on a card that always faces the camera. Far off, the
+/// streak is kept to about one pixel wide so it doesn't vanish; its length
+/// never changes.
 fn tracer_shape(position: Vec3, velocity: Vec3, camera: Vec3, size: f32) -> (Transform, Transform) {
     let dist = position.distance(camera);
-    // Close up: true to caliber. Far off: a minimum on-screen width, still
-    // thicker for bigger rounds.
-    let width = size.max(dist * 0.0018 * size.sqrt() / TRACER_WIDTH);
-    let len = (velocity.length() * 0.008).clamp(1.5, 7.0).max(dist * 0.02);
+    let width = size.max(dist * MIN_TRACER_ANGLE / TRACER_WIDTH);
+    let len = (velocity.length() * 0.003).clamp(0.6, 3.0);
     let dir = velocity.normalize_or(Vec3::NEG_Z);
     let center = -dir * len * 0.5;
     let core = Transform::from_translation(center)
         .looking_to(dir, Vec3::Y)
         .with_scale(Vec3::new(width, width, len));
-    // The glow card: its Y along the streak, its face toward the camera.
-    let to_eye = camera - (position + center);
-    let face = (to_eye - dir * to_eye.dot(dir)).normalize_or(Vec3::Y.any_orthonormal_vector());
-    let side = dir.cross(face);
+    // The glow card faces the camera square on, stretched along the
+    // streak as it appears on screen.
+    let face = (camera - (position + center)).normalize_or(Vec3::Z);
+    let along = dir - face * dir.dot(face);
+    let shown = along.length();
+    let up = if shown > 1e-4 {
+        along / shown
+    } else {
+        face.any_orthonormal_vector()
+    };
+    let side = up.cross(face);
     let glow_w = width * TRACER_WIDTH * GLOW_WIDTH;
     let glow = Transform {
         translation: center,
-        rotation: Quat::from_mat3(&Mat3::from_cols(side, dir, face)),
-        scale: Vec3::new(glow_w, len + glow_w, 1.0),
+        rotation: Quat::from_mat3(&Mat3::from_cols(side, up, face)),
+        scale: Vec3::new(glow_w, len * shown + glow_w, 1.0),
     };
     (core, glow)
 }
 
-/// The glow's texture: a soft-edged, rounded streak (white, with the shape
-/// in alpha), brightest along the middle and fading out to nothing.
+/// The glow's texture: a soft round spot (white, with the shape in alpha),
+/// brightest in the middle and fading smoothly to nothing at the edge.
 fn glow_image() -> Image {
     use bevy::asset::RenderAssetUsages;
     use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-    const W: usize = 32;
-    const H: usize = 128;
-    let mut data = Vec::with_capacity(W * H * 4);
-    for y in 0..H {
-        for x in 0..W {
-            // -1..1 across and along the streak.
-            let u = (x as f32 + 0.5) / W as f32 * 2.0 - 1.0;
-            let v = (y as f32 + 0.5) / H as f32 * 2.0 - 1.0;
-            // Distance from the middle line, with rounded ends.
-            let along = (v.abs() - 0.75).max(0.0) / 0.25;
-            let d = (u * u + along * along).sqrt();
-            let a = ((-d * d * 3.0).exp() * (1.0 - d * d).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    const N: usize = 64;
+    let mut data = Vec::with_capacity(N * N * 4);
+    for y in 0..N {
+        for x in 0..N {
+            let u = (x as f32 + 0.5) / N as f32 * 2.0 - 1.0;
+            let v = (y as f32 + 0.5) / N as f32 * 2.0 - 1.0;
+            let d2 = u * u + v * v;
+            let a = ((-d2 * 3.5).exp() * (1.0 - d2).max(0.0)).clamp(0.0, 1.0);
             data.extend_from_slice(&[255, 255, 255, (a * 255.0) as u8]);
         }
     }
     Image::new(
         Extent3d {
-            width: W as u32,
-            height: H as u32,
+            width: N as u32,
+            height: N as u32,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -893,9 +897,12 @@ fn glow_image() -> Image {
 }
 
 /// Tracer thickness for a 20 mm round, m.
-const TRACER_WIDTH: f32 = 0.05;
+const TRACER_WIDTH: f32 = 0.02;
+/// Far off, a streak is kept at least this wide on screen, rad (about a
+/// pixel at normal zoom).
+const MIN_TRACER_ANGLE: f32 = 0.0012;
 /// The glow is this many times wider than the streak.
-const GLOW_WIDTH: f32 = 6.0;
+const GLOW_WIDTH: f32 = 2.0;
 /// Strength of the glow around a tracer (0 to 1).
 const TRACER_GLOW: f32 = 0.8;
 
@@ -1079,6 +1086,20 @@ fn fly_bullets(
                 *t = glow;
             }
         }
+    }
+}
+
+/// A scenario restart clears every round in the air.
+fn clear_rounds(
+    mut commands: Commands,
+    mut resets: MessageReader<ResetScenario>,
+    bullets: Query<Entity, With<Bullet>>,
+) {
+    if resets.read().count() == 0 {
+        return;
+    }
+    for e in &bullets {
+        commands.entity(e).despawn();
     }
 }
 

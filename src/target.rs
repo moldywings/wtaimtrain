@@ -253,8 +253,7 @@ fn reset_scenario(
     player.body = start_body(&player.model);
     player.controls.throttle = 0.8;
     *player_tf = Transform::from_translation(player.body.position);
-    aim.yaw = 0.0;
-    aim.pitch = 0.0;
+    aim.reset();
     snap_view(&mut camera, &aim);
 
     let mut scenario = scenario_override().unwrap_or(settings.scenario);
@@ -336,7 +335,12 @@ fn reset_scenario(
                     (t, Body::new(pos, Quat::IDENTITY, player_speed * 0.95))
                 }
                 Scenario::Dogfight => {
-                    let bearing = rng.range(0.0, std::f32::consts::TAU);
+                    // Usually somewhere ahead of you; now and then behind.
+                    let bearing = if rng.unit() < 0.8 {
+                        rng.signed() * 60f32.to_radians()
+                    } else {
+                        rng.range(0.0, std::f32::consts::TAU)
+                    };
                     let dist = rng.range(300.0, 900.0);
                     let pos = p + Vec3::new(
                         bearing.sin() * dist,
@@ -482,7 +486,7 @@ fn take_hits(
                 Color::srgb(1.0, 0.82, 0.3),
                 RESET_AFTER_KILL,
             ));
-            sound::play(&mut commands, sounds.kill(), 0.8, 1.0);
+            sound::play(&mut commands, sounds.kill(), 0.3, 1.0);
             commands.spawn((
                 Explosion { age: 0.0 },
                 Transform::from_translation(tf.translation),

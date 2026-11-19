@@ -442,6 +442,8 @@ enum MenuAction {
     ChaseDistance(u8, i32),
     SensitivityDown,
     SensitivityUp,
+    LookSensitivityDown,
+    LookSensitivityUp,
     ToggleDropdown(Dropdown),
     PickCrosshair(Crosshair),
     PickColor(CrosshairColor),
@@ -667,7 +669,7 @@ fn settings_page(
                     percent(100),
                 ));
 
-                col.spawn(section_header("Mouse sensitivity"));
+                col.spawn(section_header("Aim sensitivity"));
                 col.spawn(row()).with_children(|r| {
                     r.spawn(button(MenuAction::SensitivityDown, "-", px(44)));
                     r.spawn((
@@ -680,6 +682,21 @@ fn settings_page(
                         TextLayout::justify(Justify::Center),
                     ));
                     r.spawn(button(MenuAction::SensitivityUp, "+", px(44)));
+                });
+
+                col.spawn(section_header("Free look sensitivity"));
+                col.spawn(row()).with_children(|r| {
+                    r.spawn(button(MenuAction::LookSensitivityDown, "-", px(44)));
+                    r.spawn((
+                        label(&format!("{:.2}x", settings.look_sensitivity), 18.0, TEXT),
+                        Node {
+                            flex_grow: 1.0,
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                        TextLayout::justify(Justify::Center),
+                    ));
+                    r.spawn(button(MenuAction::LookSensitivityUp, "+", px(44)));
                 });
 
                 col.spawn(section_header("Crosshair"));
@@ -1668,6 +1685,12 @@ fn on_menu_click(
         }
         MenuAction::SensitivityUp => {
             settings.sensitivity = step_sensitivity(settings.sensitivity, 1.0);
+        }
+        MenuAction::LookSensitivityDown => {
+            settings.look_sensitivity = step_sensitivity(settings.look_sensitivity, -1.0);
+        }
+        MenuAction::LookSensitivityUp => {
+            settings.look_sensitivity = step_sensitivity(settings.look_sensitivity, 1.0);
         }
         MenuAction::ToggleDropdown(d) => {
             if ui.open == Some(d) {

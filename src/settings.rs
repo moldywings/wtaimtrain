@@ -271,6 +271,8 @@ pub struct Settings {
     pub units: Units,
     /// Multiplier on [`BASE_SENSITIVITY`].
     pub sensitivity: f32,
+    /// Multiplier on [`BASE_SENSITIVITY`] for free look.
+    pub look_sensitivity: f32,
     pub bindings: BTreeMap<Action, KeyCode>,
     pub crosshair: Crosshair,
     pub crosshair_color: CrosshairColor,
@@ -356,6 +358,7 @@ impl Default for Settings {
         Self {
             units: Units::Metric,
             sensitivity: 1.0,
+            look_sensitivity: 1.0,
             bindings: default_bindings(),
             crosshair: Crosshair::Cross,
             crosshair_color: CrosshairColor::Default,
@@ -492,6 +495,11 @@ impl Settings {
     /// Radians of aim movement per pixel of mouse movement.
     pub fn aim_per_pixel(&self) -> f32 {
         BASE_SENSITIVITY * self.sensitivity
+    }
+
+    /// Radians of free look per pixel of mouse movement.
+    pub fn look_per_pixel(&self) -> f32 {
+        BASE_SENSITIVITY * self.look_sensitivity
     }
 
     /// Bind `key` to `action`. Any other action already on that key swaps to

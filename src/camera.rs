@@ -31,16 +31,53 @@ impl Plugin for CameraPlugin {
     }
 }
 
-/// Where the player wants to point, in world space.
-#[derive(Resource, Default)]
+/// Where the player wants to point, in world space: a full orientation, so
+/// the aim can go straight up and over the top. The mouse moves it across
+/// the screen, and it slowly rolls back level whenever it isn't pointing
+/// steeply up or down.
+#[derive(Resource)]
 pub struct MouseAim {
-    pub yaw: f32,
-    pub pitch: f32,
+    pub rot: Quat,
 }
+
+impl Default for MouseAim {
+    fn default() -> Self {
+        MouseAim {
+            rot: Quat::IDENTITY,
+        }
+    }
+}
+
+/// How quickly the aim (and the view) rolls back level, 1/s.
+const LEVEL_RATE: f32 = 1.5;
 
 impl MouseAim {
     pub fn rotation(&self) -> Quat {
-        Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0)
+        self.rot
+    }
+
+    pub fn reset(&mut self) {
+        self.rot = Quat::IDENTITY;
+    }
+
+    /// Move the aim by a screen-space turn (rad): right and up.
+    fn turn(&mut self, right: f32, up: f32) {
+        self.rot =
+            (self.rot * Quat::from_rotation_y(-right) * Quat::from_rotation_x(up)).normalize();
+    }
+
+    /// Roll part of the way back toward level.
+    fn level(&mut self, dt: f32) {
+        let f = self.rot * Vec3::NEG_Z;
+        let up = self.rot * Vec3::Y;
+        let level_up = (Vec3::Y - f * f.y).normalize_or_zero();
+        if level_up == Vec3::ZERO {
+            return;
+        }
+        let err = f.dot(up.cross(level_up)).atan2(up.dot(level_up));
+        // Hardly at all when pointing straight up or down.
+        let k = (1.0 - f.y.abs()).powi(2) * (1.0 - (-LEVEL_RATE * dt).exp());
+        self.rot = (Quat::from_axis_angle(f, err * k) * self.rot).normalize();
     }
 
     pub fn direction(&self) -> Vec3 {
@@ -103,6 +140,7 @@ fn spawn_camera(mut commands: Commands) {
 }
 
 fn update_mouse_aim(
+    time: Res<Time<Real>>,
     motion: Res<AccumulatedMouseMotion>,
     keys: Res<ButtonInput<KeyCode>>,
     cursor: Single<&CursorOptions>,
@@ -111,18 +149,21 @@ fn update_mouse_aim(
     mut camera: Single<&mut ChaseCamera>,
 ) {
     camera.free_looking = settings.pressed(&keys, Action::FreeLook);
+    aim.level(time.delta_secs());
     if cursor.grab_mode == CursorGrabMode::None {
         return;
     }
-    // Same sensitivity zoomed or not.
-    let delta = motion.delta * settings.aim_per_pixel();
+    // Zoomed in, the same hand movement moves the circle the same distance
+    // across the screen as it does unzoomed.
+    let zoom =
+        (current_fov(camera.zoom).to_radians() * 0.5).tan() / (NORMAL_FOV.to_radians() * 0.5).tan();
     if camera.free_looking {
+        let delta = motion.delta * settings.look_per_pixel() * zoom;
         camera.look_yaw = (camera.look_yaw - delta.x).clamp(-3.0, 3.0);
         camera.look_pitch = (camera.look_pitch - delta.y).clamp(-1.4, 1.4);
     } else {
-        aim.yaw -= delta.x;
-        // Stop just short of straight up/down so the camera never flips.
-        aim.pitch = (aim.pitch - delta.y).clamp(-1.53, 1.53);
+        let delta = motion.delta * settings.aim_per_pixel() * zoom;
+        aim.turn(delta.x, -delta.y);
     }
 }
 

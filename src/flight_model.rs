@@ -967,7 +967,7 @@ impl InstructorTuning {
             rudder_gain: 150.0,
             rudder_damp: 8.0,
             rudder_fade: 0.5,
-            aim_smooth: 0.06,
+            aim_smooth: 0.16,
             rate_smooth: 0.1,
             aim_feed: 1.0,
             big_lo: 0.35,
@@ -1695,7 +1695,32 @@ mod compare_probe {
             k_pitch: 3.0,
             ..new
         };
-        for (name, t) in [("old", old), ("hi", hi), ("mid", mid)] {
+        let k6 = InstructorTuning {
+            kh: 6.0,
+            kv: 7.5,
+            ..new
+        };
+        let a15 = InstructorTuning {
+            aim_smooth: 0.16,
+            kh: 8.0,
+            kv: 10.0,
+            ..new
+        };
+        let a06 = InstructorTuning {
+            aim_smooth: 0.06,
+            kh: 8.0,
+            kv: 10.0,
+            ..new
+        };
+        for (name, t) in [
+            ("old", old),
+            ("hi", hi),
+            ("cur", new),
+            ("a06", a06),
+            ("k6", k6),
+            ("a15", a15),
+            ("mid", mid),
+        ] {
             let mut line = format!("{name}: ");
             for a in [3.0, 8.0, 20.0] {
                 let (f, mb) = super::smooth_sweep_pub::reversals(t, -a);
