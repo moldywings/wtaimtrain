@@ -2,7 +2,11 @@
 
 A desktop aim trainer for War Thunder Air Realistic Battles, built with Rust and [Bevy](https://bevy.org). You fly with mouse aim, the way the game does, and practice shooting at a target aircraft.
 
-## Running
+## Download (Windows)
+
+Get `WT-Aim-Trainer-Windows.zip` from the [latest build](https://github.com/moldywings/wtaimtrain/releases/tag/latest), unzip it anywhere, and double-click `WT Aim Trainer.exe`. Keep the `assets` folder next to the .exe. If Windows says it protected your PC, click **More info**, then **Run anyway** (the game isn't code-signed). A new build is posted automatically every time `main` changes, and your settings and presets carry over between versions.
+
+## Running from source
 
 You need the Rust toolchain (installed with [rustup](https://rustup.rs)). From the repository folder:
 
