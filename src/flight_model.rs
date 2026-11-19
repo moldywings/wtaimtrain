@@ -842,8 +842,31 @@ fn instructor_tuned(
     let yaw_err = local.x.atan2(-local.z);
     let wanted_left_bank = (-yaw_err * tune.heading_bank).clamp(-0.3, 0.3);
     let bank_to_level = right.y.clamp(-1.0, 1.0).asin() - wanted_left_bank;
-    let w = smoothstep(tune.level_below, tune.bank_above, predicted_off);
-    let roll_err = w * bank_to_target + (1.0 - w) * bank_to_level;
+    // Diving or climbing steeply, this controller flies even the small
+    // moves (the coordinated one can't tell its heading there). Roll only
+    // when rolling is the faster way; otherwise pitch and rudder with the
+    // wings held, as the game does.
+    let fwd = body.forward();
+    let steep = smoothstep(0.85, 1.1, fwd.y.abs().clamp(0.0, 1.0).asin());
+    let q = 0.5 * air_density(body.position.y) * v * v;
+    if tune.roll_choice {
+        let target = roll_over_weight(model, local, v, q, tune);
+        let tau = if target > body.roll_mode {
+            tune.roll_in
+        } else {
+            tune.roll_out
+        };
+        body.roll_mode += (target - body.roll_mode) * (1.0 - (-dt / tau.max(1e-3)).exp());
+    }
+    let roll_gate = if tune.roll_choice {
+        1.0 - steep * (1.0 - body.roll_mode)
+    } else {
+        1.0
+    };
+    let w = smoothstep(tune.level_below, tune.bank_above, predicted_off) * roll_gate;
+    // Pointing steeply down or up, "wings level" means little and chasing
+    // it would roll the plane around as it yaws: just hold the roll.
+    let roll_err = w * bank_to_target + (1.0 - w) * bank_to_level * (1.0 - steep);
     // Roll error -> desired roll rate -> stick, with damping on roll rate.
     let roll_rate_wanted = roll_err * tune.roll_gain;
     let roll_rate_now = -body.omega.z;
@@ -857,7 +880,6 @@ fn instructor_tuned(
     let roll_lag = (w * bank_to_target.abs() / 1.2).clamp(0.0, 0.85);
     // Feed-forward: the angle of attack that holds the nose up against
     // gravity, so the nose doesn't sag below the aim in level flight.
-    let q = 0.5 * air_density(body.position.y) * v * v;
     let up = body.rotation * Vec3::Y;
     let alpha_hold = if q > 50.0 {
         (model.mass * G * up.y.max(0.0) / (q * model.wing_area * model.cl_alpha))
@@ -894,19 +916,10 @@ fn instructor_tuned(
     // smooth "turn this way at this rate" command sets the bank, the pull
     // and the rudder together, so all three move in step.
     let fine = coordinated(model, body, aim, q, tune, dt);
-    let fwd = body.forward();
-    let steep = smoothstep(1.1, 1.35, fwd.y.abs().clamp(0.0, 1.0).asin());
     let wl = if !tune.roll_choice {
         smoothstep(tune.big_lo, tune.big_hi, off_nose)
     } else {
-        // Commit to rolling quickly, let go of it slowly.
-        let target = roll_over_weight(model, local, v, q, tune);
-        let tau = if target > body.roll_mode {
-            tune.roll_in
-        } else {
-            tune.roll_out
-        };
-        body.roll_mode += (target - body.roll_mode) * (1.0 - (-dt / tau.max(1e-3)).exp());
+        // Commit to rolling quickly, let go of it slowly (eased above).
         body.roll_mode
     }
     .max(steep);
@@ -2167,6 +2180,86 @@ mod track_probe {
                 println!(
                     "{name}: {r} deg/s right, {u} up: max bank {bank:.0}, mean lag {err:.2} deg"
                 );
+            }
+        }
+    }
+}
+
+/// Diving steeply with the aim a few degrees off the nose: how much it
+/// rolls to get there.
+#[cfg(test)]
+mod dive_probe {
+    use super::*;
+
+    pub(super) fn dive_step(t: InstructorTuning, dive: f32, mag: f32, dir: f32) -> (f32, f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let rot = Quat::from_rotation_x(-dive.to_radians());
+        let mut b = Body::new(Vec3::new(0.0, 3000.0, 0.0), rot, 150.0);
+        let (s, c) = mag.to_radians().sin_cos();
+        let (ds, dc) = dir.to_radians().sin_cos();
+        let aim = rot * (Vec3::NEG_Z * c + (Vec3::X * dc + Vec3::Y * ds) * s).normalize();
+        let dt = 1.0 / 120.0;
+        let (mut roll_turned, mut settled, mut rollsum) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..(120 * 4) {
+            // Keep the aim fixed relative to the flight path direction's
+            // start, like a target dead ahead in the dive.
+            let mut ctl = instructor_tuned(&m, &mut b, aim, dt, t);
+            ctl.throttle = 1.0;
+            step(&m, &mut b, &ctl, dt);
+            let tt = i as f32 * dt;
+            if b.forward().angle_between(aim).to_degrees() > 0.5 {
+                settled = tt;
+            }
+            if tt < 2.0 {
+                rollsum += ctl.roll.abs() * dt;
+                roll_turned += b.omega.z.abs().to_degrees() * dt;
+            }
+        }
+        (settled, rollsum, roll_turned)
+    }
+
+    pub(super) fn dive_track(t: InstructorTuning, dive: f32, rate: f32) -> (f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let rot = Quat::from_rotation_x(-dive.to_radians());
+        let mut b = Body::new(Vec3::new(0.0, 4000.0, 0.0), rot, 150.0);
+        let dt = 1.0 / 120.0;
+        let (mut rolled, mut err) = (0.0f32, 0.0f32);
+        for i in 0..(120 * 3) {
+            let tt = i as f32 * dt;
+            let aim = Quat::from_rotation_y(-(rate * tt).to_radians()) * rot * Vec3::NEG_Z;
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, t);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            if tt > 1.0 {
+                rolled += b.omega.z.abs().to_degrees() * dt;
+                err = err.max(b.forward().angle_between(aim).to_degrees());
+            }
+        }
+        (rolled, err)
+    }
+
+    #[test]
+    #[ignore]
+    fn dive_probe() {
+        for dive in [50.0, 65.0, 75.0, 85.0] {
+            for rate in [3.0, 8.0, 20.0] {
+                let (r, e) = dive_track(InstructorTuning::get(), dive, rate);
+                println!("track dive {dive} at {rate} deg/s: rolled {r:.0} max err {e:.1}");
+            }
+        }
+        let t = InstructorTuning::get();
+        println!("dive mag/dir: settle  roll-stick  wing-turn(deg)");
+        for dive in [0.0, 30.0, 50.0, 60.0, 70.0, 85.0] {
+            for (mag, dir) in [
+                (3.0, 0.0),
+                (6.0, 0.0),
+                (6.0, -60.0),
+                (10.0, 180.0),
+                (15.0, -90.0),
+                (25.0, 0.0),
+            ] {
+                let (s, r, w) = dive_step(t, dive, mag, dir);
+                println!("  {dive} {mag}/{dir}: {s:.2} {r:.2} {w:.0}");
             }
         }
     }
