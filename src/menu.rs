@@ -15,7 +15,10 @@ use bevy::picking::hover::{HoverMap, Hovered};
 use bevy::prelude::*;
 use bevy::text::{EditableText, TextCursorStyle};
 use bevy::ui::Pressed;
-use bevy::ui_widgets::{Activate, Button, SelectAllOnFocus, TextInput};
+use bevy::ui_widgets::{
+    Activate, Button, SelectAllOnFocus, Slider, SliderPrecision, SliderRange, SliderThumb,
+    SliderValue, TextInput, TrackClick, ValueChange,
+};
 
 use crate::GameState;
 use crate::flight_model::{AircraftCard, EngineKind, FlightModel};
@@ -24,7 +27,8 @@ use crate::settings::{
     Settings, UnitKind, Units, default_bindings, is_builtin, key_name,
 };
 use crate::weapons::{
-    GunCard, Loadout, MILS_TO_M_AT_500, Slot, TracerColor, ballistics_at, is_builtin_gun,
+    BELLY_BACK_MAX, BELLY_BACK_MIN, CONVERGENCE_CHOICES, GunCard, Loadout, MILS_TO_M_AT_500, Slot,
+    TracerColor, WING_OUT_MAX, WING_OUT_MIN, ballistics_at, is_builtin_gun,
 };
 
 pub struct MenuPlugin;
@@ -36,6 +40,7 @@ impl Plugin for MenuPlugin {
             .init_resource::<MenuUi>()
             .init_resource::<ScrollMemory>()
             .add_observer(on_menu_click)
+            .add_observer(on_slider_change)
             .add_observer(on_scroll)
             .add_systems(OnEnter(GameState::Paused), open_menu)
             .add_systems(OnExit(GameState::Paused), (despawn_menu, cancel_rebind))
@@ -103,6 +108,10 @@ enum Dropdown {
     Tracer,
     PlayerAircraft,
     TargetAircraft,
+    /// One belly or wing position's gun.
+    StationGun(Slot, u8),
+    Unit(UnitKind),
+    Convergence,
 }
 
 /// Scrollable lists, so their scroll position survives a menu rebuild.
@@ -483,7 +492,7 @@ impl GunDraft {
 enum MenuAction {
     Resume,
     Page(Page),
-    CycleUnit(UnitKind),
+    SetUnit(UnitKind, u8),
     ToggleLead,
     ToggleEnemyFire,
     PickScenario(Scenario),
@@ -517,10 +526,9 @@ enum MenuAction {
     PickTracer(TracerColor),
     PickMountGun(Slot, String),
     MountCount(Slot, i32),
-    /// Move wing gun convergence by this many steps.
-    Convergence(i32),
-    /// Switch wing gun convergence off (parallel guns) or back on.
-    ConvergenceOff,
+    PickStationGun(Slot, u8, String),
+    /// Gun targeting distance, m (0 = off).
+    SetConvergence(u32),
 }
 
 const PANEL_BG: Color = Color::srgba(0.08, 0.09, 0.11, 0.94);
@@ -692,7 +700,7 @@ fn rebuild_menu(
                 });
                 match ui.page {
                     Page::Settings => settings_page(panel, &settings, &rebinding, &ui, &scroll),
-                    Page::Units => units_page(panel, &settings),
+                    Page::Units => units_page(panel, &settings, &ui, &scroll),
                     Page::Aircraft => aircraft_page(panel, &settings, &ui, &scroll),
                     Page::Weapons => weapons_page(panel, &settings, &ui, &scroll),
                     Page::Scenario => scenario_page(panel, &settings),
@@ -1338,38 +1346,50 @@ fn weapons_page(
                     ));
                 }
                 let loadout = &card.weapons;
+                let gun_choices = |pick: &dyn Fn(String) -> MenuAction, current: &str| {
+                    settings
+                        .guns
+                        .iter()
+                        .map(|g| Choice {
+                            action: pick(g.name.clone()),
+                            label: g.name.clone(),
+                            selected: g.name == settings.gun(current).name,
+                            swatch: None,
+                        })
+                        .collect::<Vec<_>>()
+                };
                 for slot in Slot::ALL {
                     let mount = loadout.mount(slot);
+                    let count = mount.count.min(slot.max());
+                    let mixed = (0..count as usize).any(|i| mount.gun_at(i) != mount.gun);
                     col.spawn(section_header(&format!(
                         "{} (up to {})",
                         slot.label(),
                         slot.max()
                     )));
-                    col.spawn((row(), GlobalZIndex(slot_z(slot))))
+                    col.spawn((row(), GlobalZIndex(slot_z(slot, 0))))
                         .with_children(|r| {
-                            let guns: Vec<_> = settings
-                                .guns
-                                .iter()
-                                .map(|g| Choice {
-                                    action: MenuAction::PickMountGun(slot, g.name.clone()),
-                                    label: g.name.clone(),
-                                    selected: g.name == settings.gun(&mount.gun).name,
-                                    swatch: None,
-                                })
-                                .collect();
+                            let guns = gun_choices(
+                                &|g| MenuAction::PickMountGun(slot, g),
+                                &mount.gun,
+                            );
                             dropdown(
                                 r,
                                 Dropdown::Gun(slot),
                                 ui,
                                 scroll,
-                                &settings.gun(&mount.gun).name,
+                                if mixed {
+                                    "Mixed (set each below)"
+                                } else {
+                                    &settings.gun(&mount.gun).name
+                                },
                                 None,
                                 &guns,
                                 px(250),
                             );
                             r.spawn(button(MenuAction::MountCount(slot, -1), "-", px(36)));
                             r.spawn((
-                                label(&mount.count.min(slot.max()).to_string(), 18.0, TEXT),
+                                label(&count.to_string(), 18.0, TEXT),
                                 Node {
                                     width: px(30),
                                     justify_content: JustifyContent::Center,
@@ -1379,28 +1399,97 @@ fn weapons_page(
                             ));
                             r.spawn(button(MenuAction::MountCount(slot, 1), "+", px(36)));
                         });
+                    let placed = matches!(slot, Slot::Belly | Slot::Wings);
+                    if placed && count >= 2 {
+                        // A gun for each position, so calibers can be mixed.
+                        col.spawn((row(), GlobalZIndex(slot_z(slot, 1))))
+                            .with_children(|r| {
+                                r.spawn((
+                                    label("Each", 13.0, DIM),
+                                    Node {
+                                        width: px(36),
+                                        ..default()
+                                    },
+                                ));
+                                for i in 0..count as u8 {
+                                    let gun = mount.gun_at(i as usize).to_string();
+                                    let guns = gun_choices(
+                                        &|g| MenuAction::PickStationGun(slot, i, g),
+                                        &gun,
+                                    );
+                                    let short = format!(
+                                        "{:.0} mm",
+                                        settings.gun(&gun).caliber_mm()
+                                    );
+                                    dropdown(
+                                        r,
+                                        Dropdown::StationGun(slot, i),
+                                        ui,
+                                        scroll,
+                                        &short,
+                                        None,
+                                        &guns,
+                                        px(84.0),
+                                    );
+                                }
+                            });
+                    }
+                    if placed && count > 0 {
+                        let (id, value, min, max, text) = if slot == Slot::Belly {
+                            (
+                                SliderId::BellyBack,
+                                loadout.belly_back,
+                                BELLY_BACK_MIN,
+                                BELLY_BACK_MAX,
+                                "Behind spinner",
+                            )
+                        } else {
+                            (
+                                SliderId::WingOut,
+                                loadout.wing_out,
+                                WING_OUT_MIN,
+                                WING_OUT_MAX,
+                                "From wing root",
+                            )
+                        };
+                        col.spawn(row()).with_children(|r| {
+                            r.spawn((
+                                label(text, 13.0, DIM),
+                                Node {
+                                    width: px(110),
+                                    ..default()
+                                },
+                            ));
+                            r.spawn(slider(id, value, min, max, px(210)));
+                            r.spawn((
+                                label(&slider_text(id, value, settings.units), 15.0, TEXT),
+                                TextLayout::no_wrap(),
+                                SliderLabel(id),
+                            ));
+                        });
+                    }
                 }
-                col.spawn(section_header("Gun convergence (wing and belly guns)"));
-                col.spawn(row()).with_children(|r| {
-                    r.spawn((
-                        label(
-                            &if loadout.convergence > 0.0 {
-                                convergence_text(settings.units, loadout.convergence)
-                            } else {
-                                "Off (parallel)".to_string()
-                            },
-                            18.0,
-                            TEXT,
-                        ),
-                        grow(),
-                    ));
-                    r.spawn(button(MenuAction::Convergence(-1), "-", px(36)));
-                    r.spawn(button(MenuAction::Convergence(1), "+", px(36)));
-                    r.spawn(button(
-                        MenuAction::ConvergenceOff,
-                        if loadout.convergence > 0.0 { "Turn off" } else { "Turn on" },
-                        px(90),
-                    ));
+                col.spawn((row(), GlobalZIndex(12))).with_children(|r| {
+                    r.spawn((label("Gun targeting distance", 16.0, TEXT), grow()));
+                    let choices: Vec<_> = CONVERGENCE_CHOICES
+                        .iter()
+                        .map(|m| Choice {
+                            action: MenuAction::SetConvergence(*m as u32),
+                            label: convergence_label(settings.units, *m),
+                            selected: *m == loadout.convergence,
+                            swatch: None,
+                        })
+                        .collect();
+                    dropdown(
+                        r,
+                        Dropdown::Convergence,
+                        ui,
+                        scroll,
+                        &convergence_label(settings.units, loadout.convergence),
+                        None,
+                        &choices,
+                        px(210),
+                    );
                 });
                 let guns = loadout.guns();
                 let mass_per_s: f32 = guns
@@ -1418,11 +1507,12 @@ fn weapons_page(
                         mass_per_s,
                         if loadout.convergence > 0.0 {
                             format!(
-                                "Wing and belly guns converge at {}",
+                                "Wing and belly guns angle in sideways to meet at {}",
                                 convergence_text(settings.units, loadout.convergence)
                             )
                         } else {
-                            "Convergence is off, so wing and belly guns fire parallel".into()
+                            "Targeting distance is off, so wing and belly guns fire parallel"
+                                .into()
                         }
                     ),
                     13.0,
@@ -1438,23 +1528,48 @@ fn weapons_page(
         });
 }
 
-fn units_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
+fn units_page(
+    panel: &mut ChildSpawnerCommands,
+    settings: &Settings,
+    ui: &MenuUi,
+    scroll: &ScrollMemory,
+) {
     panel.spawn(column(px(560))).with_children(|col| {
         col.spawn(label(
-            "Click a unit to switch it. Presets, the readout and the menus all \
+            "Pick a unit for each. Presets, the readout and the menus all \
              convert by themselves.",
             14.0,
             DIM,
         ));
-        for kind in UnitKind::ALL {
-            col.spawn(row()).with_children(|r| {
-                r.spawn((label(kind.label(), 16.0, TEXT), grow()));
-                r.spawn(button(
-                    MenuAction::CycleUnit(kind),
-                    settings.units.get(kind).name,
-                    px(140),
-                ));
-            });
+        for (n, kind) in UnitKind::ALL.into_iter().enumerate() {
+            // Higher rows draw over lower ones, so an open list covers
+            // the rows beneath it.
+            col.spawn((row(), GlobalZIndex(30 - n as i32)))
+                .with_children(|r| {
+                    r.spawn((label(kind.label(), 16.0, TEXT), grow()));
+                    let current = settings.units.index(kind);
+                    let choices: Vec<_> = kind
+                        .options()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| Choice {
+                            action: MenuAction::SetUnit(kind, i as u8),
+                            label: d.name.to_string(),
+                            selected: i == current,
+                            swatch: None,
+                        })
+                        .collect();
+                    dropdown(
+                        r,
+                        Dropdown::Unit(kind),
+                        ui,
+                        scroll,
+                        settings.units.get(kind).name,
+                        None,
+                        &choices,
+                        px(160),
+                    );
+                });
         }
         col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
     });
@@ -1565,13 +1680,136 @@ fn scenario_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
 
 /// Convergence range in meters, with feet too outside metric.
 fn convergence_text(units: Units, m: f32) -> String {
-    units.range(m)
+    // Short distances, like War Thunder's list: meters or feet.
+    let (name, per) = units.altitude_unit();
+    format!("{:.0} {name}", m * per)
+}
+
+/// The convergence dropdown's text for a distance, m ("No" when off).
+fn convergence_label(units: Units, m: f32) -> String {
+    if m > 0.0 {
+        convergence_text(units, m)
+    } else {
+        "No".into()
+    }
 }
 
 /// Higher rows draw over lower ones, so an open gun list covers the rows
 /// beneath it.
-fn slot_z(slot: Slot) -> i32 {
-    15 - Slot::ALL.iter().position(|s| *s == slot).unwrap_or(0) as i32
+fn slot_z(slot: Slot, sub: i32) -> i32 {
+    20 - 2 * Slot::ALL.iter().position(|s| *s == slot).unwrap_or(0) as i32 - sub
+}
+
+/// Which loadout setting a slider moves.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+enum SliderId {
+    BellyBack,
+    WingOut,
+}
+
+/// The text showing a slider's value.
+#[derive(Component)]
+struct SliderLabel(SliderId);
+
+fn slider_text(_id: SliderId, m: f32, units: Units) -> String {
+    let (name, per) = units.altitude_unit();
+    format!("{:.1} {name}", m * per)
+}
+
+/// A horizontal slider: a rail with a round thumb you drag.
+fn slider(id: SliderId, value: f32, min: f32, max: f32, width: Val) -> impl Bundle {
+    (
+        Node {
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Stretch,
+            height: px(20),
+            width,
+            margin: UiRect::right(px(10)),
+            ..default()
+        },
+        Hovered::default(),
+        id,
+        Slider {
+            track_click: TrackClick::Snap,
+            ..default()
+        },
+        SliderValue(value),
+        SliderRange::new(min, max),
+        SliderPrecision(1),
+        Children::spawn((
+            Spawn((
+                Node {
+                    height: px(6),
+                    border_radius: BorderRadius::all(px(3)),
+                    ..default()
+                },
+                BackgroundColor(BUTTON_HOVER),
+            )),
+            Spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    right: px(16),
+                    top: px(0),
+                    bottom: px(0),
+                    ..default()
+                },
+                children![(
+                    SliderThumb,
+                    Node {
+                        width: px(16),
+                        height: px(16),
+                        top: px(2),
+                        position_type: PositionType::Absolute,
+                        left: percent((value - min) / (max - min) * 100.0),
+                        border_radius: BorderRadius::MAX,
+                        ..default()
+                    },
+                    BackgroundColor(ACCENT),
+                )],
+            )),
+        )),
+    )
+}
+
+/// Dragging a slider: move its thumb and label as it goes, and save the
+/// setting when let go.
+#[allow(clippy::too_many_arguments)]
+fn on_slider_change(
+    change: On<ValueChange<f32>>,
+    sliders: Query<(&SliderId, &SliderRange, &Children)>,
+    tracks: Query<&Children, Without<SliderThumb>>,
+    mut thumbs: Query<&mut Node, With<SliderThumb>>,
+    mut labels: Query<(&SliderLabel, &mut Text)>,
+    mut commands: Commands,
+    mut settings: ResMut<Settings>,
+    mut ui: ResMut<MenuUi>,
+) {
+    let Ok((id, range, children)) = sliders.get(change.source) else {
+        return;
+    };
+    let value = range.clamp(change.value);
+    commands.entity(change.source).insert(SliderValue(value));
+    for child in children.iter() {
+        for t in tracks.get(child).into_iter().flatten() {
+            if let Ok(mut node) = thumbs.get_mut(*t) {
+                node.left = percent(range.thumb_position(value) * 100.0);
+            }
+        }
+    }
+    for (l, mut text) in &mut labels {
+        if l.0 == *id {
+            text.0 = slider_text(*id, value, settings.units);
+        }
+    }
+    if change.is_final {
+        let id = *id;
+        edit_loadout(&mut settings, &mut ui, |l| match id {
+            SliderId::BellyBack => l.belly_back = value,
+            SliderId::WingOut => l.wing_out = value,
+        });
+    }
 }
 
 fn grow() -> Node {
@@ -1692,6 +1930,8 @@ fn dropdown(
                     top: px(31),
                     left: px(0),
                     width: percent(100),
+                    // Narrow lists still fit the gun names.
+                    min_width: px(210),
                     max_height: px(ROW_STEP * DROPDOWN_ROWS),
                     flex_direction: FlexDirection::Column,
                     row_gap: px(3),
@@ -1828,8 +2068,8 @@ fn on_menu_click(
         MenuAction::Range(id, end, steps) => {
             settings.ranges.step(id, end, steps);
         }
-        MenuAction::CycleUnit(kind) => {
-            settings.units.cycle(kind);
+        MenuAction::SetUnit(kind, i) => {
+            settings.units.set(kind, i);
             // Re-show the editor in the new units.
             let card = settings.card(&ui.editing).clone();
             ui.draft = Draft::from_card(&card, settings.units);
@@ -1884,6 +2124,16 @@ fn on_menu_click(
                     Dropdown::Tracer => TracerColor::ALL
                         .iter()
                         .position(|c| *c == ui.gun_draft.tracer),
+                    Dropdown::StationGun(slot, i) => {
+                        let loadout = &settings.card(&ui.loadout_for).weapons;
+                        let gun = loadout.mount(slot).gun_at(i as usize).to_string();
+                        settings.guns.iter().position(|g| g.name == gun)
+                    }
+                    Dropdown::Unit(kind) => Some(settings.units.index(kind)),
+                    Dropdown::Convergence => {
+                        let c = settings.card(&ui.loadout_for).weapons.convergence;
+                        CONVERGENCE_CHOICES.iter().position(|v| *v == c)
+                    }
                 };
                 scroll.dropdown = (index.unwrap_or(0) as f32 - 2.0).max(0.0) * ROW_STEP;
             }
@@ -2056,7 +2306,12 @@ fn on_menu_click(
             ui.gun_message.clear();
         }
         MenuAction::PickMountGun(slot, gun) => {
-            edit_loadout(&mut settings, &mut ui, |l| l.mount_mut(slot).gun = gun);
+            edit_loadout(&mut settings, &mut ui, |l| l.mount_mut(slot).set_all(&gun));
+        }
+        MenuAction::PickStationGun(slot, i, gun) => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                l.mount_mut(slot).set_at(i as usize, &gun)
+            });
         }
         MenuAction::MountCount(slot, delta) => {
             edit_loadout(&mut settings, &mut ui, |l| {
@@ -2064,30 +2319,8 @@ fn on_menu_click(
                 m.count = (m.count as i32 + delta).clamp(0, slot.max() as i32) as u32;
             });
         }
-        MenuAction::Convergence(steps) => {
-            use crate::weapons::{CONVERGENCE_MAX, CONVERGENCE_MIN, CONVERGENCE_STEP};
-            edit_loadout(&mut settings, &mut ui, |l| {
-                // From off, - and + start again at the nearest end.
-                let from = if l.convergence > 0.0 {
-                    l.convergence
-                } else if steps < 0 {
-                    CONVERGENCE_MAX + CONVERGENCE_STEP
-                } else {
-                    CONVERGENCE_MIN - CONVERGENCE_STEP
-                };
-                let c = (from / CONVERGENCE_STEP).round() * CONVERGENCE_STEP
-                    + steps as f32 * CONVERGENCE_STEP;
-                l.convergence = c.clamp(CONVERGENCE_MIN, CONVERGENCE_MAX);
-            });
-        }
-        MenuAction::ConvergenceOff => {
-            edit_loadout(&mut settings, &mut ui, |l| {
-                l.convergence = if l.convergence > 0.0 {
-                    0.0
-                } else {
-                    crate::weapons::CONVERGENCE
-                };
-            });
+        MenuAction::SetConvergence(m) => {
+            edit_loadout(&mut settings, &mut ui, |l| l.convergence = m as f32);
         }
     }
 }

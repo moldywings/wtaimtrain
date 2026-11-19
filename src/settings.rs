@@ -176,10 +176,14 @@ impl Units {
         &options[(self.choice[kind.index()] as usize).min(options.len() - 1)]
     }
 
-    /// Switch a kind to its next unit.
-    pub fn cycle(&mut self, kind: UnitKind) {
-        let i = kind.index();
-        self.choice[i] = ((self.choice[i] as usize + 1) % kind.options().len()) as u8;
+    /// Pick a kind's unit by its place in `kind.options()`.
+    pub fn set(&mut self, kind: UnitKind, i: u8) {
+        self.choice[kind.index()] = i.min(kind.options().len() as u8 - 1);
+    }
+
+    /// The place of a kind's unit in `kind.options()`.
+    pub fn index(self, kind: UnitKind) -> usize {
+        (self.choice[kind.index()] as usize).min(kind.options().len() - 1)
     }
 
     /// Unit name and factor from the stored unit, for editing.
@@ -907,9 +911,7 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"units": "Imperial"}"#).unwrap();
         assert_eq!(old.units.speed(100.0), "224 mph");
         let mut u = Units::METRIC;
-        u.cycle(UnitKind::Distance);
-        u.cycle(UnitKind::Distance);
-        u.cycle(UnitKind::Distance);
+        u.set(UnitKind::Distance, 3);
         let s = Settings {
             units: u,
             ..Default::default()

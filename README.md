@@ -31,7 +31,7 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | R | Restart the scenario |
 | Esc | Pause menu |
 
-The pause menu has five pages. **Settings** covers aim, zoomed aim and free look sensitivity, crosshair style and color, the lead indicator, and every key binding. **Units** picks the unit for each kind of number on its own: airspeed (km/h, mph, kn, m/s), altitude (m, ft), distance and range (km, mi, nmi, m, ft, yd), climb rate (m/s, ft/min, ft/s), engine power (hp, kW), thrust (kgf, lbf, kN), mass (kg, lb) and wing area (sq m, sq ft). Presets are stored in fixed units, so switching a unit converts everything shown, presets included. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies from drop-down lists. **Weapons** has gun presets and each aircraft preset's loadout. **Scenario** picks what you practice and sets that scenario's start distances. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
+The pause menu has five pages. **Settings** covers aim, zoomed aim and free look sensitivity, crosshair style and color, the lead indicator, and every key binding. **Units** has a drop-down for each kind of number: airspeed (km/h, mph, kn, m/s), altitude (m, ft), distance and range (km, mi, nmi, m, ft, yd), climb rate (m/s, ft/min, ft/s), engine power (hp, kW), thrust (kgf, lbf, kN), mass (kg, lb) and wing area (sq m, sq ft). Presets are stored in fixed units, so switching a unit converts everything shown, presets included. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies from drop-down lists. **Weapons** has gun presets and each aircraft preset's loadout. **Scenario** picks what you practice and sets that scenario's start distances. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
 
 The white circle is where you're aiming. The crosshair is where the nose points. The target shows its preset name, a bracket marker and its range. When it's off screen, a red arrow at the screen edge points to it. The readout shows indicated (IAS) and true (TAS) airspeed. Hits and accuracy show in the top right, and "HIT" flashes when a round connects. With the lead indicator on, a green circle shows where to put your gun crosshair to hit the target. It's worked out for the biggest gun on your plane, counting your speed, the target's speed, bullet drop and drag.
 
@@ -69,10 +69,12 @@ Each aircraft preset has a loadout with four mounting spots, and each spot can c
 
 - Nose, in the spinner: 1 gun through the propeller hub.
 - Nose, around it: up to 6, on a hexagon around the spinner gun.
-- Belly: up to 4 under the fuselage, below and behind the wing root.
-- Wings: up to 4 per wing (8 in total).
+- Belly: up to 4 under the fuselage. A slider sets how far behind the spinner they sit.
+- Wings: up to 4 per wing (8 in total). A slider sets how far out from the wing root the first one sits; the rest follow outward.
 
-The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. Nose guns fire straight ahead. Wing and belly guns are angled to meet at the loadout's convergence range, 400 m by default, which you set with - and + on the Weapons page (100 to 1500 m, in 50 m steps), or turn off so they fire parallel. The Yak-3 carries a ShVAK in the spinner and two UBS above it. Changing its loadout saves a copy.
+Belly and wing guns can mix calibers: with two or more, each position gets its own gun drop-down (wing positions match on both wings).
+
+The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. Nose guns fire straight ahead. Wing and belly guns angle in sideways only (like War Thunder's horizontal convergence) to meet at the loadout's gun targeting distance, 400 m by default. Pick it from the same list the game has (No, 50 to 300 m in 50 m steps, then 400 to 800 m); No fires them parallel. The Yak-3 carries a ShVAK in the spinner and two UBS above it. Changing its loadout saves a copy.
 
 ## Layout
 
