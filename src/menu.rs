@@ -23,7 +23,7 @@ use crate::settings::{
     Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, Settings, Units,
     default_bindings, is_builtin, key_name,
 };
-use crate::weapons::{GunCard, Loadout, Slot, ballistics_at, is_builtin_gun};
+use crate::weapons::{GunCard, Loadout, Slot, TracerColor, ballistics_at, is_builtin_gun};
 
 pub struct MenuPlugin;
 
@@ -96,6 +96,7 @@ enum Dropdown {
     Color,
     Gun(Slot),
     LoadoutAircraft,
+    Tracer,
 }
 
 /// Scrollable lists, so their scroll position survives a menu rebuild.
@@ -355,6 +356,7 @@ impl GunField {
 #[derive(Clone, Default)]
 struct GunDraft {
     fields: [String; GunField::ALL.len()],
+    tracer: TracerColor,
 }
 
 impl GunDraft {
@@ -374,7 +376,10 @@ impl GunDraft {
                 GunField::Spread => gun.spread.map(n).unwrap_or_default(),
             };
         }
-        GunDraft { fields }
+        GunDraft {
+            fields,
+            tracer: gun.tracer,
+        }
     }
 
     fn get(&self, f: GunField) -> &str {
@@ -409,6 +414,7 @@ impl GunDraft {
             fire_rate: need(GunField::FireRate)?,
             caliber: num(GunField::Caliber)?,
             spread: num(GunField::Spread)?,
+            tracer: self.tracer,
         };
         if gun.projectile_mass > 5.0 {
             return Err("Projectile mass is in kg (a 20 mm round is about 0.1).".into());
@@ -442,8 +448,11 @@ enum MenuAction {
     DeleteGun,
     SaveGun,
     PickLoadoutAircraft(String),
+    PickTracer(TracerColor),
     PickMountGun(Slot, String),
     MountCount(Slot, i32),
+    /// Move wing gun convergence by this many steps.
+    Convergence(i32),
 }
 
 const PANEL_BG: Color = Color::srgba(0.08, 0.09, 0.11, 0.94);
@@ -1087,6 +1096,32 @@ fn weapons_page(
                             ));
                         });
                     }
+                    col.spawn((row(), GlobalZIndex(16))).with_children(|r| {
+                        r.spawn((label("Tracer color", 15.0, TEXT), grow()));
+                        let colors: Vec<_> = TracerColor::ALL
+                            .iter()
+                            .map(|c| Choice {
+                                action: MenuAction::PickTracer(*c),
+                                label: c.label().into(),
+                                selected: *c == ui.gun_draft.tracer,
+                                swatch: Some(c.color()),
+                            })
+                            .collect();
+                        dropdown(
+                            r,
+                            Dropdown::Tracer,
+                            ui,
+                            scroll,
+                            ui.gun_draft.tracer.label(),
+                            Some(ui.gun_draft.tracer.color()),
+                            &colors,
+                            px(150),
+                        );
+                        r.spawn(Node {
+                            width: px(40),
+                            ..default()
+                        });
+                    });
                     col.spawn(button(MenuAction::SaveGun, "Save gun", percent(100)));
                     if !ui.gun_message.is_empty() {
                         col.spawn(label(&ui.gun_message, 14.0, ACCENT));
@@ -1188,6 +1223,19 @@ fn weapons_page(
                             r.spawn(button(MenuAction::MountCount(slot, 1), "+", px(36)));
                         });
                 }
+                col.spawn(section_header("Gun convergence (wing and belly guns)"));
+                col.spawn(row()).with_children(|r| {
+                    r.spawn((
+                        label(
+                            &convergence_text(settings.units, loadout.convergence),
+                            18.0,
+                            TEXT,
+                        ),
+                        grow(),
+                    ));
+                    r.spawn(button(MenuAction::Convergence(-1), "-", px(36)));
+                    r.spawn(button(MenuAction::Convergence(1), "+", px(36)));
+                });
                 let guns = loadout.guns();
                 let mass_per_s: f32 = guns
                     .iter()
@@ -1199,10 +1247,10 @@ fn weapons_page(
                 col.spawn(label(
                     &format!(
                         "{} guns, {:.2} kg of rounds per second. Wing and belly guns \
-                         converge at {:.0} m; nose guns fire straight ahead.",
+                         converge at {}; nose guns fire straight ahead.",
                         loadout.total_guns(),
                         mass_per_s,
-                        crate::weapons::CONVERGENCE
+                        convergence_text(settings.units, loadout.convergence)
                     ),
                     13.0,
                     DIM,
@@ -1215,6 +1263,14 @@ fn weapons_page(
                 col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
             });
         });
+}
+
+/// Convergence range in meters, with feet too outside metric.
+fn convergence_text(units: Units, m: f32) -> String {
+    match units {
+        Units::Metric => format!("{m:.0} m"),
+        _ => format!("{m:.0} m ({:.0} ft)", m * 3.280_84),
+    }
 }
 
 /// Higher rows draw over lower ones, so an open gun list covers the rows
@@ -1504,6 +1560,9 @@ fn on_menu_click(
                         .aircraft
                         .iter()
                         .position(|c| c.name == ui.loadout_for),
+                    Dropdown::Tracer => TracerColor::ALL
+                        .iter()
+                        .position(|c| *c == ui.gun_draft.tracer),
                 };
                 scroll.dropdown = (index.unwrap_or(0) as f32 - 2.0).max(0.0) * ROW_STEP;
             }
@@ -1667,6 +1726,10 @@ fn on_menu_click(
             }
             Err(e) => ui.gun_message = e,
         },
+        MenuAction::PickTracer(c) => {
+            ui.gun_draft.tracer = c;
+            ui.gun_message = "Tracer color set. Save gun to keep it.".into();
+        }
         MenuAction::PickLoadoutAircraft(name) => {
             ui.loadout_for = name;
             ui.gun_message.clear();
@@ -1678,6 +1741,14 @@ fn on_menu_click(
             edit_loadout(&mut settings, &mut ui, |l| {
                 let m = l.mount_mut(slot);
                 m.count = (m.count as i32 + delta).clamp(0, slot.max() as i32) as u32;
+            });
+        }
+        MenuAction::Convergence(steps) => {
+            use crate::weapons::{CONVERGENCE_MAX, CONVERGENCE_MIN, CONVERGENCE_STEP};
+            edit_loadout(&mut settings, &mut ui, |l| {
+                let c = (l.convergence / CONVERGENCE_STEP).round() * CONVERGENCE_STEP
+                    + steps as f32 * CONVERGENCE_STEP;
+                l.convergence = c.clamp(CONVERGENCE_MIN, CONVERGENCE_MAX);
             });
         }
     }

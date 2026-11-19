@@ -10,6 +10,7 @@ mod flight_model;
 mod hud;
 mod menu;
 mod settings;
+mod sound;
 mod target;
 mod weapons;
 mod world;
@@ -57,6 +58,7 @@ fn main() {
             hud::HudPlugin,
             menu::MenuPlugin,
             weapons::WeaponsPlugin,
+            sound::SoundPlugin,
         ))
         .add_systems(OnEnter(GameState::Playing), (resume_time, capture_cursor))
         .add_systems(OnEnter(GameState::Paused), (pause_time, release_cursor))

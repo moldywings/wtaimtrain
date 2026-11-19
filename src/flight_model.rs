@@ -894,10 +894,8 @@ fn coordinated(
     } else {
         0.0
     };
-    let alpha_wanted = alpha_ff
-        + tune.kq * (q_body - body.omega.x)
-        + tune.k_pitch * pitch_err
-        + body.trim;
+    let alpha_wanted =
+        alpha_ff + tune.kq * (q_body - body.omega.x) + tune.k_pitch * pitch_err + body.trim;
     let alpha_limit = 0.88 * model.alpha_stall;
     let alpha_max = ELEVATOR_ALPHA * model.alpha_stall;
     let pitch = (alpha_wanted.clamp(-0.5 * alpha_limit, alpha_limit) / alpha_max).clamp(-1.0, 1.0);
@@ -905,8 +903,8 @@ fn coordinated(
     // Rudder: the yaw part of the turn, plus fine aim on what's left.
     let yaw_err = local.x.atan2(-local.z);
     let yaw_rate_now = -body.omega.y;
-    let yaw = (tune.k_rudder * yaw_err + tune.k_rudder_rate * (r_body - yaw_rate_now))
-        .clamp(-1.0, 1.0);
+    let yaw =
+        (tune.k_rudder * yaw_err + tune.k_rudder_rate * (r_body - yaw_rate_now)).clamp(-1.0, 1.0);
 
     Controls {
         pitch,
@@ -1546,7 +1544,7 @@ pub mod smooth_sweep_pub {
 
     /// Step the aim and count stick reversals (a control swinging one way
     /// then back), plus the largest bank.
-    pub fn reversals(t: InstructorTuning, yaw_deg: f32) -> (f32, f32) {
+    pub(super) fn reversals(t: InstructorTuning, yaw_deg: f32) -> (f32, f32) {
         let m = FlightModel::from_card(&AircraftCard::yak3());
         let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 150.0);
         let dt = 1.0 / 60.0;
@@ -1561,7 +1559,10 @@ pub mod smooth_sweep_pub {
             step(&m, &mut b, &c, dt);
             let d = [c.pitch - prev.pitch, c.roll - prev.roll, c.yaw - prev.yaw];
             for i in 0..3 {
-                if d[i].abs() > 0.01 && prev_d[i].abs() > 0.01 && d[i].signum() != prev_d[i].signum() {
+                if d[i].abs() > 0.01
+                    && prev_d[i].abs() > 0.01
+                    && d[i].signum() != prev_d[i].signum()
+                {
                     flips += 1.0;
                 }
                 if d[i].abs() > 0.01 {
@@ -1636,7 +1637,14 @@ pub mod smooth_sweep_pub {
         let t = best.1;
         println!(
             "best {:.2}: kh {} kv {} kb {} kr {} krr {} cap {} kp {}\n{}",
-            best.0, t.kh, t.kv, t.k_bank, t.k_rudder, t.k_rudder_rate, t.k_phi_cap, t.k_pitch,
+            best.0,
+            t.kh,
+            t.kv,
+            t.k_bank,
+            t.k_rudder,
+            t.k_rudder_rate,
+            t.k_phi_cap,
+            t.k_pitch,
             score(t).1
         );
     }

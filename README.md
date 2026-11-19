@@ -33,7 +33,7 @@ The white circle is where you're aiming. The crosshair is where the nose points.
 
 ## Flight model
 
-The default flight model is the Yak-3. Planes are flown with physics: lift, drag, thrust, gravity, and stalls once the angle of attack is too high. Mouse aim works through an instructor that keeps you out of a stall. Holding a pitch, roll or yaw key overrides it, so you can stall the plane yourself.
+The default flight model is the Yak-3. Planes are flown with physics: lift, drag, thrust, gravity, and stalls once the angle of attack is too high. Mouse aim works through an instructor that keeps you out of a stall. Near the nose it flies coordinated turns: bank, pitch and rudder are worked out together from one wanted turn, so small aim moves don't make the crosshair jump. Holding a pitch, roll or yaw key overrides it, so you can stall the plane yourself.
 
 A preset is a stat card. It has power per engine (hp, or kgf of thrust for jets), the number of engines, climb rate, top speed, and the max sustained and max instantaneous turn rates, each in degrees per second at a speed (the Yak-3: 23.59 deg/s at 175 kt sustained, 41.1 deg/s at 302 kt instantaneous). The sustained turn sets the induced drag. The instantaneous turn sets the G limit and, unless you enter one, the max lift coefficient. Top speed altitude, mass, wing area, max lift coefficient and roll rate are optional: leave them blank and the game fills them in from typical values for the engine type and power, and the editor lists what it picked. The game solves for drag, induced drag and propeller efficiency so the plane reproduces those numbers. The editor shows a "model check" with the figures the solved model actually reaches.
 
@@ -41,7 +41,9 @@ Save as many presets as you like. Saving under a new name makes a new preset and
 
 ## Weapons
 
-A gun preset has a name, muzzle velocity (m/s), projectile mass (kg) and fire rate (rounds per minute). Caliber and spread are optional. A blank caliber is estimated from the projectile mass, and spread defaults to 2 mils. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. The built-in gun is the 20 mm ShVAK (800 m/s, 0.1 kg, 800 rpm), and it can't be changed or deleted. The 12.7 mm UBS comes as a second preset.
+A gun preset has a name, muzzle velocity (m/s), projectile mass (kg), fire rate (rounds per minute) and tracer color. Caliber and spread are optional. A blank caliber is estimated from the projectile mass, and spread defaults to 2 mils. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. Tracers glow, get bigger with caliber, and disappear after 2.5 miles (about 4 km).
+
+Gunshots and hits have sounds made in code, with no sound files. Small, fast rounds crack higher and big, slow ones boom lower. The built-in gun is the 20 mm ShVAK (800 m/s, 0.1 kg, 800 rpm), and it can't be changed or deleted. The 12.7 mm UBS comes as a second preset.
 
 Each aircraft preset has a loadout with four mounting spots, and each spot can carry a different gun preset:
 
@@ -50,7 +52,7 @@ Each aircraft preset has a loadout with four mounting spots, and each spot can c
 - Belly: up to 4 under the fuselage.
 - Wings: up to 4 per wing (8 in total).
 
-The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. Nose guns fire straight ahead. Wing and belly guns are angled to meet at 400 m. The Yak-3 carries a ShVAK in the spinner and two UBS above it. Changing its loadout saves a copy.
+The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. Nose guns fire straight ahead. Wing and belly guns are angled to meet at the loadout's convergence range, 400 m by default, which you set with - and + on the Weapons page (100 to 1500 m, in 50 m steps). The Yak-3 carries a ShVAK in the spinner and two UBS above it. Changing its loadout saves a copy.
 
 ## Layout
 
@@ -62,6 +64,7 @@ The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. 
 - `src/world.rs` sets up the lighting, ground and buildings.
 - `src/settings.rs` holds units, sensitivity and key bindings, and saves them.
 - `src/menu.rs` is the pause menu.
+- `src/sound.rs` makes the gunshot and hit sounds.
 - `src/weapons.rs` holds gun presets, loadouts and mount positions, firing, ballistics and hit detection.
 - `assets/models/airplane.glb` is the aircraft model. It's scaled 1.33x in code to roughly match a real Yak-3.
 

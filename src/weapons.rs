@@ -2,6 +2,8 @@
 //! fire rate), where they're mounted on each aircraft preset, the gun models
 //! on the planes, firing, bullet flight and hits on the target.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,7 @@ use crate::GameState;
 use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
 use crate::settings::Settings;
+use crate::sound::{self, Sounds};
 use crate::target::Target;
 
 /// Path of the gun model, relative to `assets/`.
@@ -35,6 +38,63 @@ pub struct GunCard {
     pub caliber: Option<f32>,
     /// Optional: dispersion, mils (1 mil = 1 m at 1 km).
     pub spread: Option<f32>,
+    /// Color of the tracer.
+    pub tracer: TracerColor,
+}
+
+/// Tracer colors to pick from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TracerColor {
+    Red,
+    #[default]
+    Orange,
+    Yellow,
+    Green,
+    White,
+    Blue,
+    Purple,
+}
+
+impl TracerColor {
+    pub const ALL: [TracerColor; 7] = [
+        TracerColor::Red,
+        TracerColor::Orange,
+        TracerColor::Yellow,
+        TracerColor::Green,
+        TracerColor::White,
+        TracerColor::Blue,
+        TracerColor::Purple,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TracerColor::Red => "Red",
+            TracerColor::Orange => "Orange",
+            TracerColor::Yellow => "Yellow",
+            TracerColor::Green => "Green",
+            TracerColor::White => "White",
+            TracerColor::Blue => "Blue",
+            TracerColor::Purple => "Purple",
+        }
+    }
+
+    /// Display color (for menus).
+    pub fn color(self) -> Color {
+        let c = self.rgb();
+        Color::srgb(c.x, c.y, c.z)
+    }
+
+    fn rgb(self) -> Vec3 {
+        match self {
+            TracerColor::Red => Vec3::new(1.0, 0.22, 0.12),
+            TracerColor::Orange => Vec3::new(1.0, 0.55, 0.15),
+            TracerColor::Yellow => Vec3::new(1.0, 0.92, 0.3),
+            TracerColor::Green => Vec3::new(0.35, 1.0, 0.35),
+            TracerColor::White => Vec3::new(1.0, 0.97, 0.9),
+            TracerColor::Blue => Vec3::new(0.35, 0.6, 1.0),
+            TracerColor::Purple => Vec3::new(0.85, 0.4, 1.0),
+        }
+    }
 }
 
 impl Default for GunCard {
@@ -59,6 +119,7 @@ impl GunCard {
             fire_rate: 800.0,
             caliber: Some(20.0),
             spread: None,
+            tracer: TracerColor::Orange,
         }
     }
 
@@ -71,6 +132,7 @@ impl GunCard {
             fire_rate: 1050.0,
             caliber: Some(12.7),
             spread: None,
+            tracer: TracerColor::Red,
         }
     }
 
@@ -192,6 +254,8 @@ pub struct Loadout {
     pub nose_ring: Mount,
     pub belly: Mount,
     pub wings: Mount,
+    /// Range in meters where wing and belly guns are angled to meet.
+    pub convergence: f32,
 }
 
 impl Default for Loadout {
@@ -202,6 +266,7 @@ impl Default for Loadout {
             nose_ring: Mount::new("UBS 12.7 mm", 2),
             belly: Mount::new(BUILTIN_GUN, 0),
             wings: Mount::new("UBS 12.7 mm", 0),
+            convergence: CONVERGENCE,
         }
     }
 }
@@ -366,7 +431,8 @@ struct ShownGuns(Vec<(Vec3, f32)>);
 #[derive(Resource)]
 struct WeaponAssets {
     tracer_mesh: Handle<Mesh>,
-    tracer_material: Handle<StandardMaterial>,
+    /// Per color: the bright core and the soft glow around it.
+    tracer_materials: HashMap<TracerColor, (Handle<StandardMaterial>, Handle<StandardMaterial>)>,
     spark_mesh: Handle<Mesh>,
     spark_material: Handle<StandardMaterial>,
     gun_scene: Handle<WorldAsset>,
@@ -380,12 +446,31 @@ fn setup_assets(
 ) {
     commands.insert_resource(WeaponAssets {
         tracer_mesh: meshes.add(Cuboid::new(TRACER_WIDTH, TRACER_WIDTH, 1.0)),
-        tracer_material: materials.add(StandardMaterial {
-            base_color: Color::srgb(1.0, 0.75, 0.3),
-            emissive: LinearRgba::rgb(6.0, 2.6, 0.6),
-            unlit: true,
-            ..default()
-        }),
+        // A hot, nearly white core inside a soft additive glow of the
+        // tracer's color.
+        tracer_materials: TracerColor::ALL
+            .iter()
+            .map(|c| {
+                let rgb = c.rgb();
+                let core = rgb.lerp(Vec3::ONE, 0.45);
+                (
+                    *c,
+                    (
+                        materials.add(StandardMaterial {
+                            base_color: Color::srgb(core.x, core.y, core.z),
+                            unlit: true,
+                            ..default()
+                        }),
+                        materials.add(StandardMaterial {
+                            base_color: Color::srgba(rgb.x, rgb.y, rgb.z, TRACER_GLOW),
+                            unlit: true,
+                            alpha_mode: AlphaMode::Add,
+                            ..default()
+                        }),
+                    ),
+                )
+            })
+            .collect(),
         spark_mesh: meshes.add(Sphere::new(0.35)),
         spark_material: materials.add(StandardMaterial {
             base_color: Color::srgb(1.0, 0.9, 0.5),
@@ -456,7 +541,11 @@ struct GunState {
 
 #[derive(Component, Default)]
 struct Guns {
+    /// When each gun preset's sound last played (real seconds).
+    last_sound: HashMap<String, f32>,
     guns: Vec<GunState>,
+    /// Where wing and belly guns meet, m.
+    convergence: f32,
     /// The loadout and gun cards this was built from.
     built_from: Option<(Loadout, Vec<GunCard>)>,
 }
@@ -479,6 +568,8 @@ fn sync_player_guns(
     }
     let correction = crate::model_correction();
     let built = Guns {
+        last_sound: HashMap::new(),
+        convergence: loadout.convergence.clamp(CONVERGENCE_MIN, CONVERGENCE_MAX),
         guns: loadout
             .guns()
             .into_iter()
@@ -499,15 +590,22 @@ fn sync_player_guns(
     }
 }
 
-/// Wing and belly guns are angled to meet at this range; nose guns fire
-/// straight ahead.
+/// Default range where wing and belly guns meet; nose guns fire straight
+/// ahead.
 pub const CONVERGENCE: f32 = 400.0;
+/// Limits and step for the convergence setting, m.
+pub const CONVERGENCE_MIN: f32 = 100.0;
+pub const CONVERGENCE_MAX: f32 = 1500.0;
+pub const CONVERGENCE_STEP: f32 = 50.0;
 
 #[derive(Component)]
 struct Bullet {
     position: Vec3,
     velocity: Vec3,
     age: f32,
+    /// Distance flown, m.
+    traveled: f32,
+    size: f32,
     drag: f32,
 }
 
@@ -552,6 +650,9 @@ fn trigger_held(mouse: &ButtonInput<MouseButton>, cursor: &CursorOptions) -> boo
 fn fire_guns(
     mut commands: Commands,
     time: Res<Time>,
+    real: Res<Time<Real>>,
+    mut sounds: ResMut<Sounds>,
+    mut sources: ResMut<Assets<AudioSource>>,
     mouse: Res<ButtonInput<MouseButton>>,
     cursor: Single<&CursorOptions>,
     weapon_assets: Res<WeaponAssets>,
@@ -564,9 +665,13 @@ fn fire_guns(
     let (tf, aircraft, mut guns) = player.into_inner();
     let firing = trigger_held(&mouse, &cursor);
     let forward = tf.forward().as_vec3();
-    let converge_at = tf.translation + forward * CONVERGENCE;
+    let converge_at = tf.translation + forward * guns.convergence;
     let up = tf.up().as_vec3();
     let right = tf.right().as_vec3();
+    let now = real.elapsed_secs();
+    // Guns of the same kind share one sound per frame (louder for more of
+    // them), so a full battery doesn't stack dozens of sounds.
+    let mut fired: Vec<(GunCard, u32)> = vec![];
     for gun in &mut guns.guns {
         if !firing {
             // Ready to fire again once the gun has cycled.
@@ -586,28 +691,66 @@ fn fire_guns(
             // A shot due partway through the frame has already flown a bit.
             let early = -gun.cooldown;
             let position = muzzle + velocity * early;
+            let size = tracer_size(gun.card.caliber_mm());
+            let (core, glow) = weapon_assets
+                .tracer_materials
+                .get(&gun.card.tracer)
+                .cloned()
+                .unwrap_or_default();
             commands.spawn((
                 Bullet {
                     position,
                     velocity,
                     age: early,
+                    traveled: 0.0,
                     drag: gun.card.drag_factor(),
+                    size,
                 },
-                tracer_transform(position, velocity, camera.translation()),
+                tracer_transform(position, velocity, camera.translation(), size),
                 Mesh3d(weapon_assets.tracer_mesh.clone()),
-                MeshMaterial3d(weapon_assets.tracer_material.clone()),
+                MeshMaterial3d(core),
+                children![(
+                    Mesh3d(weapon_assets.tracer_mesh.clone()),
+                    MeshMaterial3d(glow),
+                    Transform::from_scale(Vec3::new(3.0, 3.0, 1.15)),
+                )],
             ));
             stats.shots += 1;
             gun.cooldown += gun.card.interval();
+            match fired.iter_mut().find(|(c, _)| *c == gun.card) {
+                Some((_, n)) => *n += 1,
+                None => fired.push((gun.card.clone(), 1)),
+            }
         }
     }
+    for (card, count) in fired {
+        let key = card.name.clone();
+        let last = guns.last_sound.get(&key).copied().unwrap_or(f32::MIN);
+        // Every shot up to about 25 a second; faster guns blend together.
+        if now - last < card.interval().max(0.04) * 0.95 {
+            continue;
+        }
+        guns.last_sound.insert(key, now);
+        let sound = sounds.gunshot(&mut sources, card.caliber_mm(), card.muzzle_velocity);
+        let loud = (card.caliber_mm() / 20.0).clamp(0.4, 1.6).sqrt();
+        let volume = 0.22 * loud * (count as f32).powf(0.35);
+        let speed = 1.0 + rng.next() * 0.04;
+        sound::play(&mut commands, sound, volume, speed);
+    }
+}
+
+/// Tracer thickness for a caliber, relative to a 20 mm round.
+fn tracer_size(caliber_mm: f32) -> f32 {
+    (caliber_mm / 20.0).clamp(0.3, 3.0)
 }
 
 /// A tracer is drawn as a glowing streak trailing the round. Far away it's
 /// widened to stay about two pixels wide, like tracers in the game.
-fn tracer_transform(position: Vec3, velocity: Vec3, camera: Vec3) -> Transform {
+fn tracer_transform(position: Vec3, velocity: Vec3, camera: Vec3, size: f32) -> Transform {
     let dist = position.distance(camera);
-    let width = (dist * 0.0028 / TRACER_WIDTH).max(1.0);
+    // Close up: true to caliber. Far off: a minimum on-screen width, still
+    // thicker for bigger rounds.
+    let width = size.max(dist * 0.0022 * size.sqrt() / TRACER_WIDTH);
     let len = (velocity.length() * 0.012)
         .clamp(2.0, 10.0)
         .max(dist * 0.02);
@@ -617,7 +760,10 @@ fn tracer_transform(position: Vec3, velocity: Vec3, camera: Vec3) -> Transform {
         .with_scale(Vec3::new(width, width, len))
 }
 
+/// Tracer thickness for a 20 mm round, m.
 const TRACER_WIDTH: f32 = 0.12;
+/// Strength of the glow around a tracer (0 to 1).
+const TRACER_GLOW: f32 = 0.35;
 
 /// The target's pose at the start of the frame, so bullets can be tested
 /// against where it actually was during the frame.
@@ -688,7 +834,10 @@ fn lerp_pose(a: &Transform, b: &Transform, t: f32) -> Transform {
     }
 }
 
-const BULLET_LIFETIME: f32 = 4.5;
+/// Rounds are removed after flying this far: 2.5 miles.
+pub const BULLET_RANGE: f32 = 2.5 * 1609.344;
+/// And in any case after this long, s.
+const BULLET_LIFETIME: f32 = 15.0;
 const BULLET_SUBSTEPS: usize = 4;
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -698,6 +847,8 @@ fn fly_bullets(
     real: Res<Time<Real>>,
     weapon_assets: Res<WeaponAssets>,
     mut stats: ResMut<HitStats>,
+    sounds: Res<Sounds>,
+    mut last_hit_sound: Local<f32>,
     mut bullets: Query<(Entity, &mut Bullet, &mut Transform), Without<Target>>,
     targets: Query<(Entity, &Transform, &PrevPose), With<Target>>,
     camera: Single<&GlobalTransform, With<Camera3d>>,
@@ -719,6 +870,7 @@ fn fly_bullets(
             let accel = Vec3::NEG_Y * 9.81 - v * v.length() * rho * bullet.drag;
             bullet.velocity += accel * h;
             pos += bullet.velocity * h;
+            bullet.traveled += (pos - start).length();
 
             for (target, prev, now) in &poses {
                 let pose_a = lerp_pose(prev, now, i as f32 / BULLET_SUBSTEPS as f32);
@@ -732,6 +884,12 @@ fn fly_bullets(
                 if let Some(t) = hit {
                     stats.hits += 1;
                     stats.last_hit = real.elapsed_secs();
+                    // A hit sound, up to about 15 a second.
+                    if stats.last_hit - *last_hit_sound > 0.065 {
+                        *last_hit_sound = stats.last_hit;
+                        let speed = 0.92 + 0.16 * ((stats.hits * 7919) % 100) as f32 / 100.0;
+                        sound::play(&mut commands, sounds.hit(), 0.5, speed);
+                    }
                     // Spark where it struck, riding along with the target.
                     let local = crate::model_correction().transform_point(a.lerp(b, t));
                     commands.entity(*target).with_children(|p| {
@@ -749,11 +907,11 @@ fn fly_bullets(
         }
         bullet.position = pos;
         bullet.age += dt;
-        if bullet.age > BULLET_LIFETIME || pos.y < 0.0 {
+        if bullet.traveled > BULLET_RANGE || bullet.age > BULLET_LIFETIME || pos.y < 0.0 {
             commands.entity(entity).despawn();
             continue;
         }
-        *tf = tracer_transform(pos, bullet.velocity, eye);
+        *tf = tracer_transform(pos, bullet.velocity, eye, bullet.size);
     }
 }
 
