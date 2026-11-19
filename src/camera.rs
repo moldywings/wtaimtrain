@@ -114,9 +114,8 @@ fn update_mouse_aim(
     if cursor.grab_mode == CursorGrabMode::None {
         return;
     }
-    // Slower aim when zoomed, so the circle moves the same amount on screen.
-    let fov_scale = current_fov(camera.zoom) / NORMAL_FOV;
-    let delta = motion.delta * settings.aim_per_pixel() * fov_scale;
+    // Same sensitivity zoomed or not.
+    let delta = motion.delta * settings.aim_per_pixel();
     if camera.free_looking {
         camera.look_yaw = (camera.look_yaw - delta.x).clamp(-3.0, 3.0);
         camera.look_pitch = (camera.look_pitch - delta.y).clamp(-1.4, 1.4);

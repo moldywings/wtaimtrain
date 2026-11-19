@@ -1,0 +1,785 @@
+//! Aircraft flight model.
+//!
+//! An [`AircraftCard`] holds the figures you'd read off a stat card: engine
+//! power (or thrust), engine count, climb rate, sustained turn time and top
+//! speed, plus a few optional extras. [`FlightModel::from_card`] fills in the
+//! blanks (drag, induced drag and propeller efficiency) by solving for the
+//! values that reproduce those figures, and [`step`] flies the result with
+//! lift, drag, thrust, gravity and stalls.
+//!
+//! Axes follow Bevy: forward is -Z, up is +Y, right is +X.
+
+use bevy::math::{Quat, Vec3};
+use serde::{Deserialize, Serialize};
+
+pub const G: f32 = 9.81;
+const KGF: f32 = 9.80665;
+const HP: f32 = 745.7;
+
+// ---------------------------------------------------------------------------
+// Stat card
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineKind {
+    /// Piston engine and propeller; `power` is horsepower per engine.
+    Prop,
+    /// Jet engine; `power` is thrust in kgf per engine.
+    Jet,
+}
+
+/// The figures a player enters. Everything is stored in SI units.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AircraftCard {
+    pub name: String,
+    pub engine: EngineKind,
+    /// Horsepower (prop) or kgf of thrust (jet), per engine.
+    pub power: f32,
+    pub engines: u32,
+    /// Best climb rate at sea level, m/s.
+    pub climb_rate: f32,
+    /// Time for a full 360° sustained turn at sea level, seconds.
+    pub turn_time: f32,
+    /// Top speed, m/s, reached at `top_speed_altitude`.
+    pub top_speed: f32,
+    // Optional extras with sensible defaults.
+    /// Altitude of the top speed figure, m.
+    pub top_speed_altitude: f32,
+    /// Typical combat mass, kg.
+    pub mass: f32,
+    /// Wing area, m².
+    pub wing_area: f32,
+    /// Maximum lift coefficient (sets stall speed).
+    pub cl_max: f32,
+    /// Full-stick roll rate at 400 km/h, degrees per second.
+    pub roll_rate: f32,
+}
+
+impl Default for AircraftCard {
+    fn default() -> Self {
+        AircraftCard::yak3()
+    }
+}
+
+impl AircraftCard {
+    /// The default flight model, from War Thunder's Yak-3 figures.
+    pub fn yak3() -> Self {
+        AircraftCard {
+            name: "Yak-3".into(),
+            engine: EngineKind::Prop,
+            power: 1320.0,
+            engines: 1,
+            climb_rate: 4193.0 * 0.3048 / 60.0, // 4193 ft/min
+            turn_time: 17.4,
+            top_speed: 352.0 * 0.514_444, // 352 kt
+            top_speed_altitude: 4000.0,
+            mass: 2464.0,
+            wing_area: 14.83, // from 166.17 kg/m² wing loading
+            cl_max: 1.33,
+            roll_rate: 140.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Atmosphere
+// ---------------------------------------------------------------------------
+
+/// Air density (kg/m³) at altitude `h` meters, International Standard Atmosphere.
+pub fn air_density(h: f32) -> f32 {
+    let h = h.clamp(0.0, 11_000.0);
+    let t = 288.15 - 0.0065 * h;
+    1.225 * (t / 288.15).powf(4.2559)
+}
+
+// ---------------------------------------------------------------------------
+// Derived model
+// ---------------------------------------------------------------------------
+
+/// Everything the physics needs, derived from a card.
+#[derive(Clone, Debug)]
+pub struct FlightModel {
+    pub name: String,
+    pub engine: EngineKind,
+    pub mass: f32,
+    pub wing_area: f32,
+    /// Total shaft power (W) for props, total thrust (N) for jets.
+    pub power: f32,
+    /// Propeller peak efficiency (props) or thrust multiplier (jets). Solved.
+    pub efficiency: f32,
+    /// Static thrust cap for props, N.
+    pub static_thrust: f32,
+    /// Altitude up to which engine output holds (supercharger), m.
+    pub critical_altitude: f32,
+    /// Zero-lift drag coefficient. Solved.
+    pub cd0: f32,
+    /// Induced drag factor (CD = cd0 + k·CL²). Solved.
+    pub k: f32,
+    /// Lift curve slope, per radian.
+    pub cl_alpha: f32,
+    pub cl_max: f32,
+    /// Angle of attack at which the wing stalls, radians.
+    pub alpha_stall: f32,
+    /// Full-stick roll rate at the reference speed, rad/s.
+    pub roll_rate: f32,
+    /// Structural/elevator G limit.
+    pub g_limit: f32,
+    /// How well the solved model matches the card (predicted figures).
+    pub check: Performance,
+}
+
+/// Predicted performance figures, for comparing against the card.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Performance {
+    /// Top speed at the card's altitude, m/s.
+    pub top_speed: f32,
+    /// Top speed at sea level, m/s.
+    pub top_speed_sea_level: f32,
+    /// Best sea-level climb rate, m/s.
+    pub climb_rate: f32,
+    /// Best sustained 360° turn time at sea level, s.
+    pub turn_time: f32,
+    /// 1 G stall speed at sea level, m/s.
+    pub stall_speed: f32,
+}
+
+const ROLL_REF_SPEED: f32 = 400.0 / 3.6;
+const ASPECT_RATIO: f32 = 6.0;
+
+impl FlightModel {
+    pub fn from_card(card: &AircraftCard) -> FlightModel {
+        let engines = card.engines.max(1) as f32;
+        let (power, static_thrust, critical_altitude) = match card.engine {
+            EngineKind::Prop => {
+                let hp = card.power.max(1.0) * engines;
+                // Roughly 0.8 kgf of static thrust per horsepower.
+                (hp * HP, 0.8 * KGF * hp, card.top_speed_altitude.max(0.0))
+            }
+            EngineKind::Jet => {
+                let t = card.power.max(1.0) * engines * KGF;
+                (t, t, 0.0)
+            }
+        };
+        let cl_alpha =
+            std::f32::consts::TAU * ASPECT_RATIO / (2.0 + (ASPECT_RATIO.powi(2) + 4.0).sqrt());
+        let cl_max = card.cl_max.clamp(0.6, 2.5);
+
+        let mut m = FlightModel {
+            name: card.name.clone(),
+            engine: card.engine,
+            mass: card.mass.max(100.0),
+            wing_area: card.wing_area.max(1.0),
+            power,
+            efficiency: 0.8,
+            static_thrust,
+            critical_altitude,
+            cd0: 0.02,
+            k: 1.0 / (std::f32::consts::PI * 0.8 * ASPECT_RATIO),
+            cl_alpha,
+            cl_max,
+            alpha_stall: cl_max / cl_alpha,
+            roll_rate: card.roll_rate.max(10.0).to_radians(),
+            g_limit: 11.0,
+            check: Performance::default(),
+        };
+        m.solve(card);
+        m.check = m.performance(card.top_speed_altitude);
+        m
+    }
+
+    /// Find efficiency, cd0 and k so the model hits the card's top speed,
+    /// climb rate and turn time.
+    fn solve(&mut self, card: &AircraftCard) {
+        let target_climb = card.climb_rate.max(0.5);
+        let target_turn = std::f32::consts::TAU / card.turn_time.max(5.0);
+        for _ in 0..30 {
+            // Efficiency from climb rate (cd0 follows from top speed).
+            self.efficiency = bisect(0.2, 1.5, |e| {
+                let mut m = self.clone();
+                m.efficiency = e;
+                m.fit_cd0(card);
+                m.best_climb(0.0) - target_climb
+            });
+            self.fit_cd0(card);
+            // Induced drag from sustained turn rate.
+            self.k = bisect(0.01, 0.6, |k| {
+                let mut m = self.clone();
+                m.k = k;
+                m.fit_cd0(card);
+                // More induced drag means a slower turn, so flip the sign.
+                target_turn - m.best_sustained_turn_rate(0.0)
+            });
+            self.fit_cd0(card);
+        }
+    }
+
+    /// Pick cd0 so thrust equals drag at the card's top speed and altitude.
+    fn fit_cd0(&mut self, card: &AircraftCard) {
+        let h = card.top_speed_altitude;
+        let v = card.top_speed.max(30.0);
+        let q = 0.5 * air_density(h) * v * v;
+        let s = self.wing_area;
+        let w = self.mass * G;
+        let induced = self.k * (w / (q * s)).powi(2);
+        self.cd0 = (self.thrust(v, h, 1.0) / (q * s) - induced).max(0.004);
+    }
+
+    /// Engine output at altitude: constant up to the critical altitude, then
+    /// falling with air density.
+    fn altitude_factor(&self, h: f32) -> f32 {
+        match self.engine {
+            EngineKind::Prop => {
+                if h <= self.critical_altitude {
+                    1.0
+                } else {
+                    air_density(h) / air_density(self.critical_altitude)
+                }
+            }
+            EngineKind::Jet => (air_density(h) / 1.225).powf(0.8),
+        }
+    }
+
+    /// Thrust in newtons at airspeed `v`, altitude `h`, throttle 0..=1.
+    pub fn thrust(&self, v: f32, h: f32, throttle: f32) -> f32 {
+        let f = self.altitude_factor(h) * throttle.clamp(0.0, 1.0);
+        match self.engine {
+            EngineKind::Prop => {
+                let v = v.max(1.0);
+                // Propellers are poor at low speed and approach peak efficiency fast.
+                let eta = self.efficiency * (1.0 - (-v / 35.0).exp());
+                let from_power = eta * self.power * f / v;
+                let cap = self.static_thrust * f * (1.0 + v / 120.0);
+                from_power.min(cap)
+            }
+            EngineKind::Jet => self.efficiency * self.power * f,
+        }
+    }
+
+    /// Drag in newtons for level flight at load factor `n`.
+    fn drag(&self, v: f32, h: f32, n: f32) -> f32 {
+        let q = 0.5 * air_density(h) * v * v;
+        let cl = n * self.mass * G / (q * self.wing_area);
+        q * self.wing_area * (self.cd0 + self.k * cl * cl)
+    }
+
+    pub fn stall_speed(&self, h: f32) -> f32 {
+        (2.0 * self.mass * G / (air_density(h) * self.wing_area * self.cl_max)).sqrt()
+    }
+
+    /// Best climb rate (m/s) at altitude `h`.
+    pub fn best_climb(&self, h: f32) -> f32 {
+        let vs = self.stall_speed(h);
+        let mut best = f32::MIN;
+        let mut v = vs * 1.1;
+        while v < 320.0 {
+            let excess = (self.thrust(v, h, 1.0) - self.drag(v, h, 1.0)) * v;
+            best = best.max(excess / (self.mass * G));
+            v += 2.0;
+        }
+        best
+    }
+
+    /// Best sustained turn rate (rad/s) at altitude `h`.
+    pub fn best_sustained_turn_rate(&self, h: f32) -> f32 {
+        let rho = air_density(h);
+        let s = self.wing_area;
+        let w = self.mass * G;
+        let mut best = 0.0f32;
+        let mut v = self.stall_speed(h);
+        while v < 320.0 {
+            let q = 0.5 * rho * v * v;
+            let t = self.thrust(v, h, 1.0);
+            let cl_thrust = ((t / (q * s) - self.cd0) / self.k).max(0.0).sqrt();
+            let cl = cl_thrust.min(self.cl_max);
+            let n = (cl * q * s / w).min(self.g_limit);
+            if n > 1.0 {
+                best = best.max(G * (n * n - 1.0).sqrt() / v);
+            }
+            v += 1.0;
+        }
+        best
+    }
+
+    /// Level top speed (m/s) at altitude `h`.
+    pub fn top_speed(&self, h: f32) -> f32 {
+        let lo = self.stall_speed(h) * 1.3;
+        bisect(lo, 400.0, |v| self.thrust(v, h, 1.0) - self.drag(v, h, 1.0))
+    }
+
+    pub fn performance(&self, top_speed_altitude: f32) -> Performance {
+        let turn = self.best_sustained_turn_rate(0.0);
+        Performance {
+            top_speed: self.top_speed(top_speed_altitude),
+            top_speed_sea_level: self.top_speed(0.0),
+            climb_rate: self.best_climb(0.0),
+            turn_time: if turn > 0.0 {
+                std::f32::consts::TAU / turn
+            } else {
+                f32::INFINITY
+            },
+            stall_speed: self.stall_speed(0.0),
+        }
+    }
+
+    /// Lift coefficient at angle of attack `alpha`, with a stall.
+    pub fn lift_coefficient(&self, alpha: f32) -> f32 {
+        let a = alpha.abs();
+        let linear = self.cl_alpha * a;
+        // After the stall the wing behaves more like a flat plate.
+        let post = 1.2 * (2.0 * a).sin() * 0.85;
+        let blend_width = 3f32.to_radians();
+        let cl = if a <= self.alpha_stall {
+            linear
+        } else if a <= self.alpha_stall + blend_width {
+            let t = (a - self.alpha_stall) / blend_width;
+            self.cl_max + (post.min(self.cl_max) - self.cl_max) * t
+        } else {
+            post.min(self.cl_max)
+        };
+        cl.copysign(alpha)
+    }
+
+    pub fn is_stalled(&self, alpha: f32) -> bool {
+        alpha.abs() > self.alpha_stall
+    }
+}
+
+/// Find x in [lo, hi] where f(x) changes sign from negative to positive
+/// (or the nearest end if it doesn't).
+fn bisect(mut lo: f32, mut hi: f32, f: impl Fn(f32) -> f32) -> f32 {
+    let flo = f(lo);
+    let fhi = f(hi);
+    if flo >= 0.0 && fhi >= 0.0 {
+        return lo;
+    }
+    if flo <= 0.0 && fhi <= 0.0 {
+        return hi;
+    }
+    let rising = fhi > flo;
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        let fm = f(mid);
+        if (fm < 0.0) == rising {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+// ---------------------------------------------------------------------------
+// Physics
+// ---------------------------------------------------------------------------
+
+/// Control inputs, each -1..=1. Positive pitch is nose up, positive roll is
+/// right wing down, positive yaw is nose right.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Controls {
+    pub pitch: f32,
+    pub roll: f32,
+    pub yaw: f32,
+    pub throttle: f32,
+}
+
+/// The moving state of one aircraft.
+#[derive(Clone, Copy, Debug)]
+pub struct Body {
+    pub position: Vec3,
+    pub rotation: Quat,
+    /// World velocity, m/s.
+    pub velocity: Vec3,
+    /// Body angular velocity (x pitch up, y yaw left, z roll left), rad/s.
+    pub omega: Vec3,
+    /// Readouts from the last step.
+    pub alpha: f32,
+    pub g_load: f32,
+}
+
+impl Body {
+    pub fn new(position: Vec3, rotation: Quat, speed: f32) -> Body {
+        Body {
+            position,
+            rotation,
+            velocity: rotation * Vec3::NEG_Z * speed,
+            omega: Vec3::ZERO,
+            alpha: 0.0,
+            g_load: 1.0,
+        }
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.velocity.length()
+    }
+
+    pub fn forward(&self) -> Vec3 {
+        self.rotation * Vec3::NEG_Z
+    }
+}
+
+/// Angle of attack and sideslip (radians) from the velocity in body axes.
+pub fn alpha_beta(rotation: Quat, velocity: Vec3) -> (f32, f32) {
+    let vb = rotation.inverse() * velocity;
+    if vb.length_squared() < 1.0 {
+        return (0.0, 0.0);
+    }
+    let alpha = (-vb.y).atan2(-vb.z);
+    let beta = vb.x.atan2(-vb.z);
+    (alpha, beta)
+}
+
+/// How far full elevator can push the angle of attack, as a multiple of the
+/// stall angle. A bit over 1 so you can stall it by yanking at low speed.
+const ELEVATOR_ALPHA: f32 = 1.2;
+const RUDDER_BETA: f32 = 0.12;
+
+/// Advance one aircraft by `dt` seconds. Splits large steps for stability.
+pub fn step(model: &FlightModel, body: &mut Body, controls: &Controls, dt: f32) {
+    let steps = (dt / (1.0 / 240.0)).ceil().max(1.0) as usize;
+    let h = dt / steps as f32;
+    for _ in 0..steps {
+        substep(model, body, controls, h);
+    }
+}
+
+fn substep(m: &FlightModel, b: &mut Body, c: &Controls, dt: f32) {
+    let rho = air_density(b.position.y);
+    let v = b.velocity.length();
+    let q = 0.5 * rho * v * v;
+    let s = m.wing_area;
+    let vhat = if v > 0.1 { b.velocity / v } else { b.forward() };
+    let (alpha, beta) = alpha_beta(b.rotation, b.velocity);
+
+    let up = b.rotation * Vec3::Y;
+    let right = b.rotation * Vec3::X;
+    let fwd = b.rotation * Vec3::NEG_Z;
+
+    // --- Forces ---
+    let cl = m.lift_coefficient(alpha);
+    let stalled = m.is_stalled(alpha);
+    let mut cd = m.cd0 + m.k * cl * cl;
+    if stalled {
+        cd += 1.1 * alpha.sin().powi(2);
+    }
+    cd += 0.5 * beta.sin().powi(2);
+    let lift_dir = (up - vhat * up.dot(vhat)).normalize_or_zero();
+    let side_dir = (right - vhat * right.dot(vhat)).normalize_or_zero();
+    let lift = lift_dir * (q * s * cl);
+    let drag = -vhat * (q * s * cd);
+    let side = side_dir * (-q * s * 0.8 * beta);
+    let thrust = fwd * m.thrust(v, b.position.y, c.throttle);
+    let gravity = Vec3::NEG_Y * (m.mass * G);
+    let accel = (lift + drag + side + thrust + gravity) / m.mass;
+
+    b.g_load = (lift + side + thrust + drag).dot(up) / (m.mass * G);
+    b.alpha = alpha;
+
+    // Rotation of the flight path, so damping acts on the nose relative to
+    // where the plane is going.
+    let accel_perp = accel - vhat * accel.dot(vhat);
+    let path_rate_world = if v > 1.0 {
+        vhat.cross(accel_perp) / v
+    } else {
+        Vec3::ZERO
+    };
+    let path_rate = b.rotation.inverse() * path_rate_world;
+
+    // --- Rotation ---
+    // Control power grows with airspeed: mushy when slow, crisp when fast.
+    let speed_ratio = (v / ROLL_REF_SPEED).clamp(0.0, 2.5);
+    let wn = (4.5 * speed_ratio).max(0.3); // pitch/yaw stiffness, rad/s
+    let zeta = 0.75;
+
+    // Elevator sets an angle of attack to hold, limited so a full pull
+    // can't overstress the airframe at high speed.
+    let alpha_full = ELEVATOR_ALPHA * m.alpha_stall;
+    let alpha_g_limit = if q > 1.0 {
+        m.g_limit * m.mass * G / (q * s * m.cl_alpha)
+    } else {
+        alpha_full
+    };
+    let alpha_max = alpha_full.min(alpha_g_limit);
+    let alpha_cmd = if c.pitch >= 0.0 {
+        c.pitch * alpha_max
+    } else {
+        c.pitch * alpha_max * 0.6
+    };
+    let pitch_acc = wn * wn * (alpha_cmd - alpha) - 2.0 * zeta * wn * (b.omega.x - path_rate.x);
+
+    // Rudder sets a sideslip to hold; the tail weathervanes the nose.
+    let beta_cmd = -c.yaw * RUDDER_BETA;
+    let yaw_acc =
+        -wn * wn * 0.6 * (beta - beta_cmd) - 2.0 * zeta * wn * 0.8 * (b.omega.y - path_rate.y);
+
+    // Roll: first-order response toward a commanded rate that grows with
+    // speed and stiffens at high speed. Stalled wings lose most authority
+    // and tend to drop.
+    let stiffen = 1.0 / (1.0 + ((v - 1.3 * ROLL_REF_SPEED).max(0.0) / 70.0).powi(2));
+    let mut roll_authority = m.roll_rate * speed_ratio.min(1.2) * stiffen;
+    let mut wing_drop = 0.0;
+    if stalled {
+        let depth = ((alpha.abs() - m.alpha_stall) / m.alpha_stall).clamp(0.0, 1.0);
+        roll_authority *= 1.0 - 0.7 * depth;
+        // The wing on the side the plane is slipping toward drops first.
+        let side = if beta.abs() > 0.005 {
+            beta.signum()
+        } else {
+            -b.omega.y.signum()
+        };
+        wing_drop = -side * depth * 2.0 * speed_ratio.max(0.3);
+    }
+    let roll_cmd = -c.roll * roll_authority + wing_drop;
+    let tau = (0.22 / speed_ratio.max(0.2)).clamp(0.12, 0.8);
+    let roll_acc = (roll_cmd - b.omega.z) / tau;
+
+    b.omega += Vec3::new(pitch_acc, yaw_acc, roll_acc) * dt;
+
+    // --- Integrate ---
+    b.velocity += accel * dt;
+    b.position += b.velocity * dt;
+    let w = b.omega;
+    let angle = w.length() * dt;
+    if angle > 1e-7 {
+        b.rotation = (b.rotation * Quat::from_axis_angle(w.normalize(), angle)).normalize();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instructor (mouse aim autopilot)
+// ---------------------------------------------------------------------------
+
+/// Turn toward `aim` (a world direction) the way War Thunder's instructor
+/// does: roll the aim point over the canopy, pull, and level the wings when
+/// the nose is on target. Keeps the angle of attack below the stall.
+pub fn instructor(model: &FlightModel, body: &Body, aim: Vec3) -> Controls {
+    let local = body.rotation.inverse() * aim.normalize_or(Vec3::NEG_Z);
+    let off_nose = local.angle_between(Vec3::NEG_Z);
+    let v = body.speed();
+    let speed_ratio = (v / ROLL_REF_SPEED).clamp(0.2, 2.5);
+
+    // Roll: far off the nose, bank so the aim point sits above the canopy.
+    // Close to the nose, roll the wings level instead.
+    let bank_to_target = local.x.atan2(local.y);
+    let right = body.rotation * Vec3::X;
+    let bank_to_level = right.y.clamp(-1.0, 1.0).asin();
+    let w = smoothstep(0.03, 0.15, off_nose);
+    let roll_err = w * bank_to_target + (1.0 - w) * bank_to_level;
+    // Roll error -> desired roll rate -> stick, with damping on roll rate.
+    let roll_rate_wanted = roll_err * 3.0;
+    let roll_rate_now = -body.omega.z;
+    let full = (model.roll_rate * speed_ratio.min(1.2)).max(0.3);
+    let roll = ((roll_rate_wanted - roll_rate_now * 0.35) / full).clamp(-1.0, 1.0);
+
+    // Pitch: ask for angle of attack in proportion to how far the aim is
+    // above the nose, easing off while still rolling into position.
+    let pitch_err = local.y.atan2(-local.z);
+    let alpha_max = ELEVATOR_ALPHA * model.alpha_stall;
+    let roll_lag = (w * bank_to_target.abs() / 1.2).clamp(0.0, 0.85);
+    let alpha_wanted = (pitch_err * 1.6 - body.omega.x * 0.25) * (1.0 - roll_lag);
+    // Stay just under the stall (the real instructor does the same).
+    let alpha_limit = 0.88 * model.alpha_stall;
+    let pitch = (alpha_wanted.clamp(-0.5 * alpha_limit, alpha_limit) / alpha_max).clamp(-1.0, 1.0);
+
+    // Rudder for fine aiming near the nose.
+    let yaw_err = local.x.atan2(-local.z);
+    let yaw = ((yaw_err * 6.0) * (1.0 - w)).clamp(-1.0, 1.0);
+
+    Controls {
+        pitch,
+        roll,
+        yaw,
+        throttle: 0.0,
+    }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kmh(v: f32) -> f32 {
+        v * 3.6
+    }
+
+    #[test]
+    fn yak3_matches_its_stat_card() {
+        let card = AircraftCard::yak3();
+        let m = FlightModel::from_card(&card);
+        let p = m.check;
+        println!(
+            "eff {:.3} cd0 {:.4} k {:.4} | top {:.0} km/h @4000, {:.0} km/h SL | climb {:.1} m/s | turn {:.1} s | stall {:.0} km/h",
+            m.efficiency,
+            m.cd0,
+            m.k,
+            kmh(p.top_speed),
+            kmh(p.top_speed_sea_level),
+            p.climb_rate,
+            p.turn_time,
+            kmh(p.stall_speed)
+        );
+        assert!((p.top_speed - card.top_speed).abs() < 3.0, "top speed");
+        assert!((p.climb_rate - card.climb_rate).abs() < 0.5, "climb");
+        assert!((p.turn_time - card.turn_time).abs() < 0.5, "turn time");
+        assert!(m.cd0 > 0.01 && m.cd0 < 0.05, "cd0 plausible");
+    }
+
+    /// Fly the full simulation (not just the formulas) and check the
+    /// emergent numbers.
+    #[test]
+    fn simulated_yak3_hits_top_speed_and_climb() {
+        let card = AircraftCard::yak3();
+        let m = FlightModel::from_card(&card);
+        let full = Controls {
+            throttle: 1.0,
+            ..Default::default()
+        };
+
+        // Level flight at 4000 m: hold altitude with a simple autopilot.
+        let mut b = Body::new(Vec3::new(0.0, 4000.0, 0.0), Quat::IDENTITY, 150.0);
+        for _ in 0..(240 * 120) {
+            let mut c = instructor(
+                &m,
+                &b,
+                Vec3::new(0.0, (4000.0 - b.position.y) * 0.002, -1.0),
+            );
+            c.throttle = full.throttle;
+            step(&m, &mut b, &c, 1.0 / 240.0);
+        }
+        println!(
+            "sim top speed {:.0} km/h at {:.0} m",
+            kmh(b.speed()),
+            b.position.y
+        );
+        assert!((b.speed() - card.top_speed).abs() < 6.0, "sim top speed");
+
+        // Climb: hold the best climb speed and measure vertical speed.
+        let vy_best = card.climb_rate;
+        let mut best = 0.0f32;
+        for target_kmh in [240.0, 270.0, 300.0, 330.0] {
+            let target = target_kmh / 3.6;
+            let mut b = Body::new(Vec3::new(0.0, 300.0, 0.0), Quat::IDENTITY, target);
+            let mut pitch_cmd = 0.0f32;
+            let mut climbs = vec![];
+            for i in 0..(240 * 40) {
+                // Pitch the aim up or down to hold speed.
+                pitch_cmd = (pitch_cmd + (b.speed() - target) * 0.00002).clamp(-0.2, 0.6);
+                let aim = Quat::from_rotation_x(pitch_cmd) * Vec3::NEG_Z;
+                let mut c = instructor(&m, &b, aim);
+                c.throttle = 1.0;
+                step(&m, &mut b, &c, 1.0 / 240.0);
+                if i > 240 * 25 {
+                    climbs.push(b.velocity.y);
+                }
+            }
+            let avg = climbs.iter().sum::<f32>() / climbs.len() as f32;
+            best = best.max(avg);
+        }
+        println!("sim best climb {:.1} m/s (card {:.1})", best, vy_best);
+        assert!(best > vy_best * 0.8 && best < vy_best * 1.15, "sim climb");
+    }
+
+    #[test]
+    fn instructor_turns_onto_aim_without_stalling() {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 120.0);
+        let aim = Quat::from_rotation_y(2.0) * Vec3::NEG_Z; // 115° left
+        let mut stalled_frames = 0;
+        for _ in 0..(240 * 12) {
+            let mut c = instructor(&m, &b, aim);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, 1.0 / 240.0);
+            if m.is_stalled(b.alpha) {
+                stalled_frames += 1;
+            }
+        }
+        let err = b.forward().angle_between(aim).to_degrees();
+        println!("nose error after 12 s: {err:.2}°, stalled frames {stalled_frames}");
+        assert!(err < 2.0, "nose on aim");
+        assert_eq!(stalled_frames, 0, "instructor never stalls");
+    }
+
+    #[test]
+    fn full_aft_stick_at_low_speed_stalls() {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 60.0);
+        let c = Controls {
+            pitch: 1.0,
+            throttle: 0.3,
+            ..Default::default()
+        };
+        let mut stalled = false;
+        for _ in 0..(240 * 3) {
+            step(&m, &mut b, &c, 1.0 / 240.0);
+            stalled |= m.is_stalled(b.alpha);
+        }
+        assert!(stalled, "yanking at 216 km/h should stall");
+    }
+
+    #[test]
+    fn full_aft_stick_at_high_speed_is_g_limited() {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 170.0);
+        let c = Controls {
+            pitch: 1.0,
+            throttle: 1.0,
+            ..Default::default()
+        };
+        let mut peak = 0.0f32;
+        for _ in 0..(240 * 2) {
+            step(&m, &mut b, &c, 1.0 / 240.0);
+            peak = peak.max(b.g_load);
+        }
+        println!("peak G at 612 km/h pull: {peak:.1}");
+        assert!(peak > 6.0 && peak < m.g_limit + 1.0);
+    }
+
+    #[test]
+    fn roll_rate_builds_up_rather_than_snapping() {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, ROLL_REF_SPEED);
+        let c = Controls {
+            roll: 1.0,
+            throttle: 0.8,
+            ..Default::default()
+        };
+        step(&m, &mut b, &c, 0.05);
+        let early = -b.omega.z;
+        for _ in 0..(240 * 2) {
+            step(&m, &mut b, &c, 1.0 / 240.0);
+        }
+        let steady = -b.omega.z;
+        println!(
+            "roll rate after 50 ms {:.0}°/s, steady {:.0}°/s",
+            early.to_degrees(),
+            steady.to_degrees()
+        );
+        assert!(early < steady * 0.4);
+        assert!((steady.to_degrees() - 140.0).abs() < 25.0);
+    }
+
+    #[test]
+    fn jet_card_solves() {
+        let card = AircraftCard {
+            name: "Jet".into(),
+            engine: EngineKind::Jet,
+            power: 2700.0,
+            engines: 1,
+            climb_rate: 45.0,
+            turn_time: 22.0,
+            top_speed: 1050.0 / 3.6,
+            top_speed_altitude: 0.0,
+            mass: 4900.0,
+            wing_area: 20.6,
+            cl_max: 1.2,
+            roll_rate: 150.0,
+        };
+        let m = FlightModel::from_card(&card);
+        println!("jet {:?}", m.check);
+        assert!((m.check.top_speed - card.top_speed).abs() < 5.0);
+    }
+}

@@ -6,6 +6,7 @@
 
 mod camera;
 mod flight;
+mod flight_model;
 mod hud;
 mod menu;
 mod settings;

@@ -1,10 +1,13 @@
-//! Player settings: units, mouse sensitivity and key bindings. Saved to
-//! `settings.json` in the folder the game is run from.
+//! Player settings: units, mouse sensitivity, key bindings, crosshair and
+//! aircraft presets. Saved to `settings.json` in the folder the game is run
+//! from.
 
 use std::collections::BTreeMap;
 
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
+
+use crate::flight_model::AircraftCard;
 
 const SETTINGS_FILE: &str = "settings.json";
 
@@ -53,6 +56,40 @@ impl Units {
             Units::Metric => format!("{:.0} km/h", mps * 3.6),
             Units::Imperial => format!("{:.0} mph", mps * 2.236_936),
             Units::Nautical => format!("{:.0} kn", mps * 1.943_844),
+        }
+    }
+
+    /// Format a target range given in meters (km, mi or nmi).
+    pub fn range(self, m: f32) -> String {
+        match self {
+            Units::Metric => format!("{:.2} km", m / 1000.0),
+            Units::Imperial => format!("{:.2} mi", m / 1609.344),
+            Units::Nautical => format!("{:.2} nmi", m / 1852.0),
+        }
+    }
+
+    /// Speed unit for editing, with the factor from m/s.
+    pub fn speed_unit(self) -> (&'static str, f32) {
+        match self {
+            Units::Metric => ("km/h", 3.6),
+            Units::Imperial => ("mph", 2.236_936),
+            Units::Nautical => ("kt", 1.943_844),
+        }
+    }
+
+    /// Climb rate unit for editing, with the factor from m/s.
+    pub fn climb_unit(self) -> (&'static str, f32) {
+        match self {
+            Units::Metric => ("m/s", 1.0),
+            Units::Imperial | Units::Nautical => ("ft/min", 196.850_4),
+        }
+    }
+
+    /// Altitude unit for editing, with the factor from meters.
+    pub fn altitude_unit(self) -> (&'static str, f32) {
+        match self {
+            Units::Metric => ("m", 1.0),
+            Units::Imperial | Units::Nautical => ("ft", 3.280_84),
         }
     }
 
@@ -126,6 +163,39 @@ impl Action {
     }
 }
 
+/// Gun reticle styles, matching War Thunder's options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Crosshair {
+    #[default]
+    Cross,
+    Circle,
+    CircleDot,
+    Dot,
+    SmallCross,
+}
+
+impl Crosshair {
+    pub fn next(self) -> Self {
+        match self {
+            Crosshair::Cross => Crosshair::Circle,
+            Crosshair::Circle => Crosshair::CircleDot,
+            Crosshair::CircleDot => Crosshair::Dot,
+            Crosshair::Dot => Crosshair::SmallCross,
+            Crosshair::SmallCross => Crosshair::Cross,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Crosshair::Cross => "Cross",
+            Crosshair::Circle => "Circle",
+            Crosshair::CircleDot => "Circle with dot",
+            Crosshair::Dot => "Dot",
+            Crosshair::SmallCross => "Small cross",
+        }
+    }
+}
+
 #[derive(Resource, Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -133,6 +203,12 @@ pub struct Settings {
     /// Multiplier on [`BASE_SENSITIVITY`].
     pub sensitivity: f32,
     pub bindings: BTreeMap<Action, KeyCode>,
+    pub crosshair: Crosshair,
+    /// Saved flight model presets.
+    pub aircraft: Vec<AircraftCard>,
+    /// Preset names flown by the player and the target.
+    pub player_aircraft: String,
+    pub target_aircraft: String,
 }
 
 impl Default for Settings {
@@ -141,6 +217,10 @@ impl Default for Settings {
             units: Units::Metric,
             sensitivity: 1.0,
             bindings: default_bindings(),
+            crosshair: Crosshair::Cross,
+            aircraft: vec![AircraftCard::yak3()],
+            player_aircraft: "Yak-3".into(),
+            target_aircraft: "Yak-3".into(),
         }
     }
 }
@@ -150,6 +230,49 @@ pub fn default_bindings() -> BTreeMap<Action, KeyCode> {
 }
 
 impl Settings {
+    /// The preset with this name, or the first one (there's always at least one).
+    pub fn card(&self, name: &str) -> &AircraftCard {
+        self.aircraft
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or(&self.aircraft[0])
+    }
+
+    pub fn player_card(&self) -> &AircraftCard {
+        self.card(&self.player_aircraft)
+    }
+
+    pub fn target_card(&self) -> &AircraftCard {
+        self.card(&self.target_aircraft)
+    }
+
+    /// Add or replace a preset by name.
+    pub fn save_card(&mut self, card: AircraftCard) {
+        match self.aircraft.iter_mut().find(|c| c.name == card.name) {
+            Some(existing) => *existing = card,
+            None => self.aircraft.push(card),
+        }
+    }
+
+    pub fn delete_card(&mut self, name: &str) {
+        self.aircraft.retain(|c| c.name != name);
+        self.ensure_aircraft();
+    }
+
+    /// Keep at least one preset and point the player and target at real ones.
+    fn ensure_aircraft(&mut self) {
+        if self.aircraft.is_empty() {
+            self.aircraft.push(AircraftCard::yak3());
+        }
+        let first = self.aircraft[0].name.clone();
+        if !self.aircraft.iter().any(|c| c.name == self.player_aircraft) {
+            self.player_aircraft = first.clone();
+        }
+        if !self.aircraft.iter().any(|c| c.name == self.target_aircraft) {
+            self.target_aircraft = first;
+        }
+    }
+
     pub fn key(&self, action: Action) -> KeyCode {
         self.bindings
             .get(&action)
@@ -183,6 +306,12 @@ impl Settings {
     }
 
     fn load() -> Self {
+        let mut settings = Self::load_file();
+        settings.ensure_aircraft();
+        settings
+    }
+
+    fn load_file() -> Self {
         match std::fs::read_to_string(SETTINGS_FILE) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 warn!("Ignoring unreadable {SETTINGS_FILE}: {e}");
