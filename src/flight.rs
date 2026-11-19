@@ -66,26 +66,31 @@ pub struct Player {
 }
 
 pub const START_ALTITUDE: f32 = 1_500.0;
-const START_SPEED: f32 = 120.0;
+/// Start at this fraction of the preset's top speed at the start altitude.
+pub const START_SPEED_FRACTION: f32 = 0.85;
 /// How quickly keyboard inputs reach full deflection (per second).
 const KEY_RAMP: f32 = 4.0;
 
-fn start_body() -> Body {
+fn start_body(model: &FlightModel) -> Body {
     Body::new(
         Vec3::new(0.0, START_ALTITUDE, 0.0),
         Quat::IDENTITY,
-        START_SPEED,
+        START_SPEED_FRACTION * model.top_speed(START_ALTITUDE),
     )
 }
 
 fn spawn_player(mut commands: Commands, assets: Res<AssetServer>, settings: Res<Settings>) {
-    let body = start_body();
+    let mut aircraft = Aircraft::new(
+        settings.player_card(),
+        Body::new(Vec3::ZERO, Quat::IDENTITY, 0.0),
+    );
+    aircraft.body = start_body(&aircraft.model);
     commands
         .spawn((
-            Transform::from_translation(body.position),
+            Transform::from_translation(aircraft.body.position),
             Visibility::default(),
             Player::default(),
-            Aircraft::new(settings.player_card(), body),
+            aircraft,
         ))
         .with_children(|plane| {
             plane.spawn((
@@ -160,7 +165,7 @@ pub fn fly_player(
 
     // No crash damage yet: hitting the ground just restarts you.
     if body.position.y < 3.0 {
-        *body = start_body();
+        *body = start_body(model);
     }
 
     tf.translation = body.position;
@@ -180,7 +185,7 @@ fn reset(
     if !settings.just_pressed(&keys, Action::Reset) {
         return;
     }
-    player.body = start_body();
+    player.body = start_body(&player.model);
     player.controls.throttle = 0.8;
     aim.yaw = 0.0;
     aim.pitch = 0.0;

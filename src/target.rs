@@ -5,7 +5,7 @@
 use bevy::prelude::*;
 
 use crate::GameState;
-use crate::flight::{Aircraft, START_ALTITUDE};
+use crate::flight::{Aircraft, START_ALTITUDE, START_SPEED_FRACTION};
 use crate::flight_model::{self, Body};
 use crate::settings::Settings;
 
@@ -45,10 +45,11 @@ const START_AHEAD: f32 = 1_200.0;
 impl Target {
     pub fn reset(&mut self, aircraft: &mut Aircraft) {
         *self = Target::default();
+        let speed = START_SPEED_FRACTION * aircraft.model.top_speed(self.altitude);
         aircraft.body = Body::new(
             Vec3::new(0.0, self.altitude, -START_AHEAD),
             Quat::IDENTITY,
-            115.0,
+            speed,
         );
     }
 }

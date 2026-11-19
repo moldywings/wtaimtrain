@@ -436,6 +436,10 @@ pub struct Body {
     pub g_load: f32,
     /// Instructor's slowly built-up pitch correction (integral term), rad.
     pub trim: f32,
+    /// The instructor's smoothed copy of the aim direction (zero until the
+    /// first call), and how fast it's turning (world rad/s).
+    pub aim_smoothed: Vec3,
+    pub aim_rate: Vec3,
 }
 
 impl Body {
@@ -448,6 +452,8 @@ impl Body {
             alpha: 0.0,
             g_load: 1.0,
             trim: 0.0,
+            aim_smoothed: Vec3::ZERO,
+            aim_rate: Vec3::ZERO,
         }
     }
 
@@ -606,17 +612,37 @@ fn instructor_tuned(
     dt: f32,
     tune: InstructorTuning,
 ) -> Controls {
-    let local = body.rotation.inverse() * aim.normalize_or(Vec3::NEG_Z);
+    // Mouse input arrives in uneven steps (frames with and without
+    // movement). Smooth it briefly so those steps don't kick the controls,
+    // and track how fast the aim is moving so the nose can keep up.
+    let aim = aim.normalize_or(Vec3::NEG_Z);
+    if body.aim_smoothed == Vec3::ZERO || dt <= 0.0 {
+        body.aim_smoothed = aim;
+        body.aim_rate = Vec3::ZERO;
+    } else {
+        let k = 1.0 - (-dt / tune.aim_smooth.max(1e-4)).exp();
+        let prev = body.aim_smoothed;
+        let next = prev.lerp(aim, k).normalize_or(aim);
+        let rate = prev.cross(next) / dt;
+        let kr = 1.0 - (-dt / tune.rate_smooth.max(1e-4)).exp();
+        body.aim_rate = body.aim_rate.lerp(rate, kr);
+        body.aim_smoothed = next;
+    }
+    let aim = body.aim_smoothed;
+    let local = body.rotation.inverse() * aim;
     let off_nose = local.angle_between(Vec3::NEG_Z);
     let v = body.speed();
     let speed_ratio = (v / ROLL_REF_SPEED).clamp(0.2, 2.5);
+    // Nose rate relative to the aim's own motion, in body axes.
+    let aim_rate_body = body.rotation.inverse() * body.aim_rate * tune.aim_feed;
+    let rel = body.omega - aim_rate_body;
 
     // Where the aim will be relative to the nose a moment from now, given
     // how the nose is already swinging. Acting on this instead of the
     // current error stops the nose sailing past the aim.
     let lead = tune.lead;
-    let px = local.x + body.omega.y * lead;
-    let py = local.y - body.omega.x * lead;
+    let px = local.x + rel.y * lead;
+    let py = local.y - rel.x * lead;
     let predicted_off = if off_nose < 0.3 {
         (px * px + py * py).sqrt()
     } else {
@@ -664,8 +690,7 @@ fn instructor_tuned(
     } else {
         body.trim *= 1.0 - (4.0 * dt).min(1.0);
     }
-    let alpha_wanted = (pitch_err * tune.pitch_gain - body.omega.x * tune.pitch_damp)
-        * (1.0 - roll_lag)
+    let alpha_wanted = (pitch_err * tune.pitch_gain - rel.x * tune.pitch_damp) * (1.0 - roll_lag)
         + alpha_hold * (1.0 - w)
         + body.trim;
     // Stay just under the stall (the real instructor does the same).
@@ -673,7 +698,7 @@ fn instructor_tuned(
     let pitch = (alpha_wanted.clamp(-0.5 * alpha_limit, alpha_limit) / alpha_max).clamp(-1.0, 1.0);
 
     // Rudder puts the nose right on the aim for the last few degrees.
-    let yaw = ((yaw_err * tune.rudder_gain + body.omega.y * tune.rudder_damp)
+    let yaw = ((yaw_err * tune.rudder_gain + rel.y * tune.rudder_damp)
         * (1.0 - w * tune.rudder_fade))
         .clamp(-1.0, 1.0);
 
@@ -699,6 +724,12 @@ struct InstructorTuning {
     rudder_damp: f32,
     /// How much the rudder backs off while banking toward a far-off aim.
     rudder_fade: f32,
+    /// Time constant for smoothing the aim, s.
+    aim_smooth: f32,
+    /// Time constant for smoothing the aim's turn rate, s.
+    rate_smooth: f32,
+    /// How much of the aim's motion to lead (0 = none, 1 = all).
+    aim_feed: f32,
 }
 
 impl InstructorTuning {
@@ -712,8 +743,11 @@ impl InstructorTuning {
             pitch_gain: 4.0,
             pitch_damp: 0.1,
             rudder_gain: 150.0,
-            rudder_damp: 2.0,
+            rudder_damp: 8.0,
             rudder_fade: 0.5,
+            aim_smooth: 0.06,
+            rate_smooth: 0.1,
+            aim_feed: 1.0,
         }
     }
 }
@@ -1102,6 +1136,7 @@ mod settle_probe {
                                                 rudder_gain: rg,
                                                 rudder_damp: rd,
                                                 rudder_fade: rf,
+                                                ..base
                                             };
                                             let (sc, _) = score(t);
                                             if sc < best.0 {
@@ -1131,5 +1166,195 @@ mod settle_probe {
             t.rudder_fade
         );
         println!("{}", score(t).1);
+    }
+}
+
+#[cfg(test)]
+mod jump_probe {
+    use super::*;
+
+    /// Step or sweep the aim and report the largest bank, overshoot, and
+    /// how much the nose wanders sideways.
+    pub fn probe(name: &str, aim_at: impl Fn(f32) -> Vec3, secs: f32) -> (f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 150.0);
+        let dt = 1.0 / 60.0;
+        let mut max_bank = 0.0f32;
+        let mut max_err = 0.0f32;
+        let mut log = String::new();
+        for i in 0..((secs / dt) as usize) {
+            let t = i as f32 * dt;
+            let aim = aim_at(t);
+            let mut c = instructor(&m, &mut b, aim, dt);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            let right = b.rotation * Vec3::X;
+            let bank = right.y.asin().to_degrees();
+            max_bank = max_bank.max(bank.abs());
+            let err = b.forward().angle_between(aim).to_degrees();
+            if t > 1.5 {
+                max_err = max_err.max(err);
+            }
+            if i % 6 == 0 {
+                log += &format!("{t:.1}:b{bank:.0},e{err:.1},y{:.2},r{:.2} ", c.yaw, c.roll);
+            }
+        }
+        println!("{name}: max bank {max_bank:.0}°, max err after 1.5 s {max_err:.2}°\n  {log}");
+        (max_bank, max_err)
+    }
+
+    pub fn dir(yaw_deg: f32, pitch_deg: f32) -> Vec3 {
+        Quat::from_euler(
+            bevy::math::EulerRot::YXZ,
+            yaw_deg.to_radians(),
+            pitch_deg.to_radians(),
+            0.0,
+        ) * Vec3::NEG_Z
+    }
+
+    /// A mouse-like sweep: the aim moves in uneven steps (some frames get no
+    /// mouse movement). Returns (control chatter, nose jerk, mean error).
+    pub fn mouse_sweep(tune: InstructorTuning, rate_dps: f32, fps: f32) -> (f32, f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 150.0);
+        let dt = 1.0 / fps;
+        let mut yaw_deg = 0.0f32;
+        let mut prev = Controls::default();
+        let mut prev_fwd = b.forward();
+        let mut prev_rate = Vec3::ZERO;
+        let (mut chatter, mut jerk, mut err) = (0.0, 0.0, 0.0);
+        let n = (fps * 4.0) as usize;
+        for i in 0..n {
+            // Every third frame has no mouse input; the others make up for it.
+            if i % 3 != 2 && i < n / 2 {
+                yaw_deg -= rate_dps * dt * 1.5;
+            }
+            let aim = dir(yaw_deg, 0.0);
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, tune);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            let fwd = b.forward();
+            let rate = (fwd - prev_fwd) / dt;
+            if i > 10 {
+                chatter += (c.yaw - prev.yaw).abs() + (c.roll - prev.roll).abs();
+                jerk += ((rate - prev_rate) / dt).length() * dt;
+                err += fwd.angle_between(aim).to_degrees() / n as f32;
+            }
+            prev = c;
+            prev_fwd = fwd;
+            prev_rate = rate;
+        }
+        (chatter, jerk, err)
+    }
+
+    /// Uneven mouse input mustn't make the controls (and the crosshair) jump.
+    #[test]
+    fn mouse_steps_dont_kick_the_controls() {
+        let (chatter, jerk, err) = mouse_sweep(InstructorTuning::get(), 5.0, 60.0);
+        println!("chatter {chatter:.1}, jerk {jerk:.2}, err {err:.2}");
+        assert!(chatter < 12.0 && jerk < 0.35 && err < 0.5);
+    }
+
+    #[test]
+    #[ignore]
+    fn mouse_sweeps() {
+        let t = InstructorTuning::get();
+        for fps in [60.0, 144.0] {
+            for rate in [2.0, 5.0, 15.0] {
+                let (c, j, e) = mouse_sweep(t, rate, fps);
+                println!("{fps} fps {rate}°/s: chatter {c:.1}, jerk {j:.2}, mean err {e:.2}°");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn shallow_moves() {
+        probe("step 3° right", |_| dir(-3.0, 0.0), 3.0);
+        probe("step 6° right", |_| dir(-6.0, 0.0), 3.0);
+        probe(
+            "sweep 4°/s right for 2 s",
+            |t| dir(-4.0 * t.min(2.0), 0.0),
+            4.0,
+        );
+        probe(
+            "wiggle ±2° at 0.5 Hz",
+            |t| dir(2.0 * (t * std::f32::consts::PI).sin(), 0.0),
+            6.0,
+        );
+    }
+}
+
+#[cfg(test)]
+mod smooth_sweep {
+    use super::jump_probe::mouse_sweep;
+    use super::settle_probe::settle_time_fps;
+    use super::*;
+
+    fn score(t: InstructorTuning) -> (f32, String) {
+        let mut total = 0.0;
+        let mut out = String::new();
+        for (a, p) in [
+            (3.0, 1.0),
+            (10.0, 0.0),
+            (30.0, 0.0),
+            (-60.0, 10.0),
+            (150.0, 5.0),
+        ] {
+            let (ts, st) = settle_time_fps(a, p, t, 60.0);
+            total += ts + if st { 20.0 } else { 0.0 };
+            out += &format!("{a}:{ts:.2} ");
+        }
+        for rate in [2.0, 5.0, 15.0] {
+            let (c, j, e) = mouse_sweep(t, rate, 60.0);
+            total += c * 0.05 + j * 1.0 + e * 1.0;
+            out += &format!("[{rate}: c{c:.1} j{j:.2} e{e:.2}] ");
+        }
+        (total, out)
+    }
+
+    #[test]
+    #[ignore]
+    fn smooth_sweep() {
+        let base = InstructorTuning::get();
+        println!("base {:.2} {}", score(base).0, score(base).1);
+        let mut best = (score(base).0, base);
+        for sm in [0.0, 0.03, 0.06, 0.1] {
+            for hb in [20.0, 35.0] {
+                for rg in [60.0, 100.0, 150.0] {
+                    for rd in [2.0, 4.0, 8.0] {
+                        for rf in [0.0, 0.5] {
+                            for ff in [0.0, 0.5, 1.0] {
+                                let t = InstructorTuning {
+                                    aim_smooth: sm,
+                                    heading_bank: hb,
+                                    rudder_gain: rg,
+                                    rudder_damp: rd,
+                                    rudder_fade: rf,
+                                    aim_feed: ff,
+                                    ..base
+                                };
+                                let sc = score(t).0;
+                                if sc < best.0 {
+                                    best = (sc, t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let t = best.1;
+        println!(
+            "best {:.2}: smooth {} hb {} rg {} rd {} rf {} feed {}\n{}",
+            best.0,
+            t.aim_smooth,
+            t.heading_bank,
+            t.rudder_gain,
+            t.rudder_damp,
+            t.rudder_fade,
+            t.aim_feed,
+            score(t).1
+        );
     }
 }
