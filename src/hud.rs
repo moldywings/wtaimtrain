@@ -53,7 +53,7 @@ const CROSSHAIR_SIZE: f32 = 40.0;
 const TARGET_RED: Color = Color::srgb(0.95, 0.18, 0.15);
 const BRACKET: Color = Color::srgb(0.92, 0.92, 0.92);
 const RETICLE_WHITE: Color = Color::srgb(0.95, 0.95, 0.95);
-const RETICLE_GOLD: Color = Color::srgb(0.85, 0.72, 0.45);
+pub const RETICLE_GOLD: Color = Color::srgb(0.85, 0.72, 0.45);
 
 // Target marker layout: name, then the bracket diamond, then the range.
 const MARKER_WIDTH: f32 = 180.0;

@@ -9,8 +9,9 @@
 
 use bevy::input::ButtonState;
 use bevy::input::keyboard::KeyboardInput;
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::input_focus::tab_navigation::{TabGroup, TabIndex};
-use bevy::picking::hover::Hovered;
+use bevy::picking::hover::{HoverMap, Hovered};
 use bevy::prelude::*;
 use bevy::text::{EditableText, TextCursorStyle};
 use bevy::ui::Pressed;
@@ -19,7 +20,8 @@ use bevy::ui_widgets::{Activate, Button, SelectAllOnFocus, TextInput};
 use crate::GameState;
 use crate::flight_model::{AircraftCard, EngineKind, FlightModel};
 use crate::settings::{
-    Action, MAX_SENSITIVITY, MIN_SENSITIVITY, Settings, Units, default_bindings, key_name,
+    Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, Settings, Units,
+    default_bindings, is_builtin, key_name,
 };
 
 pub struct MenuPlugin;
@@ -29,7 +31,9 @@ impl Plugin for MenuPlugin {
         app.add_plugins(bevy::input_focus::tab_navigation::TabNavigationPlugin)
             .init_resource::<Rebinding>()
             .init_resource::<MenuUi>()
+            .init_resource::<ScrollMemory>()
             .add_observer(on_menu_click)
+            .add_observer(on_scroll)
             .add_systems(OnEnter(GameState::Paused), open_menu)
             .add_systems(OnExit(GameState::Paused), (despawn_menu, cancel_rebind))
             .add_systems(
@@ -45,6 +49,7 @@ impl Plugin for MenuPlugin {
                         .after(sync_draft)
                         .run_if(in_state(GameState::Paused)),
                     style_buttons,
+                    send_scroll_events.run_if(in_state(GameState::Paused)),
                 ),
             );
     }
@@ -73,7 +78,46 @@ struct MenuUi {
     draft: Draft,
     /// Feedback after saving.
     message: String,
+    /// The drop-down list that's open, if any.
+    open: Option<Dropdown>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dropdown {
+    Crosshair,
+    Color,
+}
+
+/// Scrollable lists, so their scroll position survives a menu rebuild.
+#[derive(Component, Clone, Copy)]
+enum ScrollList {
+    Presets,
+    Dropdown,
+}
+
+/// Remembered scroll offsets, kept outside `MenuUi` so scrolling doesn't
+/// rebuild the menu.
+#[derive(Resource, Default)]
+struct ScrollMemory {
+    presets: f32,
+    dropdown: f32,
+}
+
+impl ScrollMemory {
+    fn get_mut(&mut self, list: ScrollList) -> &mut f32 {
+        match list {
+            ScrollList::Presets => &mut self.presets,
+            ScrollList::Dropdown => &mut self.dropdown,
+        }
+    }
+}
+
+/// Height of one button row in a list, including the gap.
+const ROW_STEP: f32 = 31.0;
+/// Show this many rows in a drop-down before it scrolls.
+const DROPDOWN_ROWS: f32 = 5.5;
+/// Show this many presets before the list scrolls.
+const PRESET_ROWS: f32 = 7.5;
 
 /// The aircraft editor's fields, as typed, in the current display units.
 #[derive(Clone, Default)]
@@ -150,6 +194,7 @@ impl Draft {
                 s
             }
         };
+        let opt = |v: Option<f32>, decimals: usize| v.map(|v| n(v, decimals)).unwrap_or_default();
         let mut fields: [String; Field::ALL.len()] = Default::default();
         for f in Field::ALL {
             fields[f.index()] = match f {
@@ -159,11 +204,11 @@ impl Draft {
                 Field::Climb => n(card.climb_rate * clm, 1),
                 Field::TurnTime => n(card.turn_time, 1),
                 Field::TopSpeed => n(card.top_speed * spd, 0),
-                Field::TopSpeedAltitude => n(card.top_speed_altitude * alt, 0),
-                Field::Mass => n(card.mass, 0),
-                Field::WingArea => n(card.wing_area, 2),
-                Field::ClMax => n(card.cl_max, 2),
-                Field::RollRate => n(card.roll_rate, 0),
+                Field::TopSpeedAltitude => opt(card.top_speed_altitude.map(|v| v * alt), 0),
+                Field::Mass => opt(card.mass, 0),
+                Field::WingArea => opt(card.wing_area, 2),
+                Field::ClMax => opt(card.cl_max, 2),
+                Field::RollRate => opt(card.roll_rate, 0),
             };
         }
         Draft {
@@ -176,8 +221,8 @@ impl Draft {
         self.fields[f.index()].trim()
     }
 
-    /// Build a card from the fields. Blank optional fields keep the base
-    /// card's value (the preset being edited).
+    /// Build a card from the fields. Blank optional fields stay blank, and
+    /// the flight model fills them in.
     fn to_card(&self, base: &AircraftCard, units: Units) -> Result<AircraftCard, String> {
         let (_, spd) = units.speed_unit();
         let (_, clm) = units.climb_unit();
@@ -203,6 +248,13 @@ impl Draft {
                 )),
             }
         };
+        let optional = |f: Field, scale: f32| -> Result<Option<f32>, String> {
+            if self.get(f).is_empty() {
+                Ok(None)
+            } else {
+                num(f, true, 0.0, scale).map(Some)
+            }
+        };
         let card = AircraftCard {
             name,
             engine: self.engine.unwrap_or(base.engine),
@@ -213,11 +265,11 @@ impl Draft {
             climb_rate: num(Field::Climb, true, base.climb_rate, clm)?,
             turn_time: num(Field::TurnTime, true, base.turn_time, 1.0)?,
             top_speed: num(Field::TopSpeed, true, base.top_speed, spd)?,
-            top_speed_altitude: num(Field::TopSpeedAltitude, false, base.top_speed_altitude, alt)?,
-            mass: num(Field::Mass, false, base.mass, 1.0)?,
-            wing_area: num(Field::WingArea, false, base.wing_area, 1.0)?,
-            cl_max: num(Field::ClMax, false, base.cl_max, 1.0)?,
-            roll_rate: num(Field::RollRate, false, base.roll_rate, 1.0)?,
+            top_speed_altitude: optional(Field::TopSpeedAltitude, alt)?,
+            mass: optional(Field::Mass, 1.0)?,
+            wing_area: optional(Field::WingArea, 1.0)?,
+            cl_max: optional(Field::ClMax, 1.0)?,
+            roll_rate: optional(Field::RollRate, 1.0)?,
         };
         if card.power <= 0.0 || card.climb_rate <= 0.0 || card.top_speed <= 0.0 {
             return Err("Power, climb rate and top speed must be above zero.".into());
@@ -236,8 +288,9 @@ enum MenuAction {
     CycleUnits,
     SensitivityDown,
     SensitivityUp,
-    CycleCrosshair,
-    CycleCrosshairColor,
+    ToggleDropdown(Dropdown),
+    PickCrosshair(Crosshair),
+    PickColor(CrosshairColor),
     Rebind(Action),
     ResetBindings,
     Quit,
@@ -319,6 +372,11 @@ fn open_menu(settings: Res<Settings>, mut ui: ResMut<MenuUi>) {
 
 /// Copy what's typed into the draft, without triggering a rebuild.
 fn sync_draft(mut ui: ResMut<MenuUi>, inputs: Query<(&Field, &EditableText)>) {
+    // A click just replaced the draft (new preset, save, ...): the fields on
+    // screen are stale until the rebuild, so don't copy them back.
+    if ui.is_changed() {
+        return;
+    }
     let ui = ui.bypass_change_detection();
     for (field, text) in &inputs {
         let value = text.value().to_string();
@@ -333,6 +391,7 @@ fn rebuild_menu(
     settings: Res<Settings>,
     rebinding: Res<Rebinding>,
     ui: Res<MenuUi>,
+    scroll: Res<ScrollMemory>,
     menus: Query<Entity, With<PauseMenu>>,
 ) {
     let exists = !menus.is_empty();
@@ -386,14 +445,20 @@ fn rebuild_menu(
                     }
                 });
                 match ui.page {
-                    Page::Settings => settings_page(panel, &settings, &rebinding),
-                    Page::Aircraft => aircraft_page(panel, &settings, &ui),
+                    Page::Settings => settings_page(panel, &settings, &rebinding, &ui, &scroll),
+                    Page::Aircraft => aircraft_page(panel, &settings, &ui, &scroll),
                 }
             });
         });
 }
 
-fn settings_page(panel: &mut ChildSpawnerCommands, settings: &Settings, rebinding: &Rebinding) {
+fn settings_page(
+    panel: &mut ChildSpawnerCommands,
+    settings: &Settings,
+    rebinding: &Rebinding,
+    ui: &MenuUi,
+    scroll: &ScrollMemory,
+) {
     panel
         .spawn(Node {
             flex_direction: FlexDirection::Row,
@@ -428,18 +493,44 @@ fn settings_page(panel: &mut ChildSpawnerCommands, settings: &Settings, rebindin
                 });
 
                 col.spawn(section_header("Crosshair"));
-                col.spawn(row()).with_children(|r| {
-                    r.spawn(button(
-                        MenuAction::CycleCrosshair,
-                        settings.crosshair.label(),
-                        percent(56),
-                    ));
-                    r.spawn(button(
-                        MenuAction::CycleCrosshairColor,
-                        settings.crosshair_color.label(),
-                        percent(41),
-                    ));
-                });
+                let styles: Vec<_> = Crosshair::ALL
+                    .iter()
+                    .map(|c| Choice {
+                        action: MenuAction::PickCrosshair(*c),
+                        label: c.label(),
+                        selected: *c == settings.crosshair,
+                        swatch: None,
+                    })
+                    .collect();
+                dropdown(
+                    col,
+                    Dropdown::Crosshair,
+                    ui,
+                    scroll,
+                    settings.crosshair.label(),
+                    None,
+                    &styles,
+                );
+
+                col.spawn(section_header("Crosshair color"));
+                let colors: Vec<_> = CrosshairColor::ALL
+                    .iter()
+                    .map(|c| Choice {
+                        action: MenuAction::PickColor(*c),
+                        label: c.label(),
+                        selected: *c == settings.crosshair_color,
+                        swatch: Some(swatch(*c)),
+                    })
+                    .collect();
+                dropdown(
+                    col,
+                    Dropdown::Color,
+                    ui,
+                    scroll,
+                    settings.crosshair_color.label(),
+                    Some(swatch(settings.crosshair_color)),
+                    &colors,
+                );
 
                 col.spawn(section_header("Mouse"));
                 col.spawn(label(
@@ -487,7 +578,12 @@ fn settings_page(panel: &mut ChildSpawnerCommands, settings: &Settings, rebindin
         });
 }
 
-fn aircraft_page(panel: &mut ChildSpawnerCommands, settings: &Settings, ui: &MenuUi) {
+fn aircraft_page(
+    panel: &mut ChildSpawnerCommands,
+    settings: &Settings,
+    ui: &MenuUi,
+    scroll: &ScrollMemory,
+) {
     let units = settings.units;
     panel
         .spawn(Node {
@@ -511,17 +607,46 @@ fn aircraft_page(panel: &mut ChildSpawnerCommands, settings: &Settings, ui: &Men
                     percent(100),
                 ));
 
-                col.spawn(section_header("Presets (click to edit)"));
-                for card in &settings.aircraft {
-                    let mut b = col.spawn(button(
-                        MenuAction::EditPreset(card.name.clone()),
-                        &card.name,
-                        percent(100),
-                    ));
-                    if card.name == ui.editing {
-                        b.insert(Selected);
+                col.spawn(section_header(&format!(
+                    "Presets ({}, click to edit)",
+                    settings.aircraft.len()
+                )));
+                col.spawn((
+                    scroll_list(ScrollList::Presets, scroll.presets),
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: px(3),
+                        max_height: px(ROW_STEP * PRESET_ROWS),
+                        overflow: Overflow::scroll_y(),
+                        ..default()
+                    },
+                ))
+                .with_children(|list| {
+                    for card in &settings.aircraft {
+                        let text = if is_builtin(&card.name) {
+                            format!("{} (built in)", card.name)
+                        } else {
+                            card.name.clone()
+                        };
+                        let mut b = list.spawn(button(
+                            MenuAction::EditPreset(card.name.clone()),
+                            &text,
+                            percent(100),
+                        ));
+                        b.insert(Node {
+                            width: percent(100),
+                            height: px(28),
+                            flex_shrink: 0.0,
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(px(6)),
+                            ..default()
+                        });
+                        if card.name == ui.editing {
+                            b.insert(Selected);
+                        }
                     }
-                }
+                });
                 col.spawn(row()).with_children(|r| {
                     r.spawn(button(MenuAction::NewPreset, "New", percent(48)));
                     r.spawn(button(MenuAction::DeletePreset, "Delete", percent(48)));
@@ -541,6 +666,14 @@ fn aircraft_page(panel: &mut ChildSpawnerCommands, settings: &Settings, ui: &Men
                 col.spawn(section_header(
                     "Stat card: enter what you know, the rest is worked out",
                 ));
+                if is_builtin(&ui.editing) {
+                    col.spawn(label(
+                        "Built-in preset. Your changes save as a new preset, \
+                         and the stock Yak-3 stays as it is.",
+                        13.0,
+                        ACCENT,
+                    ));
+                }
                 col.spawn(row()).with_children(|r| {
                     r.spawn((label("Engine type", 15.0, TEXT), grow()));
                     r.spawn(button(
@@ -587,7 +720,7 @@ fn aircraft_page(panel: &mut ChildSpawnerCommands, settings: &Settings, ui: &Men
                              Climb {:.0} {cu}. Turn {:.1} s. Stalls at {:.0} {su}.",
                             card.name,
                             p.top_speed * sf,
-                            card.top_speed_altitude * af,
+                            card.extras().top_speed_altitude * af,
                             p.top_speed_sea_level * sf,
                             p.climb_rate * cf,
                             p.turn_time,
@@ -596,6 +729,31 @@ fn aircraft_page(panel: &mut ChildSpawnerCommands, settings: &Settings, ui: &Men
                         13.0,
                         DIM,
                     ));
+                    // Show what the game picked for any blank optional field.
+                    let e = card.extras();
+                    let mut filled = vec![];
+                    if card.top_speed_altitude.is_none() {
+                        filled.push(format!("top speed altitude {:.0} {au}", e.top_speed_altitude * af));
+                    }
+                    if card.mass.is_none() {
+                        filled.push(format!("mass {:.0} kg", e.mass));
+                    }
+                    if card.wing_area.is_none() {
+                        filled.push(format!("wing area {:.1} sq m", e.wing_area));
+                    }
+                    if card.cl_max.is_none() {
+                        filled.push(format!("max lift {:.2}", e.cl_max));
+                    }
+                    if card.roll_rate.is_none() {
+                        filled.push(format!("roll rate {:.0} deg/s", e.roll_rate));
+                    }
+                    if !filled.is_empty() {
+                        col.spawn(label(
+                            &format!("Filled in for you: {}.", filled.join(", ")),
+                            13.0,
+                            DIM,
+                        ));
+                    }
                     // Say so when a card asks for something the model can't do.
                     let mut misses = vec![];
                     if (p.top_speed - card.top_speed).abs() > card.top_speed * 0.03 {
@@ -662,6 +820,183 @@ fn text_field(field: Field, value: &str) -> impl Bundle {
     )
 }
 
+/// One entry in a drop-down list.
+struct Choice {
+    action: MenuAction,
+    label: &'static str,
+    selected: bool,
+    swatch: Option<Color>,
+}
+
+/// The swatch shown next to a crosshair color. "Default" shows the gold
+/// most styles use.
+fn swatch(c: CrosshairColor) -> Color {
+    c.color().unwrap_or(crate::hud::RETICLE_GOLD)
+}
+
+fn color_chip(color: Color) -> impl Bundle {
+    (
+        Node {
+            width: px(14),
+            height: px(14),
+            margin: UiRect::right(px(8)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(3)),
+            ..default()
+        },
+        BackgroundColor(color),
+        BorderColor::all(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+    )
+}
+
+/// A button that opens a scrollable list below it.
+#[allow(clippy::too_many_arguments)]
+fn dropdown(
+    col: &mut ChildSpawnerCommands,
+    kind: Dropdown,
+    ui: &MenuUi,
+    scroll: &ScrollMemory,
+    current: &str,
+    current_swatch: Option<Color>,
+    choices: &[Choice],
+) {
+    let open = ui.open == Some(kind);
+    col.spawn(Node {
+        width: percent(100),
+        ..default()
+    })
+    .with_children(|wrap| {
+        let mut head = wrap.spawn((
+            Button,
+            Hovered::default(),
+            MenuAction::ToggleDropdown(kind),
+            Node {
+                width: percent(100),
+                height: px(28),
+                padding: UiRect::horizontal(px(10)),
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(px(6)),
+                ..default()
+            },
+            BackgroundColor(BUTTON_BG),
+        ));
+        if open {
+            head.insert(Selected);
+        }
+        head.with_children(|b| {
+            if let Some(c) = current_swatch {
+                b.spawn(color_chip(c));
+            }
+            b.spawn((label(current, 16.0, TEXT), grow()));
+            b.spawn(label(if open { "^" } else { "v" }, 15.0, DIM));
+        });
+
+        if !open {
+            return;
+        }
+        wrap.spawn((
+            scroll_list(ScrollList::Dropdown, scroll.dropdown),
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(31),
+                left: px(0),
+                width: percent(100),
+                max_height: px(ROW_STEP * DROPDOWN_ROWS),
+                flex_direction: FlexDirection::Column,
+                row_gap: px(3),
+                padding: UiRect::all(px(3)),
+                overflow: Overflow::scroll_y(),
+                border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(6)),
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.10, 0.11, 0.13)),
+            BorderColor::all(Color::srgb(0.35, 0.38, 0.44)),
+            GlobalZIndex(20),
+        ))
+        .with_children(|list| {
+            for choice in choices {
+                let mut item = list.spawn((
+                    Button,
+                    Hovered::default(),
+                    choice.action.clone(),
+                    Node {
+                        width: percent(100),
+                        height: px(28),
+                        flex_shrink: 0.0,
+                        padding: UiRect::horizontal(px(8)),
+                        align_items: AlignItems::Center,
+                        border_radius: BorderRadius::all(px(4)),
+                        ..default()
+                    },
+                    BackgroundColor(BUTTON_BG),
+                ));
+                if choice.selected {
+                    item.insert(Selected);
+                }
+                item.with_children(|b| {
+                    if let Some(c) = choice.swatch {
+                        b.spawn(color_chip(c));
+                    }
+                    b.spawn(label(choice.label, 16.0, TEXT));
+                });
+            }
+        });
+    });
+}
+
+fn scroll_list(list: ScrollList, offset: f32) -> impl Bundle {
+    (list, ScrollPosition(Vec2::new(0.0, offset)))
+}
+
+/// Line height for wheels that scroll by lines.
+const WHEEL_LINE: f32 = 24.0;
+
+/// Mouse wheel scrolling for the lists, sent to whatever is under the pointer
+/// and passed up to the nearest scrollable parent.
+fn send_scroll_events(
+    mut wheel: MessageReader<MouseWheel>,
+    hover_map: Res<HoverMap>,
+    mut commands: Commands,
+) {
+    for event in wheel.read() {
+        let mut dy = -event.y;
+        if event.unit == MouseScrollUnit::Line {
+            dy *= WHEEL_LINE;
+        }
+        for pointer_map in hover_map.values() {
+            for entity in pointer_map.keys().copied() {
+                commands.trigger(Scroll { entity, dy });
+            }
+        }
+    }
+}
+
+#[derive(EntityEvent, Debug)]
+#[entity_event(propagate, auto_propagate)]
+struct Scroll {
+    entity: Entity,
+    dy: f32,
+}
+
+fn on_scroll(
+    mut scroll: On<Scroll>,
+    mut lists: Query<(&ScrollList, &mut ScrollPosition, &ComputedNode)>,
+    mut memory: ResMut<ScrollMemory>,
+) {
+    let Ok((list, mut pos, computed)) = lists.get_mut(scroll.entity) else {
+        return;
+    };
+    let max = ((computed.content_size().y - computed.size().y) * computed.inverse_scale_factor())
+        .max(0.0);
+    let y = (pos.y + scroll.dy).clamp(0.0, max);
+    if y != pos.y {
+        pos.y = y;
+        *memory.bypass_change_detection().get_mut(*list) = y;
+    }
+    scroll.propagate(false);
+}
+
 /// Marks the active tab or preset button.
 #[derive(Component)]
 struct Selected;
@@ -675,18 +1010,24 @@ fn column(width: Val) -> Node {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn on_menu_click(
     activate: On<Activate>,
     actions: Query<&MenuAction>,
     mut settings: ResMut<Settings>,
     mut rebinding: ResMut<Rebinding>,
     mut ui: ResMut<MenuUi>,
+    mut scroll: ResMut<ScrollMemory>,
     mut next: ResMut<NextState<GameState>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Ok(action) = actions.get(activate.entity) else {
         return;
     };
+    // Any click other than opening a list closes the open one.
+    if !matches!(action, MenuAction::ToggleDropdown(_)) && ui.open.is_some() {
+        ui.open = None;
+    }
     match action.clone() {
         MenuAction::Resume => next.set(GameState::Playing),
         MenuAction::Page(page) => ui.page = page,
@@ -702,10 +1043,25 @@ fn on_menu_click(
         MenuAction::SensitivityUp => {
             settings.sensitivity = step_sensitivity(settings.sensitivity, 1.0);
         }
-        MenuAction::CycleCrosshair => settings.crosshair = settings.crosshair.next(),
-        MenuAction::CycleCrosshairColor => {
-            settings.crosshair_color = settings.crosshair_color.next();
+        MenuAction::ToggleDropdown(d) => {
+            if ui.open == Some(d) {
+                ui.open = None;
+            } else {
+                ui.open = Some(d);
+                // Open with the current choice in view.
+                let index = match d {
+                    Dropdown::Crosshair => {
+                        Crosshair::ALL.iter().position(|c| *c == settings.crosshair)
+                    }
+                    Dropdown::Color => CrosshairColor::ALL
+                        .iter()
+                        .position(|c| *c == settings.crosshair_color),
+                };
+                scroll.dropdown = (index.unwrap_or(0) as f32 - 2.0).max(0.0) * ROW_STEP;
+            }
         }
+        MenuAction::PickCrosshair(c) => settings.crosshair = c,
+        MenuAction::PickColor(c) => settings.crosshair_color = c,
         MenuAction::Rebind(a) => rebinding.0 = Some(a),
         MenuAction::ResetBindings => settings.bindings = default_bindings(),
         MenuAction::Quit => {
@@ -725,15 +1081,23 @@ fn on_menu_click(
             ui.message = "Fill in the stat card, then Save preset.".into();
         }
         MenuAction::DeletePreset => {
-            if settings.aircraft.len() <= 1 {
-                ui.message = "You need at least one preset.".into();
-            } else {
-                let name = ui.editing.clone();
-                settings.delete_card(&name);
+            let name = ui.editing.clone();
+            if !settings.aircraft.iter().any(|c| c.name == name) {
+                // A new preset that was never saved: just drop the draft.
                 let card = settings.aircraft[0].clone();
                 ui.draft = Draft::from_card(&card, settings.units);
                 ui.editing = card.name;
-                ui.message = format!("Deleted \"{name}\".");
+                ui.message = format!("Discarded \"{name}\".");
+            } else {
+                match settings.delete_card(&name) {
+                    Ok(()) => {
+                        let card = settings.aircraft[0].clone();
+                        ui.draft = Draft::from_card(&card, settings.units);
+                        ui.editing = card.name;
+                        ui.message = format!("Deleted \"{name}\".");
+                    }
+                    Err(e) => ui.message = e,
+                }
             }
         }
         MenuAction::ToggleEngine => {
@@ -746,23 +1110,35 @@ fn on_menu_click(
         MenuAction::SavePreset => {
             let base = settings.card(&ui.editing).clone();
             match ui.draft.to_card(&base, settings.units) {
-                Ok(card) => {
-                    let name = card.name.clone();
-                    // Renaming a saved preset carries over who was flying it.
-                    if ui.editing != name && settings.aircraft.iter().any(|c| c.name == ui.editing)
-                    {
-                        if settings.player_aircraft == ui.editing {
-                            settings.player_aircraft = name.clone();
-                        }
-                        if settings.target_aircraft == ui.editing {
-                            settings.target_aircraft = name.clone();
-                        }
-                        let old = ui.editing.clone();
-                        settings.aircraft.retain(|c| c.name != old);
+                Ok(mut card) => {
+                    // The built-in Yak-3 is never overwritten: save a copy.
+                    let copied = is_builtin(&card.name);
+                    if copied {
+                        card.name = unique_name(&settings, &format!("{} copy", card.name.trim()));
                     }
-                    settings.save_card(card);
-                    ui.editing = name.clone();
-                    ui.message = format!("Saved \"{name}\".");
+                    let name = card.name.clone();
+                    let replaced = settings.aircraft.iter().any(|c| c.name == name);
+                    let old = ui.editing.clone();
+                    let kept_old = old != name && settings.aircraft.iter().any(|c| c.name == old);
+                    match settings.save_card(card) {
+                        Ok(()) => {
+                            ui.message = if copied {
+                                format!(
+                                    "The Yak-3 is built in, so this was saved as \"{name}\". \
+                                     Rename it and save again if you like."
+                                )
+                            } else if replaced {
+                                format!("Saved \"{name}\".")
+                            } else if kept_old {
+                                format!("Saved new preset \"{name}\". \"{old}\" is still there.")
+                            } else {
+                                format!("Saved new preset \"{name}\".")
+                            };
+                            ui.draft.fields[Field::Name.index()] = name.clone();
+                            ui.editing = name;
+                        }
+                        Err(e) => ui.message = e,
+                    }
                 }
                 Err(e) => ui.message = e,
             }

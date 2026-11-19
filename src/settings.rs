@@ -1,6 +1,7 @@
 //! Player settings: units, mouse sensitivity, key bindings, crosshair and
-//! aircraft presets. Saved to `settings.json` in the folder the game is run
-//! from.
+//! aircraft presets. Saved to `settings.json` in your user settings folder
+//! (on Windows, `%APPDATA%\\WT Aim Trainer`), so they're remembered no matter
+//! where the game is started from.
 
 use std::collections::BTreeMap;
 
@@ -10,6 +11,21 @@ use serde::{Deserialize, Serialize};
 use crate::flight_model::AircraftCard;
 
 const SETTINGS_FILE: &str = "settings.json";
+const APP_FOLDER: &str = "WT Aim Trainer";
+
+/// Where settings live: the per-user config folder, falling back to the
+/// current folder if none can be found.
+pub fn settings_path() -> std::path::PathBuf {
+    let base = std::env::var_os("WTAT_CONFIG_DIR")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    match base {
+        Some(dir) => dir.join(APP_FOLDER).join(SETTINGS_FILE),
+        None => std::path::PathBuf::from(SETTINGS_FILE),
+    }
+}
 
 /// Radians of aim movement per pixel at 1.0x sensitivity.
 pub const BASE_SENSITIVITY: f32 = 0.0015;
@@ -175,15 +191,13 @@ pub enum Crosshair {
 }
 
 impl Crosshair {
-    pub fn next(self) -> Self {
-        match self {
-            Crosshair::Cross => Crosshair::Circle,
-            Crosshair::Circle => Crosshair::CircleDot,
-            Crosshair::CircleDot => Crosshair::Dot,
-            Crosshair::Dot => Crosshair::SmallCross,
-            Crosshair::SmallCross => Crosshair::Cross,
-        }
-    }
+    pub const ALL: [Crosshair; 5] = [
+        Crosshair::Cross,
+        Crosshair::Circle,
+        Crosshair::CircleDot,
+        Crosshair::Dot,
+        Crosshair::SmallCross,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -211,7 +225,7 @@ pub enum CrosshairColor {
 }
 
 impl CrosshairColor {
-    const ALL: [CrosshairColor; 8] = [
+    pub const ALL: [CrosshairColor; 8] = [
         CrosshairColor::Default,
         CrosshairColor::White,
         CrosshairColor::Gold,
@@ -221,11 +235,6 @@ impl CrosshairColor {
         CrosshairColor::Red,
         CrosshairColor::Magenta,
     ];
-
-    pub fn next(self) -> Self {
-        let i = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
-        Self::ALL[(i + 1) % Self::ALL.len()]
-    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -308,23 +317,39 @@ impl Settings {
     }
 
     /// Add or replace a preset by name.
-    pub fn save_card(&mut self, card: AircraftCard) {
+    /// Store a preset. The built-in Yak-3 can't be overwritten.
+    pub fn save_card(&mut self, card: AircraftCard) -> Result<(), String> {
+        if is_builtin(&card.name) {
+            return Err(format!(
+                "\"{}\" is the built-in preset and can't be changed. Give it a new name to save a copy.",
+                card.name
+            ));
+        }
         match self.aircraft.iter_mut().find(|c| c.name == card.name) {
             Some(existing) => *existing = card,
             None => self.aircraft.push(card),
         }
+        Ok(())
     }
 
-    pub fn delete_card(&mut self, name: &str) {
+    /// Remove a preset. The built-in Yak-3 can't be deleted.
+    pub fn delete_card(&mut self, name: &str) -> Result<(), String> {
+        if is_builtin(name) {
+            return Err(format!(
+                "\"{name}\" is the built-in preset and can't be deleted."
+            ));
+        }
         self.aircraft.retain(|c| c.name != name);
         self.ensure_aircraft();
+        Ok(())
     }
 
     /// Keep at least one preset and point the player and target at real ones.
     fn ensure_aircraft(&mut self) {
-        if self.aircraft.is_empty() {
-            self.aircraft.push(AircraftCard::yak3());
-        }
+        // The built-in Yak-3 always comes first, with its stock numbers
+        // (older saves may hold an edited copy).
+        self.aircraft.retain(|c| !is_builtin(&c.name));
+        self.aircraft.insert(0, AircraftCard::yak3());
         let first = self.aircraft[0].name.clone();
         if !self.aircraft.iter().any(|c| c.name == self.player_aircraft) {
             self.player_aircraft = first.clone();
@@ -373,9 +398,13 @@ impl Settings {
     }
 
     fn load_file() -> Self {
-        match std::fs::read_to_string(SETTINGS_FILE) {
+        let path = settings_path();
+        // Earlier versions saved next to the game; pick that up once.
+        let text =
+            std::fs::read_to_string(&path).or_else(|_| std::fs::read_to_string(SETTINGS_FILE));
+        match text {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                warn!("Ignoring unreadable {SETTINGS_FILE}: {e}");
+                warn!("Ignoring unreadable {}: {e}", path.display());
                 Settings::default()
             }),
             Err(_) => Settings::default(),
@@ -385,8 +414,16 @@ impl Settings {
     fn save(&self) {
         match serde_json::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(SETTINGS_FILE, text) {
-                    warn!("Could not save {SETTINGS_FILE}: {e}");
+                let path = settings_path();
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                // Write to a temporary file first so a crash can't leave a
+                // half-written settings file behind.
+                let tmp = path.with_extension("json.tmp");
+                let result = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path));
+                if let Err(e) = result {
+                    warn!("Could not save {}: {e}", path.display());
                 }
             }
             Err(e) => warn!("Could not serialize settings: {e}"),
@@ -420,6 +457,11 @@ pub fn key_name(key: KeyCode) -> String {
     raw
 }
 
+/// The stock Yak-3 preset, which can't be edited or deleted.
+pub fn is_builtin(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(&AircraftCard::yak3().name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,6 +486,36 @@ mod tests {
         assert_eq!(back.units, Units::Nautical);
         assert_eq!(back.key(Action::FreeLook), KeyCode::KeyC);
         assert!((back.sensitivity - 1.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn many_presets_round_trip() {
+        let mut s = Settings::default();
+        for i in 0..40 {
+            let mut card = AircraftCard::yak3();
+            card.name = format!("Plane {i}");
+            card.mass = None;
+            s.save_card(card).unwrap();
+        }
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.aircraft.len(), 41);
+        assert_eq!(back.card("Plane 39").mass, None);
+    }
+
+    #[test]
+    fn built_in_yak_is_locked() {
+        let mut s = Settings::default();
+        let mut edited = AircraftCard::yak3();
+        edited.power = 5000.0;
+        assert!(s.save_card(edited.clone()).is_err());
+        assert!(s.delete_card("Yak-3").is_err());
+        assert_eq!(s.card("Yak-3").power, 1320.0);
+
+        // An old save with an edited Yak-3 gets the stock one back.
+        s.aircraft = vec![edited];
+        s.ensure_aircraft();
+        assert_eq!(s.aircraft.len(), 1);
+        assert_eq!(s.card("Yak-3").power, 1320.0);
     }
 
     #[test]
