@@ -789,6 +789,124 @@ fn instructor_tuned(
     let yaw = ((yaw_err * tune.rudder_gain + rel.y * tune.rudder_damp)
         * (1.0 - w * tune.rudder_fade))
         .clamp(-1.0, 1.0);
+    let large = Controls {
+        pitch,
+        roll,
+        yaw,
+        throttle: 0.0,
+    };
+
+    // Within a few tens of degrees, fly a coordinated turn instead: one
+    // smooth "turn this way at this rate" command sets the bank, the pull
+    // and the rudder together, so all three move in step.
+    let fine = coordinated(model, body, aim, q, tune, dt);
+    let fwd = body.forward();
+    let steep = smoothstep(1.1, 1.35, fwd.y.abs().clamp(0.0, 1.0).asin());
+    let wl = smoothstep(tune.big_lo, tune.big_hi, off_nose).max(steep);
+    if wl <= 0.0 {
+        return fine;
+    }
+    if wl >= 1.0 {
+        return large;
+    }
+    Controls {
+        pitch: fine.pitch + (large.pitch - fine.pitch) * wl,
+        roll: fine.roll + (large.roll - fine.roll) * wl,
+        yaw: fine.yaw + (large.yaw - fine.yaw) * wl,
+        throttle: 0.0,
+    }
+}
+
+/// Coordinated-turn mouse aim for aims near the nose. The heading and
+/// climb errors become a wanted turn rate and climb rate; from those come
+/// the bank angle for a coordinated turn, the angle of attack for the pull,
+/// and the rudder, all as smooth functions of the same command.
+fn coordinated(
+    model: &FlightModel,
+    body: &mut Body,
+    aim: Vec3,
+    q: f32,
+    tune: InstructorTuning,
+    dt: f32,
+) -> Controls {
+    let v = body.speed().max(20.0);
+    let fwd = body.forward();
+    let right = body.rotation * Vec3::X;
+    let up = body.rotation * Vec3::Y;
+    let local = body.rotation.inverse() * aim;
+    let heading = |d: Vec3| d.x.atan2(-d.z);
+    let elev = |d: Vec3| d.y.clamp(-1.0, 1.0).asin();
+    let mut psi_err = heading(aim) - heading(fwd);
+    if psi_err > std::f32::consts::PI {
+        psi_err -= std::f32::consts::TAU;
+    } else if psi_err < -std::f32::consts::PI {
+        psi_err += std::f32::consts::TAU;
+    }
+    let theta = elev(fwd);
+    let th_err = elev(aim) - theta;
+
+    // How fast the aim itself is moving (right and up).
+    let flat = Vec3::new(aim.x, 0.0, aim.z).normalize_or(Vec3::NEG_Z);
+    let psi_rate_aim = -body.aim_rate.y * tune.aim_feed;
+    let th_rate_aim = body.aim_rate.dot(flat.cross(Vec3::Y)) * tune.aim_feed;
+
+    // The tightest turn available without stalling.
+    let w = model.mass * G;
+    let n_avail = (0.85 * model.cl_max * q * model.wing_area / w)
+        .min(model.g_limit)
+        .max(1.0);
+    let w_max = G * (n_avail * n_avail - 1.0).sqrt() / v;
+    let turn = (tune.kh * psi_err + psi_rate_aim).clamp(-w_max, w_max);
+    let climb = (tune.kv * th_err + th_rate_aim).clamp(-w_max, w_max);
+
+    // Bank for a coordinated turn at that rate (right bank positive).
+    let phi = (-right.y).atan2(up.y);
+    let cos_t = theta.cos().max(0.2);
+    // Small corrections need only a little bank; the rudder does the rest.
+    // (The bank that follows the aim's own motion isn't capped.)
+    let phi_follow = (v * psi_rate_aim.clamp(-w_max, w_max) * cos_t / G).atan();
+    let bank_cap = (tune.k_phi_cap * psi_err.abs()).min(1.4);
+    let phi_wanted = (phi_follow
+        + ((v * turn * cos_t / G).atan() - phi_follow).clamp(-bank_cap, bank_cap))
+    .clamp(-1.4, 1.4);
+    let roll_rate_wanted = tune.k_bank * (phi_wanted - phi);
+    let speed_ratio = (v / ROLL_REF_SPEED).clamp(0.2, 2.5);
+    let full = (model.roll_rate * speed_ratio.min(1.2)).max(0.3);
+    let roll_rate_now = -body.omega.z;
+    let roll = ((roll_rate_wanted - roll_rate_now * tune.roll_damp) / full).clamp(-1.0, 1.0);
+
+    // Body pitch and yaw rates that make that turn and climb at the
+    // current bank.
+    let (sp, cp) = phi.sin_cos();
+    let q_body = climb * cp + turn * cos_t * sp;
+    let r_body = turn * cos_t * cp - climb * sp;
+
+    // Pull: the angle of attack whose lift gives that pitch rate and holds
+    // the nose up against gravity, plus a small correction on the error.
+    let pitch_err = local.y.atan2(-local.z);
+    if pitch_err.abs() < 0.01 {
+        body.trim = (body.trim + pitch_err * tune.trim_gain * dt).clamp(-0.02, 0.02);
+    } else {
+        body.trim *= 1.0 - (4.0 * dt).min(1.0);
+    }
+    let alpha_ff = if q > 50.0 {
+        model.mass * (v * q_body + G * theta.cos() * cp) / (q * model.wing_area * model.cl_alpha)
+    } else {
+        0.0
+    };
+    let alpha_wanted = alpha_ff
+        + tune.kq * (q_body - body.omega.x)
+        + tune.k_pitch * pitch_err
+        + body.trim;
+    let alpha_limit = 0.88 * model.alpha_stall;
+    let alpha_max = ELEVATOR_ALPHA * model.alpha_stall;
+    let pitch = (alpha_wanted.clamp(-0.5 * alpha_limit, alpha_limit) / alpha_max).clamp(-1.0, 1.0);
+
+    // Rudder: the yaw part of the turn, plus fine aim on what's left.
+    let yaw_err = local.x.atan2(-local.z);
+    let yaw_rate_now = -body.omega.y;
+    let yaw = (tune.k_rudder * yaw_err + tune.k_rudder_rate * (r_body - yaw_rate_now))
+        .clamp(-1.0, 1.0);
 
     Controls {
         pitch,
@@ -818,6 +936,24 @@ struct InstructorTuning {
     rate_smooth: f32,
     /// How much of the aim's motion to lead (0 = none, 1 = all).
     aim_feed: f32,
+    // Coordinated mode (near the nose).
+    /// Below `big_lo` off the nose it's all coordinated; above `big_hi`
+    /// it's all "roll the aim over the canopy" (radians).
+    big_lo: f32,
+    big_hi: f32,
+    /// Turn and climb rate wanted per radian of error, 1/s.
+    kh: f32,
+    kv: f32,
+    /// Roll rate wanted per radian of bank error, 1/s.
+    k_bank: f32,
+    roll_damp: f32,
+    kq: f32,
+    k_pitch: f32,
+    trim_gain: f32,
+    k_rudder: f32,
+    k_rudder_rate: f32,
+    /// Bank allowed per radian of heading error.
+    k_phi_cap: f32,
 }
 
 impl InstructorTuning {
@@ -836,6 +972,18 @@ impl InstructorTuning {
             aim_smooth: 0.06,
             rate_smooth: 0.1,
             aim_feed: 1.0,
+            big_lo: 0.35,
+            big_hi: 0.7,
+            kh: 8.0,
+            kv: 10.0,
+            k_bank: 2.0,
+            roll_damp: 0.35,
+            kq: 0.1,
+            k_pitch: 5.0,
+            trim_gain: 1.0,
+            k_rudder: 80.0,
+            k_rudder_rate: 8.0,
+            k_phi_cap: 16.0,
         }
     }
 }
@@ -1390,14 +1538,50 @@ mod jump_probe {
 }
 
 #[cfg(test)]
-mod smooth_sweep {
+pub mod smooth_sweep_pub {
     use super::jump_probe::mouse_sweep;
+    #[allow(unused_imports)]
     use super::settle_probe::settle_time_fps;
     use super::*;
+
+    /// Step the aim and count stick reversals (a control swinging one way
+    /// then back), plus the largest bank.
+    pub fn reversals(t: InstructorTuning, yaw_deg: f32) -> (f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 150.0);
+        let dt = 1.0 / 60.0;
+        let aim = super::jump_probe::dir(yaw_deg, 0.0);
+        let mut prev = Controls::default();
+        let mut prev_d = [0.0f32; 3];
+        let mut flips = 0.0;
+        let mut max_bank = 0.0f32;
+        for _ in 0..(60 * 3) {
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, t);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            let d = [c.pitch - prev.pitch, c.roll - prev.roll, c.yaw - prev.yaw];
+            for i in 0..3 {
+                if d[i].abs() > 0.01 && prev_d[i].abs() > 0.01 && d[i].signum() != prev_d[i].signum() {
+                    flips += 1.0;
+                }
+                if d[i].abs() > 0.01 {
+                    prev_d[i] = d[i];
+                }
+            }
+            prev = c;
+            max_bank = max_bank.max((b.rotation * Vec3::X).y.abs().asin().to_degrees());
+        }
+        (flips, max_bank)
+    }
 
     fn score(t: InstructorTuning) -> (f32, String) {
         let mut total = 0.0;
         let mut out = String::new();
+        for a in [3.0, 8.0] {
+            let (f, mb) = reversals(t, -a);
+            total += f * 0.5 + (mb - a * 3.0).max(0.0) * 0.1;
+            out += &format!("<{a}: flips {f} bank {mb:.0}> ");
+        }
         for (a, p) in [
             (3.0, 1.0),
             (10.0, 0.0),
@@ -1423,19 +1607,20 @@ mod smooth_sweep {
         let base = InstructorTuning::get();
         println!("base {:.2} {}", score(base).0, score(base).1);
         let mut best = (score(base).0, base);
-        for sm in [0.0, 0.03, 0.06, 0.1] {
-            for hb in [20.0, 35.0] {
-                for rg in [60.0, 100.0, 150.0] {
-                    for rd in [2.0, 4.0, 8.0] {
-                        for rf in [0.0, 0.5] {
-                            for ff in [0.0, 0.5, 1.0] {
+        for kh in [6.0, 8.0, 12.0] {
+            for kb in [1.5, 2.0, 3.0] {
+                for kr in [30.0, 50.0, 80.0] {
+                    for krr in [4.0, 8.0, 12.0] {
+                        for cap in [12.0, 16.0, 24.0] {
+                            for kp in [3.0, 5.0, 8.0] {
                                 let t = InstructorTuning {
-                                    aim_smooth: sm,
-                                    heading_bank: hb,
-                                    rudder_gain: rg,
-                                    rudder_damp: rd,
-                                    rudder_fade: rf,
-                                    aim_feed: ff,
+                                    kh,
+                                    kv: kp * 2.0,
+                                    k_bank: kb,
+                                    k_rudder: kr,
+                                    k_rudder_rate: krr,
+                                    k_phi_cap: cap,
+                                    k_pitch: kp,
                                     ..base
                                 };
                                 let sc = score(t).0;
@@ -1450,15 +1635,70 @@ mod smooth_sweep {
         }
         let t = best.1;
         println!(
-            "best {:.2}: smooth {} hb {} rg {} rd {} rf {} feed {}\n{}",
-            best.0,
-            t.aim_smooth,
-            t.heading_bank,
-            t.rudder_gain,
-            t.rudder_damp,
-            t.rudder_fade,
-            t.aim_feed,
+            "best {:.2}: kh {} kv {} kb {} kr {} krr {} cap {} kp {}\n{}",
+            best.0, t.kh, t.kv, t.k_bank, t.k_rudder, t.k_rudder_rate, t.k_phi_cap, t.k_pitch,
             score(t).1
         );
+    }
+}
+
+#[cfg(test)]
+mod compare_probe {
+    use super::*;
+
+    /// Pitch, roll and yaw move together without swinging back and forth.
+    #[test]
+    fn small_turns_are_smooth_and_coordinated() {
+        let t = InstructorTuning::get();
+        for a in [3.0, 8.0] {
+            let (flips, bank) = super::smooth_sweep_pub::reversals(t, -a);
+            println!("{a} deg step: {flips} stick reversals, max bank {bank:.0}");
+            assert!(flips <= 4.0, "{a} deg: {flips} reversals");
+            assert!(bank < a * 4.5, "{a} deg: bank {bank}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn compare() {
+        let new = InstructorTuning::get();
+        let old = InstructorTuning {
+            big_lo: -2.0,
+            big_hi: -1.0,
+            ..new
+        };
+        let hi = InstructorTuning {
+            kh: 8.0,
+            kv: 10.0,
+            k_bank: 2.0,
+            k_rudder: 80.0,
+            k_rudder_rate: 8.0,
+            k_phi_cap: 16.0,
+            k_pitch: 5.0,
+            ..new
+        };
+        let mid = InstructorTuning {
+            kh: 5.0,
+            kv: 6.0,
+            k_bank: 3.0,
+            k_rudder: 40.0,
+            k_rudder_rate: 4.0,
+            k_phi_cap: 12.0,
+            k_pitch: 3.0,
+            ..new
+        };
+        for (name, t) in [("old", old), ("hi", hi), ("mid", mid)] {
+            let mut line = format!("{name}: ");
+            for a in [3.0, 8.0, 20.0] {
+                let (f, mb) = super::smooth_sweep_pub::reversals(t, -a);
+                let (ts, _) = super::settle_probe::settle_time_fps(a, 0.0, t, 60.0);
+                line += &format!("[{a}: flips {f} bank {mb:.0} settle {ts:.2}] ");
+            }
+            for rate in [5.0, 15.0] {
+                let (c, j, e) = super::jump_probe::mouse_sweep(t, rate, 60.0);
+                line += &format!("[{rate}/s c{c:.1} j{j:.2} e{e:.2}] ");
+            }
+            println!("{line}");
+        }
     }
 }
