@@ -1,0 +1,14 @@
+[package]
+name = "wtaimtrain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.20.1"
+
+# Faster dev builds: optimize dependencies, keep our code quick to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
