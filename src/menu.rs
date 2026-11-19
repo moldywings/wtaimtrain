@@ -702,7 +702,7 @@ fn settings_page(
 
                 col.spawn(section_header("Mouse"));
                 col.spawn(label(
-                    "Move: aim\nRight click: toggle zoom\nLeft click: shoot (coming soon)",
+                    "Move: aim\nRight click: toggle zoom\nLeft click (hold): fire",
                     15.0,
                     TEXT,
                 ));
