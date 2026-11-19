@@ -654,6 +654,16 @@ pub fn alpha_beta(rotation: Quat, velocity: Vec3) -> (f32, f32) {
 /// stall angle. A bit over 1 so you can stall it by yanking at low speed.
 const ELEVATOR_ALPHA: f32 = 1.2;
 const RUDDER_BETA: f32 = 0.12;
+/// Side force per radian of sideslip (times dynamic pressure and wing
+/// area). Enough that the rudder alone can swing the flight path a few
+/// degrees a second, as in the game, so small aim moves need little bank.
+const SIDE_FORCE: f32 = 1.6;
+
+/// How fast the rudder alone (wings level, a full slip) turns the flight
+/// path, rad/s.
+fn rudder_turn_rate(model: &FlightModel, q: f32, v: f32) -> f32 {
+    (q * model.wing_area * SIDE_FORCE * RUDDER_BETA * 0.8 / (model.mass * v.max(20.0))).max(0.005)
+}
 
 /// Advance one aircraft by `dt` seconds. Splits large steps for stability.
 pub fn step(model: &FlightModel, body: &mut Body, controls: &Controls, dt: f32) {
@@ -688,7 +698,7 @@ fn substep(m: &FlightModel, b: &mut Body, c: &Controls, dt: f32) {
     let side_dir = (right - vhat * right.dot(vhat)).normalize_or_zero();
     let lift = lift_dir * (q * s * cl);
     let drag = -vhat * (q * s * cd);
-    let side = side_dir * (-q * s * 0.8 * beta);
+    let side = side_dir * (-q * s * SIDE_FORCE * beta);
     let thrust = fwd * m.thrust(v, b.position.y, c.throttle);
     let gravity = Vec3::NEG_Y * (m.mass * G);
     let accel = (lift + drag + side + thrust + gravity) / m.mass;
@@ -941,7 +951,7 @@ fn roll_over_weight(
     let pull_rate = (G * (n_avail * n_avail - 1.0).sqrt() / v).max(0.05);
     let roll_rate = roll_authority(model, v).max(0.3);
     let slip = RUDDER_BETA * 0.8;
-    let slip_rate = (q * model.wing_area * 0.8 * slip / (model.mass * v)).max(0.005);
+    let slip_rate = rudder_turn_rate(model, q, v);
     // Rudder plus a shallow coordinated bank covers this much sideways
     // quickly.
     let reach = tune.flat_reach;
@@ -1014,7 +1024,11 @@ fn coordinated(
     let cos_t = theta.cos().max(0.2);
     // Small corrections need only a little bank; the rudder does the rest.
     // (The bank that follows the aim's own motion isn't capped.)
-    let phi_follow = (v * psi_rate_aim.clamp(-w_max, w_max) * cos_t / G).atan();
+    // Only the part of the aim's sideways motion the rudder can't follow on
+    // its own: slow drags are flown nearly wings level, like the game.
+    let rudder_rate = rudder_turn_rate(model, q, v) * tune.rudder_follow;
+    let follow = psi_rate_aim.signum() * (psi_rate_aim.abs() - rudder_rate).max(0.0);
+    let phi_follow = (v * follow.clamp(-w_max, w_max) * cos_t / G).atan();
     let bank_cap = (tune.k_phi_cap * psi_err.abs()).min(1.4);
     let phi_wanted = (phi_follow
         + ((v * turn * cos_t / G).atan() - phi_follow).clamp(-bank_cap, bank_cap))
@@ -1111,6 +1125,8 @@ struct InstructorTuning {
     roll_bias: f32,
     /// How far sideways (rad) pitch-and-rudder covers quickly.
     flat_reach: f32,
+    /// Share of the rudder's own turn rate to fly without banking.
+    rudder_follow: f32,
     /// Time constants for easing into and out of rolling, s.
     roll_in: f32,
     roll_out: f32,
@@ -1149,6 +1165,7 @@ impl InstructorTuning {
             roll_margin: 0.3,
             roll_bias: -0.2,
             flat_reach: 0.17,
+            rudder_follow: 0.8,
             roll_in: 0.08,
             roll_out: 0.4,
         }
@@ -2079,6 +2096,77 @@ mod wt_trace {
                     c.roll,
                     c.pitch,
                     c.yaw
+                );
+            }
+        }
+    }
+}
+
+/// Tracking an aim that sweeps sideways at a steady rate, like a slow
+/// mouse drag: how much it banks and how far behind the nose lags.
+#[cfg(test)]
+mod track_probe {
+    use super::*;
+
+    pub(super) fn track(t: InstructorTuning, rate_deg: f32, up_deg: f32) -> (f32, f32) {
+        let m = FlightModel::from_card(&AircraftCard::yak3());
+        let mut b = Body::new(Vec3::new(0.0, 1500.0, 0.0), Quat::IDENTITY, 140.0);
+        let dt = 1.0 / 120.0;
+        let (mut bank, mut err) = (0.0f32, 0.0f32);
+        let n = 120 * 3;
+        for i in 0..n {
+            let tt = i as f32 * dt;
+            let aim = Quat::from_euler(
+                bevy::math::EulerRot::YXZ,
+                -(rate_deg * tt).to_radians(),
+                (up_deg * tt).to_radians(),
+                0.0,
+            ) * Vec3::NEG_Z;
+            let mut c = instructor_tuned(&m, &mut b, aim, dt, t);
+            c.throttle = 1.0;
+            step(&m, &mut b, &c, dt);
+            if tt > 1.0 {
+                let up = b.rotation * Vec3::Y;
+                let right = b.rotation * Vec3::X;
+                bank = bank.max((-right.y).atan2(up.y).abs().to_degrees());
+                err += b.forward().angle_between(aim).to_degrees() / (n as f32 - 120.0);
+            }
+        }
+        (bank, err)
+    }
+
+    #[test]
+    #[ignore]
+    fn track_probe() {
+        let cur = InstructorTuning::get();
+        for (name, t) in [
+            ("cur", cur),
+            (
+                "cap 3",
+                InstructorTuning {
+                    k_phi_cap: 3.0,
+                    ..cur
+                },
+            ),
+            (
+                "follow 1.2",
+                InstructorTuning {
+                    rudder_follow: 1.2,
+                    ..cur
+                },
+            ),
+        ] {
+            for (r, u) in [
+                (1.0, 0.0),
+                (2.0, 0.0),
+                (4.0, 0.0),
+                (8.0, 0.0),
+                (15.0, 0.0),
+                (3.0, 2.0),
+            ] {
+                let (bank, err) = track(t, r, u);
+                println!(
+                    "{name}: {r} deg/s right, {u} up: max bank {bank:.0}, mean lag {err:.2} deg"
                 );
             }
         }
