@@ -303,16 +303,18 @@ pub enum Scenario {
     Chase,
     Stall,
     Dogfight,
+    Banking,
     /// A random one of the others each time.
     AllInOne,
 }
 
 impl Scenario {
-    pub const ALL: [Scenario; 5] = [
+    pub const ALL: [Scenario; 6] = [
         Scenario::HeadOn,
         Scenario::Chase,
         Scenario::Stall,
         Scenario::Dogfight,
+        Scenario::Banking,
         Scenario::AllInOne,
     ];
 
@@ -322,6 +324,7 @@ impl Scenario {
             Scenario::Chase => "Chase",
             Scenario::Stall => "Stall",
             Scenario::Dogfight => "Dogfight",
+            Scenario::Banking => "Banking",
             Scenario::AllInOne => "All in one",
         }
     }
@@ -344,6 +347,12 @@ impl Scenario {
             Scenario::Dogfight => {
                 "The target starts close by, at a random spot, height, heading and \
                  speed. It tries to ram you, or with enemy fire on, to shoot you down."
+            }
+            Scenario::Banking => {
+                "The target starts ahead of you, off to one side and above, below or \
+                 level, then pulls a hard banked turn: usually across your nose, \
+                 sometimes away. Each run takes a different path across the screen: \
+                 low to high, high to low, or straight across."
             }
             Scenario::AllInOne => "A random scenario every time it resets.",
         }
