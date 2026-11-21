@@ -27,7 +27,9 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | S / W | Pitch up / down (overrides mouse aim while held) |
 | A / D | Roll left / right |
 | Q / E | Yaw left / right |
-| L Alt (hold) | Free look (the aim circle rides along with the crosshair, so the plane flies straight) |
+| L Alt (hold) | Free look. The view holds still and level while you look all the way round, and the keyboard turns the plane under it (the aim circle rides along with the crosshair, so the plane flies straight) |
+| F6 | Gunner view, on planes with at least one turret. The mouse aims every turret, left click fires them, and you fly with the keys |
+| F3 | Back to the pilot view |
 | R | Restart the scenario (in multiplayer the host holds it 3 s to start a round) |
 | Tab (hold) | Multiplayer scoreboard |
 | Esc | Pause menu |
@@ -62,7 +64,7 @@ Roll rate builds up with speed to the preset's best roll rate at its best roll s
 
 ## Weapons
 
-A gun preset has a name, muzzle velocity (m/s), projectile mass (kg), fire rate (rounds per minute) and tracer color. Caliber, spread and hits to kill are optional. A blank caliber is estimated from the projectile mass, spread is the width of the circle the rounds land in at 500 m, in meters (1 m by default), and hits to kill comes from the caliber (about 6 for 20 mm, 16 for 12.7 mm, 50 for 7.62 mm). Hits from different guns add up: each takes its share of the target's health. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. Tracers are true to caliber: a solid white core with a bright glow around it in the tracer color, kept about a pixel wide far away. They disappear after 2.5 miles (about 4 km).
+A gun preset has a name, muzzle velocity (m/s), projectile mass (kg), fire rate (rounds per minute), tracer color, and how many rounds there are for each tracer. Caliber, spread, hits to kill and the tracer ratio are optional. Rounds between tracers are invisible but still fly and hit. A blank tracer ratio is 1 in 4 for 12.7 mm and smaller, and 1 in 3 for bigger guns (the ShVAK is 1 in 3, the UBS 1 in 4). A blank caliber is estimated from the projectile mass, spread is the width of the circle the rounds land in at 500 m, in meters (1 m by default), and hits to kill comes from the caliber (about 6 for 20 mm, 16 for 12.7 mm, 50 for 7.62 mm). Hits from different guns add up: each takes its share of the target's health. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. Tracers are true to caliber: a solid white core with a bright glow around it in the tracer color, kept about a pixel wide far away. They disappear after 2.5 miles (about 4 km).
 
 Gunshots and hits have sounds made in code, with no sound files. Small, fast rounds crack higher and big, slow ones boom lower. The built-in gun is the 20 mm ShVAK (800 m/s, 0.1 kg, 800 rpm), and it can't be changed or deleted. The 12.7 mm UBS comes as a second preset.
 
@@ -94,6 +96,22 @@ One player hosts from the Multiplayer page, and the others type the host's addre
 - Hits, eliminations ("X was eliminated by Y") and wins are worked out by the host. Eliminated players watch the others: left click for the next player, right click for the previous one. Hold Tab for the scoreboard: wins, kills and deaths in free for all; each team's round wins and every player's kills and deaths in team deathmatch.
 - The pause menu doesn't pause the game for everyone: your plane keeps flying while it's open.
 
+## Models
+
+Each aircraft preset picks one of four models on the Aircraft page: Fighter (Yak-3), Heavy Fighter (F7F), Jet Fighter (F11F-1) or Bomber (Avro Shackleton). Each one is scaled to the real plane's length and span, and the chase camera sits where the game puts it for that plane, measured from the reference videos. Presets that haven't picked a model get the jet if they have a jet engine, the heavy fighter with two engines, and the bomber with three or more.
+
+## Damage models
+
+Each preset also picks a damage model. **Fighter**: hits add up until the plane goes down, and a hit on the cockpit brings it down at once. **Bomber**: only a cockpit hit brings it down. A bomber with no fixed guns, only turrets, also goes down once every turret is destroyed.
+
+## Turrets
+
+The Weapons page has a turret column for the loadout's aircraft preset: up to 2 on top, 2 underneath, 1 in the nose and 1 in the tail. Top and bottom turrets are cubes and slide along the fuselage on a slider, and they can face forward or back. Nose and tail turrets are balls. Each turret carries 1 to 4 guns of one gun preset (1 in the middle, 2 or 3 in a row, 4 in a rectangle), has left, right, down and up traverse limits, and a traverse speed (60 deg/s by default). All turrets aim at the same point 400 m out from the plane's center; this can't be changed.
+
+A turret turns toward the aim point at its traverse speed. When the point is outside its limits, it swings as close as it can. It won't fire while it's held at a limit with the aim beyond it, but it does fire while it's still turning toward it.
+
+Turrets take their own damage and are knocked out one by one, with a small explosion. A destroyed turret disappears and can't be used. AI gunners lead the nearest enemy and fire in bursts, with some aim error. Against a plane with the Bomber damage model, AI pilots aim at the cockpit or a live turret, whichever faces them best. Some dodge when you shoot at them and some never do.
+
 ## Layout
 
 - `src/camera.rs` handles mouse aim and the chase camera.
@@ -108,7 +126,11 @@ One player hosts from the Multiplayer page, and the others type the host's addre
 - `src/weapons.rs` holds gun presets, loadouts and mount positions, firing, ballistics and hit detection.
 - `src/multiplayer.rs` hosts and joins games (renet over UDP), runs rounds and shows the scoreboard.
 - `assets/presets.json` holds extra gun and aircraft presets that are added to everyone's game once.
-- `assets/models/airplane.glb` is the aircraft model. It's scaled 1.33x in code to roughly match a real Yak-3.
+- `src/models.rs` holds the four plane models: their size, camera spot, gun spots, hit boxes and turret placement.
+- `src/turrets.rs` places, aims and fires turrets, and draws them.
+- `src/damage.rs` holds the Fighter and Bomber damage models.
+- `src/ai.rs` flies AI planes.
+- `assets/models/` holds the plane models (`fighter.glb`, `heavyfighter.glb`, `jetfighter.glb`, `bomber.glb`), the turret models and the gun model.
 
 ## Roadmap
 

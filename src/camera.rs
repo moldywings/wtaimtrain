@@ -3,6 +3,8 @@
 //! (see `flight`). Like War Thunder, a quick flick moves the circle off
 //! center before the view catches up. Holding the free look key turns the
 //! camera without moving the aim; the right mouse button toggles zoom.
+//! Planes with turrets have a gunner view (F6, back with F3): the mouse
+//! swings the gunsight round the plane and the keys fly it.
 
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::pbr::{DistanceFog, FogFalloff};
@@ -18,11 +20,13 @@ pub struct CameraPlugin;
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MouseAim>()
+            .init_resource::<GunnerView>()
             .add_systems(Startup, spawn_camera)
             .add_systems(
                 Update,
                 (
-                    update_mouse_aim
+                    (switch_view, update_mouse_aim)
+                        .chain()
                         .before(crate::flight::fly_player)
                         .run_if(in_state(GameState::Playing)),
                     follow_player.after(crate::flight::fly_player),
@@ -100,6 +104,31 @@ impl MouseAim {
     }
 }
 
+/// Gunner view: on, and where the gunsight looks (world yaw and pitch, rad).
+#[derive(Resource, Default)]
+pub struct GunnerView {
+    pub active: bool,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+/// Yaw and pitch of a direction (yaw 0 looks along -Z, + turns left).
+fn yaw_pitch(dir: Vec3) -> (f32, f32) {
+    let d = dir.normalize_or(Vec3::NEG_Z);
+    ((-d.x).atan2(-d.z), d.y.clamp(-1.0, 1.0).asin())
+}
+
+fn from_yaw_pitch(yaw: f32, pitch: f32) -> Quat {
+    Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0)
+}
+
+fn wrap(a: f32) -> f32 {
+    (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+}
+
+/// Free look and the gunsight can look nearly straight up or down.
+const MAX_LOOK_PITCH: f32 = 1.55;
+
 #[derive(Component)]
 pub struct ChaseCamera {
     /// The view direction, which trails the aim direction.
@@ -116,16 +145,8 @@ pub struct ChaseCamera {
     zoom: f32,
 }
 
-/// Camera offset behind and above the player, in view space, measured
-/// from War Thunder's chase view: the plane sits about 15 m ahead and
-/// 3.6 m below the line of sight (about 14 degrees below it).
-const CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 3.6, 15.0);
-/// Zoomed in, the game pulls the camera in close over the tail, so only
-/// the top of the fuselage shows at the bottom of the screen.
-const ZOOM_OFFSET: Vec3 = Vec3::new(0.0, 3.4, 11.0);
-/// The view points this far below the aim, so the aim circle sits a
-/// little above the middle of the screen, as in the game.
-const VIEW_TILT_DEG: f32 = 3.3;
+// Each airframe has its own camera distance, height and tilt (see
+// `models`): measured from War Thunder's chase view for each aircraft.
 
 /// How quickly the view catches up with the aim circle (1/s). Higher is snappier.
 const CAMERA_FOLLOW_RATE: f32 = 5.0;
@@ -181,6 +202,42 @@ fn spawn_camera(mut commands: Commands) {
     ));
 }
 
+/// F6 switches to gunner view (planes with a working turret), F3 back.
+fn switch_view(
+    keys: Res<ButtonInput<KeyCode>>,
+    settings: Res<Settings>,
+    mut gunner: ResMut<GunnerView>,
+    camera: Single<&Transform, With<ChaseCamera>>,
+    player: Single<Option<&crate::turrets::Turrets>, With<Player>>,
+    mp: Res<crate::multiplayer::Mp>,
+) {
+    let has_turret = player.is_some_and(|t| t.any_alive()) && mp.alive();
+    if settings.just_pressed(&keys, Action::GunnerView) && has_turret && !gunner.active {
+        // Start looking where the camera looks now.
+        let (yaw, pitch) = yaw_pitch(camera.forward().as_vec3());
+        *gunner = GunnerView {
+            active: true,
+            yaw,
+            pitch,
+        };
+    }
+    // Testing aid: WTAT_GUNNER="yaw,pitch" (degrees) starts in gunner view.
+    if let Ok(v) = std::env::var("WTAT_GUNNER")
+        && has_turret
+        && !gunner.active
+    {
+        let mut n = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok());
+        *gunner = GunnerView {
+            active: true,
+            yaw: n.next().unwrap_or(0.0).to_radians(),
+            pitch: n.next().unwrap_or(0.0).to_radians(),
+        };
+    }
+    if (settings.just_pressed(&keys, Action::PilotView) || !has_turret) && gunner.active {
+        gunner.active = false;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_mouse_aim(
     time: Res<Time<Real>>,
@@ -190,12 +247,14 @@ fn update_mouse_aim(
     settings: Res<Settings>,
     mut aim: ResMut<MouseAim>,
     mut camera: Single<&mut ChaseCamera>,
+    mut gunner: ResMut<GunnerView>,
     player: Single<&Transform, With<Player>>,
 ) {
-    camera.free_looking = settings.pressed(&keys, Action::FreeLook);
-    // While free looking the aim rides on the gun crosshair (the nose), so
-    // the plane holds its course and the aim circle sits in the crosshair.
-    if camera.free_looking {
+    camera.free_looking = settings.pressed(&keys, Action::FreeLook) && !gunner.active;
+    // While free looking (or in gunner view, where the keys fly the plane)
+    // the aim rides on the gun crosshair (the nose), so the plane holds its
+    // course and the aim circle sits in the crosshair.
+    if camera.free_looking || gunner.active {
         let nose = player.forward().as_vec3();
         if nose.y.abs() < 0.97 {
             let goal = Transform::default().looking_to(nose, Vec3::Y).rotation;
@@ -212,10 +271,18 @@ fn update_mouse_aim(
     let narrowing =
         (current_fov(camera.zoom).to_radians() * 0.5).tan() / (NORMAL_FOV.to_radians() * 0.5).tan();
     let zoom = narrowing.sqrt() * (1.0 + (settings.zoom_sensitivity - 1.0) * camera.zoom);
-    if camera.free_looking {
+    if gunner.active {
+        let delta = motion.delta * settings.aim_per_pixel() * zoom;
+        gunner.yaw = wrap(gunner.yaw - delta.x);
+        gunner.pitch = (gunner.pitch - delta.y).clamp(-MAX_LOOK_PITCH, MAX_LOOK_PITCH);
+    } else if camera.free_looking {
+        // All the way round, and up or down to straight over or under the
+        // plane (limited where the view itself already points).
         let delta = motion.delta * settings.look_per_pixel() * zoom;
-        camera.look_goal.x = (camera.look_goal.x - delta.x).clamp(-3.0, 3.0);
-        camera.look_goal.y = (camera.look_goal.y - delta.y).clamp(-1.4, 1.4);
+        let (_, base_pitch) = yaw_pitch(camera.view * Vec3::NEG_Z);
+        camera.look_goal.x -= delta.x;
+        camera.look_goal.y = (camera.look_goal.y - delta.y)
+            .clamp(-MAX_LOOK_PITCH - base_pitch, MAX_LOOK_PITCH - base_pitch);
     } else {
         let delta = motion.delta * settings.aim_per_pixel() * zoom;
         aim.turn(delta.x, -delta.y);
@@ -226,23 +293,34 @@ fn current_fov(zoom: f32) -> f32 {
     NORMAL_FOV + (ZOOM_FOV - NORMAL_FOV) * zoom
 }
 
-#[allow(clippy::too_many_arguments)]
-fn follow_player(
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn follow_player(
     time: Res<Time<Real>>,
     state: Res<State<GameState>>,
     mouse: Res<ButtonInput<MouseButton>>,
     aim: Res<MouseAim>,
-    player: Single<&Transform, (With<Player>, Without<ChaseCamera>)>,
+    gunner: Res<GunnerView>,
+    player: Single<(&Transform, &crate::flight::Aircraft), (With<Player>, Without<ChaseCamera>)>,
     mp: Res<crate::multiplayer::Mp>,
-    remotes: Query<(&Transform, &crate::multiplayer::RemotePlane), Without<ChaseCamera>>,
+    remotes: Query<
+        (
+            &Transform,
+            &crate::flight::Aircraft,
+            &crate::multiplayer::RemotePlane,
+        ),
+        Without<ChaseCamera>,
+    >,
     camera: Single<(&mut Transform, &mut ChaseCamera, &mut Projection)>,
 ) {
     // Out of a multiplayer round: ride along behind the player you watch.
     let watched = mp
         .spectate
-        .and_then(|id| remotes.iter().find(|(_, r)| r.id == id))
-        .map(|(tf, _)| *tf);
-    let followed = watched.unwrap_or(**player);
+        .and_then(|id| remotes.iter().find(|(_, _, r)| r.id == id))
+        .map(|(tf, a, _)| (*tf, a.card.model_kind()));
+    let (followed, kind) = watched.unwrap_or((*player.0, player.1.card.model_kind()));
+    let watched = watched.map(|w| w.0);
+    let gunning = gunner.active && watched.is_none();
+    let spec = kind.spec().camera;
     let (mut tf, mut cam, mut projection) = camera.into_inner();
     // Real time so the view keeps settling smoothly in the pause menu.
     let dt = time.delta_secs();
@@ -257,14 +335,23 @@ fn follow_player(
             }
             None => aim.rotation(),
         };
-        cam.view = cam.view.slerp(goal, ease(CAMERA_FOLLOW_RATE)).normalize();
+        // Free looking (and in gunner view) the view holds still, level,
+        // wherever it was pointing, like the game: keyboard flying turns the
+        // plane under the camera instead of swinging the camera with it.
+        if cam.free_looking || gunning {
+            let (yaw, pitch) = yaw_pitch(cam.view * Vec3::NEG_Z);
+            cam.view = from_yaw_pitch(yaw, pitch);
+        } else {
+            cam.view = cam.view.slerp(goal, ease(CAMERA_FOLLOW_RATE)).normalize();
+        }
 
         // Free look eases toward where the mouse put it, and springs back
-        // once the key is released.
+        // once the key is released (the short way round).
         let k = if cam.free_looking {
             ease(LOOK_FOLLOW_RATE)
         } else {
             cam.look_goal = Vec2::ZERO;
+            cam.look_yaw = wrap(cam.look_yaw);
             ease(LOOK_RETURN_RATE)
         };
         cam.look_yaw += (cam.look_goal.x - cam.look_yaw) * k;
@@ -284,8 +371,8 @@ fn follow_player(
 
     // Testing aid: WTAT_LOOK="yaw,pitch,distance" (degrees, metres) holds
     // a fixed view of the player's plane for screenshots.
-    let mut offset = CAMERA_OFFSET.lerp(ZOOM_OFFSET, cam.zoom);
-    let mut tilt = Quat::from_rotation_x(-VIEW_TILT_DEG.to_radians());
+    let mut offset = spec.offset.lerp(spec.zoom_offset, cam.zoom);
+    let mut tilt = Quat::from_rotation_x(-spec.tilt_deg.to_radians());
     if let Ok(look) = std::env::var("WTAT_LOOK") {
         let v: Vec<f32> = look
             .split(',')
@@ -298,8 +385,20 @@ fn follow_player(
             tilt = Quat::IDENTITY;
         }
     }
-    let look = Quat::from_euler(EulerRot::YXZ, cam.look_yaw, cam.look_pitch, 0.0);
-    let rot = cam.view * look;
+    let rot = if gunning {
+        // Gunner view: a little closer and lower, the gunsight in the middle.
+        offset = spec.gunner_offset() * (1.0 - 0.25 * cam.zoom);
+        tilt = Quat::IDENTITY;
+        from_yaw_pitch(gunner.yaw, gunner.pitch)
+    } else {
+        // Free look turns about the vertical and tilts up and down, so the
+        // horizon stays level wherever you look.
+        let (yaw, pitch) = yaw_pitch(cam.view * Vec3::NEG_Z);
+        from_yaw_pitch(
+            yaw + cam.look_yaw,
+            (pitch + cam.look_pitch).clamp(-MAX_LOOK_PITCH, MAX_LOOK_PITCH),
+        )
+    };
     tf.translation = followed.translation + rot * offset;
     tf.rotation = rot * tilt;
 }
