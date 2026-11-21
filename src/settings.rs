@@ -443,10 +443,10 @@ pub struct Settings {
     pub ranges: Ranges,
     /// Show where to aim to hit the target.
     pub lead_indicator: bool,
-    /// The target shoots back.
-    pub enemy_fires: bool,
     /// One shot from each gun per click, instead of holding to fire.
     pub single_fire: bool,
+    /// Your team in team deathmatch (0 = A, 1 = B).
+    pub team: u8,
     /// Your name in multiplayer.
     pub nickname: String,
     /// Your aircraft's paint (the canopy keeps its color).
@@ -580,7 +580,8 @@ impl Scenario {
             }
             Scenario::Dogfight => {
                 "The target starts close by, at a random spot, height, heading and \
-                 speed. It tries to ram you, or with enemy fire on, to shoot you down."
+                 speed, and dogfights you: it manages its speed and throttle, keeps \
+                 clear of the ground and shoots when it has a lead on you."
             }
             Scenario::Banking => {
                 "The target starts ahead of you, off to one side and above, below or \
@@ -747,8 +748,8 @@ impl Default for Settings {
             scenario: Scenario::Chase,
             ranges: Ranges::default(),
             lead_indicator: false,
-            enemy_fires: false,
             single_fire: false,
+            team: 0,
             nickname: "Pilot".into(),
             plane_color: PlaneColor::Red,
             host: Default::default(),

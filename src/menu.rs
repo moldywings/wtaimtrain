@@ -22,14 +22,14 @@ use bevy::ui_widgets::{
 
 use crate::GameState;
 use crate::flight_model::{AircraftCard, EngineKind, FlightModel};
-use crate::multiplayer::{HOST_ID, Mp, MpCommand};
+use crate::multiplayer::{GameMode, HOST_ID, MAX_BOTS, Mp, MpCommand, team_name};
 use crate::settings::{
     Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, PlaneColor, RangeId,
     Scenario, Settings, UnitKind, Units, default_bindings, is_builtin, key_name,
 };
 use crate::weapons::{
     BELLY_BACK_MAX, BELLY_BACK_MIN, CONVERGENCE_CHOICES, GunCard, Loadout, MILS_TO_M_AT_500, Slot,
-    TracerColor, WING_OUT_MAX, WING_OUT_MIN, ballistics_at, is_builtin_gun,
+    TracerColor, WING_OUT_MAX, WING_OUT_MIN, is_builtin_gun,
 };
 
 pub struct MenuPlugin;
@@ -506,7 +506,6 @@ enum MenuAction {
     Page(Page),
     SetUnit(UnitKind, u8),
     ToggleLead,
-    ToggleEnemyFire,
     PickScenario(Scenario),
     /// Move a start distance: (which, which end: 0 near, 1 far; steps).
     Range(RangeId, u8, i32),
@@ -548,6 +547,8 @@ enum MenuAction {
     MpLeave,
     ToggleMpLead,
     ToggleFacing,
+    ToggleMode,
+    PickTeam(u8),
     HostStep(HostOpt, i32),
     LockPlayer(u64, Option<String>),
     FlyHostPreset(Option<String>),
@@ -570,6 +571,9 @@ enum HostOpt {
     SpawnDistance,
     Altitude,
     AltitudeSpread,
+    Bots,
+    BotsA,
+    BotsB,
 }
 
 impl HostOpt {
@@ -580,6 +584,7 @@ impl HostOpt {
             HostOpt::SpawnDistance => (250.0, 250.0, 12_000.0),
             HostOpt::Altitude => (250.0, 500.0, 8_000.0),
             HostOpt::AltitudeSpread => (100.0, 0.0, 3_000.0),
+            HostOpt::Bots | HostOpt::BotsA | HostOpt::BotsB => (1.0, 0.0, MAX_BOTS as f32),
         }
     }
 }
@@ -938,9 +943,9 @@ fn settings_page(
                 col.spawn(button(
                     MenuAction::ToggleSingleFire,
                     if settings.single_fire {
-                        "Single fire (one shot per click)"
+                        "Single fire"
                     } else {
-                        "Automatic (hold to fire)"
+                        "Automatic"
                     },
                     percent(100),
                 ));
@@ -1412,27 +1417,6 @@ fn weapons_page(
                     if !ui.gun_message.is_empty() {
                         col.spawn(label(&ui.gun_message, 14.0, ACCENT));
                     }
-                    if let Some(gun) = settings.guns.iter().find(|g| g.name == ui.gun_editing) {
-                        let b = ballistics_at(gun, 1000.0);
-                        let mut text = format!(
-                            "\"{}\" at 1 km (sea level): {:.2} s flight, {:.0} m/s left, {:.1} m drop.",
-                            gun.name, b.time, b.speed, b.drop
-                        );
-                        let mut filled = vec![];
-                        if gun.caliber.is_none() {
-                            filled.push(format!("caliber {:.1} mm", gun.caliber_mm()));
-                        }
-                        if gun.spread.is_none() {
-                            filled.push(format!("spread {:.1} m at 500 m", gun.spread_at_500()));
-                        }
-                        if gun.hits_to_kill.is_none() {
-                            filled.push(format!("{} hits to destroy", gun.hits_to_destroy()));
-                        }
-                        if !filled.is_empty() {
-                            text += &format!(" Filled in for you: {}.", filled.join(", "));
-                        }
-                        col.spawn(label(&text, 13.0, DIM));
-                    }
                 });
 
             // Right: where the guns go on an aircraft preset.
@@ -1493,10 +1477,8 @@ fn weapons_page(
                     )));
                     col.spawn((row(), GlobalZIndex(slot_z(slot, 0))))
                         .with_children(|r| {
-                            let guns = gun_choices(
-                                &|g| MenuAction::PickMountGun(slot, g),
-                                &mount.gun,
-                            );
+                            let guns =
+                                gun_choices(&|g| MenuAction::PickMountGun(slot, g), &mount.gun);
                             dropdown(
                                 r,
                                 Dropdown::Gun(slot),
@@ -1541,10 +1523,8 @@ fn weapons_page(
                                         &|g| MenuAction::PickStationGun(slot, i, g),
                                         &gun,
                                     );
-                                    let short = format!(
-                                        "{:.0} mm",
-                                        settings.gun(&gun).caliber_mm()
-                                    );
+                                    let short =
+                                        format!("{:.0} mm", settings.gun(&gun).caliber_mm());
                                     dropdown(
                                         r,
                                         Dropdown::StationGun(slot, i),
@@ -1615,33 +1595,6 @@ fn weapons_page(
                         px(210),
                     );
                 });
-                let guns = loadout.guns();
-                let mass_per_s: f32 = guns
-                    .iter()
-                    .map(|(_, g, _)| {
-                        let g = settings.gun(g);
-                        g.projectile_mass * g.fire_rate / 60.0
-                    })
-                    .sum();
-                col.spawn(label(
-                    &format!(
-                        "{} guns, {:.2} kg of rounds per second. {}; nose guns fire \
-                         straight ahead.",
-                        loadout.total_guns(),
-                        mass_per_s,
-                        if loadout.convergence > 0.0 {
-                            format!(
-                                "Wing and belly guns angle in sideways to meet at {}",
-                                convergence_text(settings.units, loadout.convergence)
-                            )
-                        } else {
-                            "Targeting distance is off, so wing and belly guns fire parallel"
-                                .into()
-                        }
-                    ),
-                    13.0,
-                    DIM,
-                ));
                 col.spawn(Node {
                     flex_grow: 1.0,
                     min_height: px(12),
@@ -1720,18 +1673,6 @@ fn scenario_page(panel: &mut ChildSpawnerCommands, settings: &Settings) {
                     }
                 }
                 col.spawn(label(settings.scenario.description(), 14.0, DIM));
-                col.spawn(section_header("Enemy shoots back"));
-                col.spawn(button(
-                    MenuAction::ToggleEnemyFire,
-                    if settings.enemy_fires { "On" } else { "Off" },
-                    percent(100),
-                ));
-                col.spawn(label(
-                    "When on, the target fires its own guns at you whenever they're \
-                     lined up, and in a dogfight it hunts you instead of ramming.",
-                    13.0,
-                    DIM,
-                ));
                 col.spawn(label(
                     "Destroy the target and it resets 2 seconds later. It also resets \
                      when a plane crashes, the target gets away, or you press R.",
@@ -2200,7 +2141,6 @@ fn on_menu_click(
         MenuAction::Resume => next.set(GameState::Playing),
         MenuAction::Page(page) => ui.page = page,
         MenuAction::ToggleLead => settings.lead_indicator = !settings.lead_indicator,
-        MenuAction::ToggleEnemyFire => settings.enemy_fires = !settings.enemy_fires,
         MenuAction::PickScenario(sc) => settings.scenario = sc,
         MenuAction::Range(id, end, steps) => {
             settings.ranges.step(id, end, steps);
@@ -2480,6 +2420,13 @@ fn on_menu_click(
         MenuAction::ToggleFacing => {
             settings.host.face_each_other = !settings.host.face_each_other;
         }
+        MenuAction::ToggleMode => {
+            settings.host.mode = match settings.host.mode {
+                GameMode::Ffa => GameMode::Tdm,
+                GameMode::Tdm => GameMode::Ffa,
+            };
+        }
+        MenuAction::PickTeam(t) => settings.team = t,
         MenuAction::HostStep(opt, dir) => {
             let (step, lo, hi) = opt.step();
             let h = &mut settings.host;
@@ -2495,6 +2442,14 @@ fn on_menu_click(
                 }
                 HostOpt::AltitudeSpread => {
                     h.altitude_spread = (h.altitude_spread + step * dir as f32).clamp(lo, hi);
+                }
+                HostOpt::Bots | HostOpt::BotsA | HostOpt::BotsB => {
+                    let n = match opt {
+                        HostOpt::Bots => &mut h.bots,
+                        HostOpt::BotsA => &mut h.bots_a,
+                        _ => &mut h.bots_b,
+                    };
+                    *n = (*n as f32 + step * dir as f32).clamp(lo, hi) as u32;
                 }
             }
         }
@@ -2520,8 +2475,9 @@ fn mp_summary(mp: &Mp) -> String {
         mp.locked(),
         mp.host_aircraft.len()
     );
+    s += &format!("|{:?}", mp.options);
     for e in &mp.roster {
-        s += &format!("|{}:{}:{:?}", e.id, e.name(), e.locked);
+        s += &format!("|{}:{}:{:?}:{}", e.id, e.name(), e.locked, e.team());
     }
     s
 }
@@ -2569,6 +2525,24 @@ fn multiplayer_page(
                             px(360),
                         );
                     });
+
+                let mode = if mp.is_client() {
+                    mp.options.mode
+                } else {
+                    settings.host.mode
+                };
+                if mode == GameMode::Tdm {
+                    col.spawn(section_header("Your team"));
+                    col.spawn(row()).with_children(|r| {
+                        for t in 0..2u8 {
+                            let mut b =
+                                r.spawn(button(MenuAction::PickTeam(t), team_name(t), px(176)));
+                            if settings.team.min(1) == t {
+                                b.insert(Selected);
+                            }
+                        }
+                    });
+                }
 
                 if mp.online() {
                     col.spawn(section_header(if mp.is_host() {
@@ -2642,20 +2616,6 @@ fn multiplayer_page(
                 if !mp.status.is_empty() {
                     col.spawn(label(&mp.status, 14.0, ACCENT));
                 }
-                col.spawn(label(
-                    "Friends join with the host's IP address, like \
-                     203.0.113.5:5050. Over the internet the host forwards \
-                     UDP port 5050 on their router, or everyone joins the same \
-                     VPN (Radmin VPN, ZeroTier, Tailscale) and uses its address.",
-                    13.0,
-                    DIM,
-                ));
-                col.spawn(label(
-                    "Free for all: the last plane flying wins. The host holds \
-                     the reset key 3 s to start a round. Tab: scoreboard.",
-                    13.0,
-                    DIM,
-                ));
                 col.spawn(Node {
                     flex_grow: 1.0,
                     min_height: px(8),
@@ -2700,6 +2660,33 @@ fn multiplayer_page(
                             }
                         });
                     };
+                col.spawn(row()).with_children(|r| {
+                    r.spawn((label("Game mode", 16.0, TEXT), grow()));
+                    if host {
+                        r.spawn(button(MenuAction::ToggleMode, o.mode.label(), px(190)));
+                    } else {
+                        r.spawn(label(o.mode.label(), 16.0, TEXT));
+                    }
+                });
+                match o.mode {
+                    GameMode::Ffa => {
+                        stepper(col, "AI targets", o.bots.to_string(), HostOpt::Bots);
+                    }
+                    GameMode::Tdm => {
+                        stepper(
+                            col,
+                            "AI targets, Team A",
+                            o.bots_a.to_string(),
+                            HostOpt::BotsA,
+                        );
+                        stepper(
+                            col,
+                            "AI targets, Team B",
+                            o.bots_b.to_string(),
+                            HostOpt::BotsB,
+                        );
+                    }
+                }
                 col.spawn(row()).with_children(|r| {
                     r.spawn((label("Lead indicators", 16.0, TEXT), grow()));
                     let text = if o.lead_indicators { "Allowed" } else { "Off" };
@@ -2751,7 +2738,11 @@ fn multiplayer_page(
                     col.spawn(section_header(
                         "Players (lock someone to one of your presets)",
                     ));
-                    let others: Vec<_> = mp.roster.iter().filter(|e| e.id != HOST_ID).collect();
+                    let others: Vec<_> = mp
+                        .roster
+                        .iter()
+                        .filter(|e| e.id != HOST_ID && !e.bot)
+                        .collect();
                     if others.is_empty() {
                         col.spawn(label("Nobody has joined yet.", 15.0, DIM));
                     }

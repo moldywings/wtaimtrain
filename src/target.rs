@@ -22,6 +22,10 @@ impl Plugin for TargetPlugin {
             .add_message::<TargetHit>()
             .add_message::<PlayerHit>()
             .init_resource::<ScenarioState>()
+            .add_systems(
+                Update,
+                fade_explosions.run_if(crate::multiplayer::world_runs),
+            )
             .add_systems(Startup, (spawn_target, spawn_notice))
             .add_systems(
                 Update,
@@ -36,13 +40,7 @@ impl Plugin for TargetPlugin {
             )
             .add_systems(
                 Update,
-                (
-                    take_hits,
-                    take_player_hits,
-                    end_of_run,
-                    fade_explosions,
-                    update_notice,
-                )
+                (take_hits, take_player_hits, end_of_run, update_notice)
                     .chain()
                     .after(fly_target)
                     .run_if(in_state(GameState::Playing))
@@ -81,8 +79,6 @@ enum Behavior {
     },
     /// Pull straight up, dodging and rolling.
     Climb { intensity: f32 },
-    /// Fly at the player and try to hit them.
-    Ram,
     /// Get on the player's tail and shoot them down.
     Attack,
     /// A hard banked turn: `turn` is the aim's yaw offset (rad, + right),
@@ -119,10 +115,10 @@ pub struct Target {
     next_dodge: f32,
     /// Fraction of the target destroyed (1 = gone).
     damage: f32,
-    /// Its guns are on target and it's shooting (when enemy fire is on).
+    /// Its guns are on target and it's shooting.
     pub firing: bool,
-    /// Seconds left of breaking away after a close pass.
-    break_off: f32,
+    /// The dogfighting pilot (for the attack behavior).
+    pilot: crate::ai::Pilot,
 }
 
 impl Target {
@@ -135,7 +131,7 @@ impl Target {
             next_dodge: 0.0,
             damage: 0.0,
             firing: false,
-            break_off: 0.0,
+            pilot: crate::ai::Pilot::default(),
         }
     }
 
@@ -272,13 +268,13 @@ fn spawn_target(
 /// Start over when the scenario or its settings change in the menu.
 fn restart_on_change(
     settings: Res<Settings>,
-    mut last: Local<Option<(Scenario, Ranges, bool)>>,
+    mut last: Local<Option<(Scenario, Ranges)>>,
     mut reset: MessageWriter<ResetScenario>,
 ) {
     if !settings.is_changed() {
         return;
     }
-    let now = (settings.scenario, settings.ranges, settings.enemy_fires);
+    let now = (settings.scenario, settings.ranges);
     if last.is_some_and(|l| l != now) {
         reset.write(ResetScenario);
     }
@@ -430,13 +426,8 @@ fn reset_scenario(
                     let course = rng.range(0.0, std::f32::consts::TAU);
                     let dir = Vec3::new(course.sin(), 0.0, -course.cos());
                     let speed = model.top_speed(pos.y) * rng.range(0.45, 1.0);
-                    // With enemy fire on it tries to shoot you down;
-                    // otherwise it tries to ram you.
-                    let behavior = if settings.enemy_fires {
-                        Behavior::Attack
-                    } else {
-                        Behavior::Ram
-                    };
+                    // It hunts you and tries to shoot you down.
+                    let behavior = Behavior::Attack;
                     (Target::new(behavior), Body::new(pos, heading(dir), speed))
                 }
                 Scenario::Banking => {
@@ -535,20 +526,13 @@ pub fn fly_target(
             continue;
         }
         target.next_dodge -= dt;
-        target.break_off = (target.break_off - dt).max(0.0);
         let new_dodge = target.next_dodge <= 0.0;
         let pos = aircraft.body.position;
         let rel = player.position - pos;
         let range = rel.length();
         // Where its biggest gun has to point to hit you.
-        let gun = aircraft
-            .card
-            .weapons
-            .guns()
-            .iter()
-            .map(|(_, g, _)| settings.gun(g))
-            .max_by(|a, b| a.caliber_mm().total_cmp(&b.caliber_mm()))
-            .cloned();
+        let gun = crate::ai::biggest_gun(&aircraft.card, |g| settings.gun(g));
+        let mut attack: Option<crate::ai::Decision> = None;
         let lead = gun.as_ref().and_then(|g| {
             crate::weapons::lead_direction(
                 g,
@@ -591,28 +575,23 @@ pub fn fly_target(
                 let up = Vec3::new(target.dodge.x.sin(), 1.0, target.dodge.y.sin());
                 up.normalize()
             }
-            Behavior::Ram => {
-                // Lead the player: aim where they'll be on arrival.
-                let rel = player.position - pos;
-                let closing = aircraft.body.speed().max(60.0);
-                let t = (rel.length() / closing).min(6.0);
-                let at = player.position + player.velocity * t * 0.8;
-                (at - pos).normalize_or(Vec3::NEG_Z)
-            }
             Behavior::Attack => {
-                // Too close and closing: break away, then come back round.
-                let closing = (player.velocity - aircraft.body.velocity).dot(rel) < 0.0;
-                if range < 150.0 && closing && target.break_off <= 0.0 {
-                    target.break_off = 1.8;
-                }
-                if target.break_off > 0.0 {
-                    // Break off to the side and up, so it can turn back in.
-                    let away = (-rel).with_y(0.0).normalize_or(Vec3::X);
-                    let side = away.cross(Vec3::Y);
-                    (away + side * 0.8 + Vec3::Y * 0.4).normalize()
-                } else {
-                    lead.unwrap_or_else(|| rel.normalize_or(Vec3::NEG_Z))
-                }
+                let foe = (!state.player_down()).then_some(crate::ai::Foe {
+                    position: player.position,
+                    velocity: player.velocity,
+                });
+                let d = crate::ai::decide(
+                    &aircraft.card,
+                    &aircraft.model,
+                    &aircraft.body,
+                    gun.as_ref(),
+                    foe,
+                    &mut target.pilot,
+                    dt,
+                );
+                let aim = d.aim;
+                attack = Some(d);
+                aim
             }
             Behavior::Evade {
                 aware,
@@ -719,10 +698,13 @@ pub fn fly_target(
         // a real pilot, it opens fire a little before the solution is perfect.
         let forward = aircraft.body.rotation * Vec3::NEG_Z;
         let cone = (12.0 / range.max(1.0)).atan().max(2.5f32.to_radians());
-        target.firing = settings.enemy_fires
-            && !state.player_down()
-            && range < 900.0
-            && lead.is_some_and(|d| d.angle_between(forward) < cone);
+        target.firing = !state.player_down()
+            && match &attack {
+                Some(d) => d.firing,
+                None => range < 900.0 && lead.is_some_and(|d| d.angle_between(forward) < cone),
+            };
+        // Whatever it's doing, it won't fly into the ground.
+        let aim = crate::ai::ground_escape(&aircraft.body).unwrap_or(aim);
 
         let hold_speed = target.hold_speed;
         let roll = target.roll;
@@ -741,9 +723,10 @@ pub fn fly_target(
         if extra_roll {
             controls.roll = (controls.roll + roll).clamp(-1.0, 1.0);
         }
-        controls.throttle = match hold_speed {
-            Some(v) => (0.6 + (v - body.speed()) * 0.05).clamp(0.0, 1.0),
-            None => 1.0,
+        controls.throttle = match (&attack, hold_speed) {
+            (Some(d), _) => d.throttle,
+            (None, Some(v)) => (0.6 + (v - body.speed()) * 0.05).clamp(0.0, 1.0),
+            (None, None) => 1.0,
         };
         flight_model::step(model, body, controls, dt);
         tf.translation = body.position;
@@ -778,7 +761,6 @@ fn take_hits(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     targets: Query<(&mut Target, &Transform, &mut Visibility)>,
-    mut sphere: Local<Option<Handle<Mesh>>>,
 ) {
     let damage: f32 = hits.read().map(|h| h.damage).sum();
     if damage <= 0.0 {
@@ -798,21 +780,7 @@ fn take_hits(
                 RESET_AFTER_KILL,
             ));
             sound::play(&mut commands, sounds.kill(), 0.3, 1.0);
-            commands.spawn((
-                Explosion { age: 0.0 },
-                Transform::from_translation(tf.translation),
-                Mesh3d(
-                    sphere
-                        .get_or_insert_with(|| meshes.add(Sphere::new(1.0)))
-                        .clone(),
-                ),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgba(1.0, 0.8, 0.35, 0.95),
-                    unlit: true,
-                    alpha_mode: AlphaMode::Blend,
-                    ..default()
-                })),
-            ));
+            spawn_explosion(&mut commands, &mut meshes, &mut materials, tf.translation);
         }
     }
 }
@@ -820,6 +788,26 @@ fn take_hits(
 #[derive(Component)]
 struct Explosion {
     age: f32,
+}
+
+/// The fireball when a plane is destroyed.
+pub fn spawn_explosion(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    at: Vec3,
+) {
+    commands.spawn((
+        Explosion { age: 0.0 },
+        Transform::from_translation(at),
+        Mesh3d(meshes.add(Sphere::new(1.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.8, 0.35, 0.95),
+            unlit: true,
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        })),
+    ));
 }
 
 const EXPLOSION_TIME: f32 = 0.9;

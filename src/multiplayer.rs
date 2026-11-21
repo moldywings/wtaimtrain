@@ -33,6 +33,10 @@ pub const DEFAULT_PORT: u16 = 5050;
 const PROTOCOL_ID: u64 = 0x5754_4154_0001;
 /// The host's own player id.
 pub const HOST_ID: u64 = 0;
+/// AI targets get ids from here up (joined players' ids are huge and odd).
+const BOT_BASE: u64 = 1_000;
+/// Seconds after a round ends before the next one starts by itself.
+const AUTO_RESTART: f32 = 3.0;
 const MAX_PLAYERS: usize = 16;
 /// Position updates per second.
 const SEND_RATE: f32 = 30.0;
@@ -58,6 +62,39 @@ pub struct HostOptions {
     pub altitude_spread: f32,
     /// Everyone starts facing the middle (each other), or a random way.
     pub face_each_other: bool,
+    pub mode: GameMode,
+    /// Free for all: how many AI targets join in.
+    pub bots: u32,
+    /// Team deathmatch: AI targets on team A and on team B.
+    pub bots_a: u32,
+    pub bots_b: u32,
+}
+
+/// What kind of game.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GameMode {
+    /// Free for all: last plane flying wins.
+    #[default]
+    Ffa,
+    /// Team deathmatch: the last team flying wins.
+    Tdm,
+}
+
+impl GameMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            GameMode::Ffa => "Free for all",
+            GameMode::Tdm => "Team deathmatch",
+        }
+    }
+}
+
+/// Most AI targets the host can add (per team in team deathmatch).
+pub const MAX_BOTS: u32 = 12;
+
+/// Team names.
+pub fn team_name(team: u8) -> &'static str {
+    if team == 0 { "Team A" } else { "Team B" }
 }
 
 impl Default for HostOptions {
@@ -69,6 +106,10 @@ impl Default for HostOptions {
             altitude: 2_000.0,
             altitude_spread: 0.0,
             face_each_other: true,
+            mode: GameMode::Ffa,
+            bots: 0,
+            bots_a: 0,
+            bots_b: 0,
         }
     }
 }
@@ -81,6 +122,9 @@ pub struct PlayerInfo {
     pub card: AircraftCard,
     /// The gun presets its loadout uses.
     pub guns: Vec<GunCard>,
+    /// Team in team deathmatch (0 = A, 1 = B).
+    #[serde(default)]
+    pub team: u8,
 }
 
 /// A plane's motion, sent many times a second.
@@ -100,6 +144,9 @@ pub struct Entry {
     pub info: Option<PlayerInfo>,
     pub kills: u32,
     pub wins: u32,
+    pub deaths: u32,
+    /// An AI target run by the host.
+    pub bot: bool,
     pub alive: bool,
     /// Share of the plane shot away (1 = down).
     pub damage: f32,
@@ -114,10 +161,16 @@ impl Entry {
             info: None,
             kills: 0,
             wins: 0,
+            deaths: 0,
+            bot: false,
             alive: false,
             damage: 0.0,
             locked: None,
         }
+    }
+
+    pub fn team(&self) -> u8 {
+        self.info.as_ref().map(|i| i.team).unwrap_or(0)
     }
 
     pub fn name(&self) -> String {
@@ -160,6 +213,7 @@ enum ToPlayer {
     Roster {
         entries: Vec<Entry>,
         phase: Phase,
+        team_wins: [u32; 2],
     },
     States(Vec<(u64, PlaneState)>),
     RoundStart {
@@ -171,6 +225,7 @@ enum ToPlayer {
     },
     RoundOver {
         winner: Option<u64>,
+        team: Option<u8>,
     },
     ResetHold(f32),
 }
@@ -231,10 +286,23 @@ pub struct Mp {
     send_timer: f32,
     /// Host: the round needs a winner check.
     check_round: bool,
-    /// Host: players in the current round.
+    /// Host: players in the current round, and which teams they're on
+    /// (bit 0 = A, bit 1 = B).
     round_size: usize,
+    round_teams: u8,
     /// Where your plane starts the new round, until it's put there.
     pending: Option<Spawn>,
+    /// Rounds won by each team in team deathmatch.
+    pub team_wins: [u32; 2],
+    /// Host: seconds until the next round starts by itself.
+    restart_in: Option<f32>,
+    /// Planes just eliminated, to blow up on screen.
+    explode: Vec<u64>,
+    /// Host: where each AI target starts the new round.
+    bot_spawns: HashMap<u64, Spawn>,
+    /// Host: AI targets' latest motion, to send out.
+    bot_states: HashMap<u64, PlaneState>,
+    next_bot: u64,
 }
 
 impl Default for Mp {
@@ -258,7 +326,14 @@ impl Default for Mp {
             send_timer: 0.0,
             check_round: false,
             round_size: 0,
+            round_teams: 0,
             pending: None,
+            team_wins: [0; 2],
+            restart_in: None,
+            explode: vec![],
+            bot_spawns: HashMap::new(),
+            bot_states: HashMap::new(),
+            next_bot: BOT_BASE,
         }
     }
 }
@@ -347,6 +422,18 @@ impl Mp {
         (card, guns)
     }
 
+    /// Two planes are on opposite sides (always, in free for all).
+    pub fn enemies(&self, a: u64, b: u64) -> bool {
+        if a == b {
+            return false;
+        }
+        if self.options.mode == GameMode::Ffa {
+            return true;
+        }
+        let team = |id: u64| self.roster.iter().find(|e| e.id == id).map(|e| e.team());
+        team(a) != team(b)
+    }
+
     /// Your aircraft is locked by the host.
     pub fn locked(&self) -> Option<&str> {
         self.me().and_then(|e| e.locked.as_deref())
@@ -391,6 +478,21 @@ pub struct RemoteHit {
     pub damage: f32,
 }
 
+/// An AI target's round hit a plane (worked out on the host).
+#[derive(Message)]
+pub struct BotHit {
+    pub bot: u64,
+    /// The plane hit: a remote plane's id, or the host's own.
+    pub victim: u64,
+    pub damage: f32,
+}
+
+/// An AI target, flown by the host.
+#[derive(Component, Default)]
+pub struct Bot {
+    pilot: crate::ai::Pilot,
+}
+
 /// Menu requests.
 #[derive(Message, Clone)]
 pub enum MpCommand {
@@ -407,6 +509,7 @@ impl Plugin for MultiplayerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Mp>()
             .add_message::<RemoteHit>()
+            .add_message::<BotHit>()
             .add_message::<MpCommand>()
             .add_systems(Startup, spawn_mp_ui)
             .add_systems(PreUpdate, (handle_commands, receive).chain())
@@ -415,8 +518,10 @@ impl Plugin for MultiplayerPlugin {
                 (
                     hold_reset,
                     run_round,
+                    manage_bots,
                     sync_remote_planes,
                     move_remote_planes,
+                    fly_bots,
                     local_status,
                     spectate_controls,
                     send,
@@ -425,7 +530,7 @@ impl Plugin for MultiplayerPlugin {
                     .after(crate::flight::fly_player)
                     .before(crate::weapons::Firing),
             )
-            .add_systems(Update, (hide_target_online, test_hooks))
+            .add_systems(Update, (hide_target_online, test_hooks, explode_eliminated))
             .add_systems(PostUpdate, update_mp_ui.after(TransformSystems::Propagate));
     }
 }
@@ -442,8 +547,17 @@ fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
 
 /// Start hosting on `port`.
 fn start_host(mp: &mut Mp, port: u16) -> Result<(), String> {
-    let socket = UdpSocket::bind(("0.0.0.0", port))
-        .map_err(|e| format!("Couldn't open port {port}: {e}"))?;
+    let socket = UdpSocket::bind(("0.0.0.0", port)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            format!(
+                "Port {port} is already in use on this computer. If another copy \
+                 of the game is hosting, join it with 127.0.0.1 instead. Otherwise \
+                 pick another port (and forward that one on your router)."
+            )
+        } else {
+            format!("Couldn't open port {port}: {e}")
+        }
+    })?;
     let addr = socket
         .local_addr()
         .map_err(|e| format!("Couldn't read the port: {e}"))?;
@@ -578,6 +692,7 @@ fn broadcast_roster(mp: &mut Mp) {
     let msg = encode(&ToPlayer::Roster {
         entries: mp.roster.clone(),
         phase: mp.phase,
+        team_wins: mp.team_wins,
     });
     if let Net::Host { server, .. } = &mut mp.net {
         server.broadcast_message(DefaultChannel::ReliableOrdered, msg);
@@ -601,6 +716,7 @@ fn eliminate(mp: &mut Mp, victim: u64, by: Option<u64>) {
     }
     e.alive = false;
     e.damage = 1.0;
+    e.deaths += 1;
     if let Some(by) = by.filter(|b| *b != victim)
         && let Some(k) = mp.entry_mut(by)
     {
@@ -624,6 +740,7 @@ fn apply_elimination(mp: &mut Mp, victim: u64, by: Option<u64>) {
     };
     info!("{line}");
     mp.feed(line);
+    mp.explode.push(victim);
     if let Some(e) = mp.entry_mut(victim) {
         e.alive = false;
     }
@@ -645,6 +762,10 @@ fn apply_hit(mp: &mut Mp, attacker: u64, victim: u64, damage: f32) {
         return;
     }
     let attacker_alive = mp.roster.iter().any(|e| e.id == attacker && e.alive);
+    // No friendly fire.
+    if !mp.enemies(attacker, victim) {
+        return;
+    }
     let Some(e) = mp.entry_mut(victim) else {
         return;
     };
@@ -676,21 +797,52 @@ fn start_round(mp: &mut Mp) {
         .map(|e| e.id)
         .collect();
     let n = ids.len().max(1);
-    // Around a circle, so players across it are `spawn_distance` apart.
     let radius = opts.spawn_distance * 0.5;
     let turn = rand() * std::f32::consts::TAU;
-    let spawns: Vec<(u64, Spawn)> = ids
-        .iter()
-        .enumerate()
-        .map(|(i, id)| {
+    let tdm = opts.mode == GameMode::Tdm;
+    // Free for all: around a circle, so players across it are
+    // `spawn_distance` apart. Teams: each team side by side (200 m apart)
+    // on opposite sides of the circle.
+    let teams: HashMap<u64, u8> = mp.roster.iter().map(|e| (e.id, e.team())).collect();
+    let team_of = |id: u64| teams.get(&id).copied().unwrap_or(0);
+    let mut places: Vec<(u64, Vec2)> = vec![];
+    if tdm {
+        for team in 0..2u8 {
+            let members: Vec<u64> = ids
+                .iter()
+                .copied()
+                .filter(|id| team_of(*id) == team)
+                .collect();
+            let a = turn + team as f32 * std::f32::consts::PI;
+            let out = Vec2::new(a.sin(), -a.cos());
+            let side = out.perp();
+            for (k, id) in members.iter().enumerate() {
+                let lateral = (k as f32 - (members.len() as f32 - 1.0) / 2.0) * 200.0;
+                places.push((*id, out * radius + side * lateral));
+            }
+        }
+    } else {
+        for (i, id) in ids.iter().enumerate() {
             let a = turn + i as f32 / n as f32 * std::f32::consts::TAU;
-            let x = a.sin() * radius;
-            let z = -a.cos() * radius;
+            places.push((*id, Vec2::new(a.sin(), -a.cos()) * radius));
+        }
+    }
+    let spawns: Vec<(u64, Spawn)> = places
+        .iter()
+        .map(|(id, at)| {
+            let (x, z) = (at.x, at.y);
             let y = (opts.altitude + (rand() * 2.0 - 1.0) * opts.altitude_spread).max(200.0);
             let heading = if opts.face_each_other && n > 1 {
-                // Toward the middle. Heading h flies toward
-                // (-sin h, -cos h), so point that at (-x, -z).
-                x.atan2(z)
+                if tdm {
+                    // Straight across toward the other team.
+                    let a = turn + team_of(*id) as f32 * std::f32::consts::PI;
+                    let (ox, oz) = (a.sin(), -a.cos());
+                    ox.atan2(oz)
+                } else {
+                    // Toward the middle. Heading h flies toward
+                    // (-sin h, -cos h), so point that at (-x, -z).
+                    x.atan2(z)
+                }
             } else {
                 rand() * std::f32::consts::TAU
             };
@@ -706,11 +858,21 @@ fn start_round(mp: &mut Mp) {
             )
         })
         .collect();
+    mp.restart_in = None;
+    mp.bot_spawns = spawns
+        .iter()
+        .filter(|(id, _)| mp.roster.iter().any(|e| e.id == *id && e.bot))
+        .copied()
+        .collect();
     for e in &mut mp.roster {
         e.alive = ids.contains(&e.id);
         e.damage = 0.0;
     }
     mp.round_size = ids.len();
+    mp.round_teams = ids
+        .iter()
+        .map(|id| 1u8 << team_of(*id).min(1))
+        .fold(0, |a, b| a | b);
     mp.phase = Phase::Countdown(opts.countdown as f32);
     host_send_all(
         mp,
@@ -890,8 +1052,13 @@ fn receive(time: Res<Time<Real>>, mut mp: ResMut<Mp>, settings: Res<Settings>) {
                         mp.host_guns = guns;
                     }
                     ToPlayer::Options(o) => mp.options = o,
-                    ToPlayer::Roster { entries, phase } => {
+                    ToPlayer::Roster {
+                        entries,
+                        phase,
+                        team_wins,
+                    } => {
                         mp.roster = entries;
+                        mp.team_wins = team_wins;
                         // The countdown runs locally; only take a new phase.
                         if std::mem::discriminant(&phase) != std::mem::discriminant(&mp.phase) {
                             mp.phase = phase;
@@ -913,9 +1080,9 @@ fn receive(time: Res<Time<Real>>, mut mp: ResMut<Mp>, settings: Res<Settings>) {
                         pending_spawn(mp, &spawns);
                     }
                     ToPlayer::Eliminated { victim, by } => apply_elimination(mp, victim, by),
-                    ToPlayer::RoundOver { winner } => {
+                    ToPlayer::RoundOver { winner, team } => {
                         mp.phase = Phase::Over;
-                        round_over_banner(mp, winner);
+                        round_over_banner(mp, winner, team);
                     }
                     ToPlayer::ResetHold(t) => mp.reset_hold = t,
                 }
@@ -924,11 +1091,16 @@ fn receive(time: Res<Time<Real>>, mut mp: ResMut<Mp>, settings: Res<Settings>) {
     }
 }
 
-fn round_over_banner(mp: &mut Mp, winner: Option<u64>) {
-    let text = match winner {
-        Some(w) if w == mp.my_id => "You win the round!".to_string(),
-        Some(w) => format!("{} wins the round!", mp.name_of(w)),
-        None => "Nobody survived the round".into(),
+fn round_over_banner(mp: &mut Mp, winner: Option<u64>, team: Option<u8>) {
+    let my_team = mp.me().map(|e| e.team());
+    let text = match (winner, team) {
+        (_, Some(t)) if Some(t) == my_team => {
+            format!("{} wins the round! (your team)", team_name(t))
+        }
+        (_, Some(t)) => format!("{} wins the round!", team_name(t)),
+        (Some(w), None) if w == mp.my_id => "You win the round!".to_string(),
+        (Some(w), None) => format!("{} wins the round!", mp.name_of(w)),
+        (None, None) => "Nobody survived the round".into(),
     };
     mp.banner = Some((text, 6.0));
 }
@@ -1014,28 +1186,60 @@ fn run_round(
             mp.banner = None;
         }
     }
-    // Host: last plane flying wins.
+    // Host: last plane (or team) flying wins.
     if mp.is_host() && mp.check_round {
         mp.check_round = false;
         if matches!(mp.phase, Phase::Fight(_) | Phase::Countdown(_)) {
-            let alive: Vec<u64> = mp.roster.iter().filter(|e| e.alive).map(|e| e.id).collect();
-            let over = if mp.round_size >= 2 {
-                alive.len() <= 1
+            let alive: Vec<&Entry> = mp.roster.iter().filter(|e| e.alive).collect();
+            let (over, winner, team) = if mp.options.mode == GameMode::Tdm {
+                let teams: Vec<u8> = alive.iter().map(|e| e.team()).collect();
+                let left = [teams.contains(&0), teams.contains(&1)];
+                let both_started = mp.round_teams == 0b11;
+                let over = if both_started {
+                    !(left[0] && left[1])
+                } else {
+                    alive.is_empty()
+                };
+                let team = if both_started {
+                    left.iter().position(|l| *l).map(|t| t as u8)
+                } else {
+                    None
+                };
+                (over, None, team.filter(|_| over))
             } else {
-                alive.is_empty()
+                let over = if mp.round_size >= 2 {
+                    alive.len() <= 1
+                } else {
+                    alive.is_empty()
+                };
+                let winner = alive.first().map(|e| e.id).filter(|_| mp.round_size >= 2);
+                (over, winner, None)
             };
             if over {
-                let winner = alive.first().copied().filter(|_| mp.round_size >= 2);
                 if let Some(w) = winner
                     && let Some(e) = mp.entry_mut(w)
                 {
                     e.wins += 1;
                 }
+                if let Some(t) = team {
+                    mp.team_wins[t as usize] += 1;
+                }
                 mp.phase = Phase::Over;
-                host_send_all(&mut mp, &ToPlayer::RoundOver { winner });
-                round_over_banner(&mut mp, winner);
+                mp.restart_in = Some(AUTO_RESTART);
+                host_send_all(&mut mp, &ToPlayer::RoundOver { winner, team });
+                round_over_banner(&mut mp, winner, team);
                 broadcast_roster(&mut mp);
             }
+        }
+    }
+    // Host: the next round starts by itself a few seconds after a win.
+    if mp.is_host()
+        && let Some(t) = mp.restart_in.as_mut()
+    {
+        *t -= dt;
+        if *t <= 0.0 {
+            mp.restart_in = None;
+            start_round(&mut mp);
         }
     }
 }
@@ -1100,6 +1304,7 @@ fn sync_remote_planes(
                 GunBook(info.guns.clone()),
                 aircraft,
             ))
+            .insert_if(Bot::default(), || e.bot && mp.is_host())
             .with_children(|plane| {
                 plane.spawn((
                     WorldAssetRoot(
@@ -1143,7 +1348,16 @@ fn move_remote_planes(
         let v = Vec3::from(s.v);
         let age = (now - at).clamp(0.0, 0.5);
         let p = Vec3::from(s.p) + v * age;
-        let r = Quat::from_array(s.r).normalize();
+        let r = Quat::from_array(s.r);
+        // (Ignore a broken rotation rather than spread NaNs.)
+        let r = if r.length_squared() > 1e-6 && r.is_finite() {
+            r.normalize()
+        } else {
+            tf.rotation
+        };
+        if !Vec3::from(s.p).is_finite() || !Vec3::from(s.v).is_finite() {
+            continue;
+        }
         // Far off (a respawn), jump; otherwise ease toward it.
         if tf.translation.distance(p) > 200.0 {
             tf.translation = p;
@@ -1175,6 +1389,7 @@ fn local_status(
         With<Player>,
     >,
     mut hits: MessageReader<RemoteHit>,
+    mut bot_hits: MessageReader<BotHit>,
 ) {
     let (entity, mut plane, mut vis, mut paint, book) = player.into_inner();
     if paint.0 != settings.plane_color {
@@ -1188,6 +1403,7 @@ fn local_status(
             *vis = Visibility::Inherited;
         }
         hits.clear();
+        bot_hits.clear();
         return;
     }
     let (card, guns) = mp.local_loadout(&settings);
@@ -1231,6 +1447,16 @@ fn local_status(
                     speed,
                 );
             }
+        }
+    }
+    // AI targets' hits (host only).
+    let list: Vec<_> = bot_hits
+        .read()
+        .map(|h| (h.bot, h.victim, h.damage))
+        .collect();
+    for (bot, victim, damage) in list {
+        if mp.is_host() {
+            apply_hit(&mut mp, bot, victim, damage);
         }
     }
     // Your hits on others go to the host.
@@ -1324,6 +1550,7 @@ fn send(
         color: settings.plane_color,
         card,
         guns,
+        team: settings.team.min(1),
     };
     if mp.last_info.as_ref() != Some(&info) {
         if mp.is_host() {
@@ -1363,6 +1590,7 @@ fn send(
             let mut list: Vec<(u64, PlaneState)> =
                 mp.states.iter().map(|(id, (s, _))| (*id, *s)).collect();
             list.push((HOST_ID, state));
+            list.extend(mp.bot_states.iter().map(|(id, s)| (*id, *s)));
             let bytes = encode(&ToPlayer::States(list));
             if let Net::Host { server, .. } = &mut mp.net {
                 server.broadcast_message(DefaultChannel::Unreliable, bytes);
@@ -1379,6 +1607,249 @@ fn send(
             let _ = transport.send_packets(client);
         }
         Net::Off => {}
+    }
+}
+
+/// Host: add or remove AI targets to match the game settings, and keep
+/// their aircraft in step with the host's target preset.
+fn manage_bots(mut mp: ResMut<Mp>, settings: Res<Settings>) {
+    if !mp.is_host() {
+        return;
+    }
+    let o = &settings.host;
+    let wanted: [u32; 2] = match o.mode {
+        GameMode::Ffa => [o.bots.min(MAX_BOTS), 0],
+        GameMode::Tdm => [o.bots_a.min(MAX_BOTS), o.bots_b.min(MAX_BOTS)],
+    };
+    let card = settings.target_card().clone();
+    let guns: Vec<GunCard> = card
+        .weapons
+        .guns()
+        .iter()
+        .map(|(_, g, _)| settings.gun(g).clone())
+        .fold(vec![], |mut v: Vec<GunCard>, g| {
+            if !v.iter().any(|x| x.name == g.name) {
+                v.push(g);
+            }
+            v
+        });
+    let mut changed = false;
+    for team in 0..2u8 {
+        let mine: Vec<u64> = mp
+            .roster
+            .iter()
+            .filter(|e| e.bot && e.team() == team)
+            .map(|e| e.id)
+            .collect();
+        let want = wanted[team as usize] as usize;
+        // Too many: the newest go first.
+        for id in mine.iter().skip(want) {
+            mp.roster.retain(|e| e.id != *id);
+            mp.bot_states.remove(id);
+            changed = true;
+        }
+        for _ in mine.len()..want {
+            let id = mp.next_bot;
+            mp.next_bot += 1;
+            let taken: Vec<String> = mp.roster.iter().map(|e| e.name()).collect();
+            let free: Vec<&str> = crate::names::BOT_NAMES
+                .iter()
+                .copied()
+                .filter(|n| !taken.iter().any(|t| t == n))
+                .collect();
+            let pick = (now_since_epoch().as_nanos() as usize).wrapping_mul(2654435761) >> 7;
+            let nickname = free
+                .get(pick % free.len().max(1))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("Target {}", id - BOT_BASE + 1));
+            mp.roster.push(Entry {
+                info: Some(PlayerInfo {
+                    nickname,
+                    color: PlaneColor::Red,
+                    card: card.clone(),
+                    guns: guns.clone(),
+                    team,
+                }),
+                bot: true,
+                ..Entry::new(id)
+            });
+            changed = true;
+        }
+    }
+    for e in mp.roster.iter_mut().filter(|e| e.bot) {
+        if let Some(info) = &mut e.info
+            && (info.card != card || info.guns != guns)
+        {
+            info.card = card.clone();
+            info.guns = guns.clone();
+            changed = true;
+        }
+    }
+    if changed {
+        broadcast_roster(&mut mp);
+    }
+}
+
+/// Host: fly the AI targets. Each goes after the nearest enemy plane.
+#[allow(clippy::type_complexity)]
+fn fly_bots(
+    time: Res<Time>,
+    mut mp: ResMut<Mp>,
+    settings: Res<Settings>,
+    player: Single<&Aircraft, (With<Player>, Without<Bot>)>,
+    mut bots: Query<
+        (
+            &mut Bot,
+            &mut RemotePlane,
+            &mut Aircraft,
+            &mut Transform,
+            &mut Visibility,
+            Option<&GunBook>,
+        ),
+        Without<Player>,
+    >,
+    others: Query<(&RemotePlane, &Aircraft), (Without<Bot>, Without<Player>)>,
+) {
+    if !mp.is_host() {
+        return;
+    }
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    // Everyone a bot might chase: you, other players, and the bots.
+    let mut planes: Vec<(u64, Vec3, Vec3)> = vec![];
+    if mp.alive() && !matches!(mp.phase, Phase::Lobby) {
+        planes.push((HOST_ID, player.body.position, player.body.velocity));
+    }
+    for (r, a) in &others {
+        if r.alive {
+            planes.push((r.id, a.body.position, a.body.velocity));
+        }
+    }
+    for (_, r, a, ..) in &bots {
+        if r.alive {
+            planes.push((r.id, a.body.position, a.body.velocity));
+        }
+    }
+    let fight = matches!(mp.phase, Phase::Fight(_));
+    let mut crashed = vec![];
+    for (mut bot, mut remote, mut aircraft, mut tf, mut vis, book) in &mut bots {
+        let id = remote.id;
+        let alive = mp.roster.iter().any(|e| e.id == id && e.alive);
+        remote.alive = alive;
+        if let Some(spawn) = mp.bot_spawns.remove(&id) {
+            let rot = Quat::from_rotation_y(spawn.heading);
+            let speed = spawn.speed * aircraft.model.top_speed(spawn.p[1]);
+            aircraft.body = Body::new(Vec3::from(spawn.p), rot, speed);
+            bot.pilot = crate::ai::Pilot::default();
+            tf.translation = aircraft.body.position;
+            tf.rotation = rot;
+        }
+        let want = if alive {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+        if !alive {
+            remote.firing = false;
+            let b = &aircraft.body;
+            mp.bot_states.insert(
+                id,
+                PlaneState {
+                    p: b.position.to_array(),
+                    r: b.rotation.to_array(),
+                    v: b.velocity.to_array(),
+                    firing: false,
+                    alive: false,
+                },
+            );
+            continue;
+        }
+        let pos = aircraft.body.position;
+        let foe = planes
+            .iter()
+            .filter(|(other, ..)| mp.enemies(id, *other))
+            .min_by(|a, b| a.1.distance(pos).total_cmp(&b.1.distance(pos)))
+            .map(|(_, p, v)| crate::ai::Foe {
+                position: *p,
+                velocity: *v,
+            })
+            .filter(|_| fight);
+        let gun = crate::ai::biggest_gun(&aircraft.card, |g| GunBook::gun(book, &settings, g));
+        let decision = {
+            let a = &*aircraft;
+            crate::ai::decide(
+                &a.card,
+                &a.model,
+                &a.body,
+                gun.as_ref(),
+                foe,
+                &mut bot.pilot,
+                dt,
+            )
+        };
+        let Aircraft {
+            model,
+            body,
+            controls,
+            ..
+        } = &mut *aircraft;
+        *controls = crate::ai::fly(model, body, &decision, dt);
+        remote.firing = fight && decision.firing;
+        tf.translation = body.position;
+        tf.rotation = body.rotation;
+        if body.position.y < 3.0 {
+            crashed.push(id);
+        }
+        mp.bot_states.insert(
+            id,
+            PlaneState {
+                p: body.position.to_array(),
+                r: body.rotation.to_array(),
+                v: body.velocity.to_array(),
+                firing: remote.firing,
+                alive: true,
+            },
+        );
+    }
+    for id in crashed {
+        if matches!(mp.phase, Phase::Fight(_) | Phase::Countdown(_)) {
+            eliminate(&mut mp, id, None);
+        }
+    }
+}
+
+/// Blow up planes as they're eliminated, like the practice target.
+#[allow(clippy::too_many_arguments)]
+fn explode_eliminated(
+    mut commands: Commands,
+    mut mp: ResMut<Mp>,
+    sounds: Res<crate::sound::Sounds>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    player: Single<&GlobalTransform, With<Player>>,
+    remotes: Query<(&RemotePlane, &GlobalTransform)>,
+) {
+    if mp.explode.is_empty() {
+        return;
+    }
+    for id in std::mem::take(&mut mp.explode) {
+        let at = if id == mp.my_id {
+            Some(player.translation())
+        } else {
+            remotes
+                .iter()
+                .find(|(r, _)| r.id == id)
+                .map(|(_, tf)| tf.translation())
+        };
+        if let Some(at) = at {
+            crate::target::spawn_explosion(&mut commands, &mut meshes, &mut materials, at);
+            crate::sound::play(&mut commands, sounds.kill(), 0.3, 1.0);
+        }
     }
 }
 
@@ -1444,11 +1915,15 @@ fn hide_target_online(
 #[derive(Component)]
 struct PlayerMarker(u64);
 
+/// A marker's name, range and dot, for the plane with this id.
 #[derive(Component)]
-struct PlayerMarkerText;
+struct PlayerMarkerText(u64);
 
 #[derive(Component)]
-struct PlayerMarkerRange;
+struct PlayerMarkerRange(u64);
+
+#[derive(Component)]
+struct PlayerMarkerDot(u64);
 
 #[derive(Component)]
 struct Banner;
@@ -1466,7 +1941,11 @@ struct ScoreboardText;
 struct MpStatusLine;
 
 const RED: Color = Color::srgb(0.95, 0.22, 0.18);
-const MARKER_W: f32 = 220.0;
+const BLUE: Color = Color::srgb(0.3, 0.6, 1.0);
+const MARKER_W: f32 = 240.0;
+/// Room for two lines of name above the diamond, and the diamond's box.
+const MARKER_NAME_H: f32 = 40.0;
+const MARKER_BOX: f32 = 30.0;
 
 fn text(size: f32, color: Color) -> impl Bundle {
     (
@@ -1559,13 +2038,11 @@ fn update_mp_ui(
     camera: Single<(&Camera, &GlobalTransform), With<ChaseCamera>>,
     player: Single<&GlobalTransform, With<Player>>,
     remotes: Query<(&RemotePlane, &GlobalTransform, &Aircraft, &Visibility)>,
-    mut markers: Query<
-        (Entity, &PlayerMarker, &mut Node, &mut Visibility, &Children),
-        Without<RemotePlane>,
-    >,
+    mut markers: Query<(Entity, &PlayerMarker, &mut Node, &mut Visibility), Without<RemotePlane>>,
+    mut dots: Query<(&PlayerMarkerDot, &mut BackgroundColor)>,
     mut texts: ParamSet<(
-        Query<&mut Text, With<PlayerMarkerText>>,
-        Query<&mut Text, With<PlayerMarkerRange>>,
+        Query<(&PlayerMarkerText, &mut Text, &mut TextColor)>,
+        Query<(&PlayerMarkerRange, &mut Text, &mut TextColor)>,
         Single<
             (&mut Text, &mut Visibility),
             (
@@ -1597,10 +2074,12 @@ fn update_mp_ui(
         cam.world_to_viewport(cam_tf, world).ok()
     };
 
-    // One marker per other plane, like the target's: red, with the
-    // player's name above the aircraft name, and the range below.
+    // One marker per other plane, like the target's: the player's name
+    // above the aircraft name, the diamond, and the range below. Red for
+    // enemies, blue for your team.
     let mut have = vec![];
-    for (entity, marker, mut node, mut vis, children) in &mut markers {
+    let mut looks: HashMap<u64, (String, String, Color)> = HashMap::new();
+    for (entity, marker, mut node, mut vis) in &mut markers {
         let found = remotes.iter().find(|(r, ..)| r.id == marker.0);
         let Some((_, tf, aircraft, rvis)) = found.filter(|_| mp.online()) else {
             commands.entity(entity).despawn();
@@ -1609,34 +2088,57 @@ fn update_mp_ui(
         have.push(marker.0);
         let screen = project(tf.translation()).filter(|_| *rvis != Visibility::Hidden);
         match screen {
+            // The diamond's center sits on the plane.
             Some(p) => {
                 node.left = px(p.x - MARKER_W / 2.0);
-                node.top = px(p.y - 58.0);
+                node.top = px(p.y - MARKER_NAME_H - MARKER_BOX / 2.0);
                 *vis = Visibility::Inherited;
             }
             None => *vis = Visibility::Hidden,
         }
+        let color = if mp.enemies(mp.my_id, marker.0) {
+            RED
+        } else {
+            BLUE
+        };
         let name = format!("{}\n{}", mp.name_of(marker.0), aircraft.model.name);
         let range = settings
             .units
             .range(player.translation().distance(tf.translation()));
-        for c in children.iter() {
-            if let Ok(mut t) = texts.p0().get_mut(c)
-                && t.0 != name
-            {
+        looks.insert(marker.0, (name, range, color));
+    }
+    for (id, mut t, mut c) in texts.p0().iter_mut() {
+        if let Some((name, _, color)) = looks.get(&id.0) {
+            if t.0 != *name {
                 t.0 = name.clone();
             }
-            if let Ok(mut t) = texts.p1().get_mut(c)
-                && t.0 != range
-            {
+            if c.0 != *color {
+                c.0 = *color;
+            }
+        }
+    }
+    for (id, mut t, mut c) in texts.p1().iter_mut() {
+        if let Some((_, range, color)) = looks.get(&id.0) {
+            if t.0 != *range {
                 t.0 = range.clone();
             }
+            if c.0 != *color {
+                c.0 = *color;
+            }
+        }
+    }
+    for (id, mut bg) in &mut dots {
+        if let Some((_, _, color)) = looks.get(&id.0)
+            && bg.0 != *color
+        {
+            bg.0 = *color;
         }
     }
     for (remote, ..) in &remotes {
         if have.contains(&remote.id) || !mp.online() {
             continue;
         }
+        let id = remote.id;
         commands
             .spawn((
                 Node {
@@ -1647,40 +2149,60 @@ fn update_mp_ui(
                     ..default()
                 },
                 Visibility::Hidden,
-                PlayerMarker(remote.id),
+                PlayerMarker(id),
             ))
             .with_children(|m| {
-                m.spawn((
-                    text(15.0, RED),
-                    TextLayout::justify(Justify::Center),
-                    PlayerMarkerText,
-                ));
-                // The same red-dotted diamond as the target's marker.
-                m.spawn((
-                    Node {
-                        width: px(18),
-                        height: px(18),
-                        margin: UiRect::vertical(px(4)),
-                        border: UiRect::all(px(2)),
-                        ..default()
-                    },
-                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.85)),
-                    UiTransform::from_rotation(Rot2::degrees(45.0)),
-                ))
-                .with_children(|d| {
-                    d.spawn((
-                        Node {
-                            position_type: PositionType::Absolute,
-                            left: px(-4),
-                            top: px(-4),
-                            width: px(6),
-                            height: px(6),
-                            ..default()
-                        },
-                        BackgroundColor(RED),
+                // Name: a fixed-height box, text at its bottom.
+                m.spawn(Node {
+                    height: px(MARKER_NAME_H),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::FlexEnd,
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|n| {
+                    n.spawn((
+                        text(15.0, RED),
+                        TextLayout::justify(Justify::Center),
+                        PlayerMarkerText(id),
                     ));
                 });
-                m.spawn((text(15.0, RED), PlayerMarkerRange));
+                // The same dotted diamond as the target's marker, centered
+                // in its box.
+                m.spawn(Node {
+                    width: px(MARKER_BOX),
+                    height: px(MARKER_BOX),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                })
+                .with_children(|b| {
+                    b.spawn((
+                        Node {
+                            width: px(18),
+                            height: px(18),
+                            border: UiRect::all(px(2)),
+                            ..default()
+                        },
+                        BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+                        UiTransform::from_rotation(Rot2::degrees(45.0)),
+                    ))
+                    .with_children(|d| {
+                        d.spawn((
+                            Node {
+                                position_type: PositionType::Absolute,
+                                left: px(-4),
+                                top: px(-4),
+                                width: px(6),
+                                height: px(6),
+                                ..default()
+                            },
+                            BackgroundColor(RED),
+                            PlayerMarkerDot(id),
+                        ));
+                    });
+                });
+                m.spawn((text(15.0, RED), PlayerMarkerRange(id)));
             });
     }
 
@@ -1760,7 +2282,9 @@ fn update_mp_ui(
         }
     }
     // Scoreboard while the key is held.
-    let show = mp.online() && settings.pressed(&keys, Action::Scoreboard);
+    // (Testing aid: WTAT_TAB=1 holds the key.)
+    let show = mp.online()
+        && (settings.pressed(&keys, Action::Scoreboard) || std::env::var("WTAT_TAB").is_ok());
     let want = if show {
         Visibility::Inherited
     } else {
@@ -1770,25 +2294,62 @@ fn update_mp_ui(
         **board = want;
     }
     if show {
-        let mut rows: Vec<&Entry> = mp.roster.iter().collect();
-        rows.sort_by(|a, b| b.wins.cmp(&a.wins).then(b.kills.cmp(&a.kills)));
-        let mut s = format!("{:<22}{:>8}{:>7}  \n", "Player", "Wins", "Kills");
-        for e in rows {
+        let label = |e: &Entry| {
             let mut name = e.name();
             if e.id == HOST_ID {
                 name += " (host)";
             }
+            if e.bot {
+                name += " (AI)";
+            }
             if e.id == mp.my_id {
                 name = format!("> {name}");
             }
-            let name: String = name.chars().take(21).collect();
+            let name: String = name.chars().take(35).collect();
+            name
+        };
+        let out = |e: &Entry| if e.alive { "" } else { "  out" };
+        let mut s = String::new();
+        if mp.options.mode == GameMode::Tdm {
+            for team in 0..2u8 {
+                s += &format!(
+                    "{}  ({} round wins)\n",
+                    team_name(team),
+                    mp.team_wins[team as usize]
+                );
+                s += &format!("  {:<36}{:>7}{:>8}  \n", "Player", "Kills", "Deaths");
+                let mut rows: Vec<&Entry> = mp.roster.iter().filter(|e| e.team() == team).collect();
+                rows.sort_by(|a, b| b.kills.cmp(&a.kills).then(a.deaths.cmp(&b.deaths)));
+                for e in rows {
+                    s += &format!(
+                        "  {:<36}{:>7}{:>8}{}\n",
+                        label(e),
+                        e.kills,
+                        e.deaths,
+                        out(e)
+                    );
+                }
+                if team == 0 {
+                    s += "\n";
+                }
+            }
+        } else {
+            let mut rows: Vec<&Entry> = mp.roster.iter().collect();
+            rows.sort_by(|a, b| b.wins.cmp(&a.wins).then(b.kills.cmp(&a.kills)));
             s += &format!(
-                "{:<22}{:>8}{:>7}{}\n",
-                name,
-                e.wins,
-                e.kills,
-                if e.alive { "" } else { "  out" }
+                "{:<36}{:>6}{:>7}{:>8}  \n",
+                "Player", "Wins", "Kills", "Deaths"
             );
+            for e in rows {
+                s += &format!(
+                    "{:<36}{:>6}{:>7}{:>8}{}\n",
+                    label(e),
+                    e.wins,
+                    e.kills,
+                    e.deaths,
+                    out(e)
+                );
+            }
         }
         let mut t = texts.p4();
         if t.0 != s {
@@ -1822,6 +2383,7 @@ mod tests {
             color: PlaneColor::Blue,
             card,
             guns,
+            team: 0,
         });
         let bytes = encode(&info);
         let back: Result<ToHost, _> = serde_json::from_slice(&bytes);
@@ -1884,6 +2446,7 @@ mod tests {
                 color: PlaneColor::Blue,
                 card: AircraftCard::yak3(),
                 guns: vec![],
+                team: 0,
             }),
             ..Entry::new(5)
         });

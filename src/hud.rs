@@ -456,7 +456,7 @@ fn update_hud(
     let enemy: Option<(Vec3, Vec3)> = if online {
         remotes
             .iter()
-            .filter(|(_, _, r)| r.alive)
+            .filter(|(_, _, r)| r.alive && mp.enemies(mp.my_id, r.id))
             .map(|(tf, a, _)| (tf.translation(), a.body.velocity))
             .max_by(|a, b| {
                 let score = |p: Vec3| {

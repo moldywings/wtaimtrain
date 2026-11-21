@@ -181,6 +181,7 @@ fn spawn_camera(mut commands: Commands) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_mouse_aim(
     time: Res<Time<Real>>,
     motion: Res<AccumulatedMouseMotion>,
@@ -189,8 +190,19 @@ fn update_mouse_aim(
     settings: Res<Settings>,
     mut aim: ResMut<MouseAim>,
     mut camera: Single<&mut ChaseCamera>,
+    player: Single<&Transform, With<Player>>,
 ) {
     camera.free_looking = settings.pressed(&keys, Action::FreeLook);
+    // While free looking the aim rides on the gun crosshair (the nose), so
+    // the plane holds its course and the aim circle sits in the crosshair.
+    if camera.free_looking {
+        let nose = player.forward().as_vec3();
+        if nose.y.abs() < 0.97 {
+            let goal = Transform::default().looking_to(nose, Vec3::Y).rotation;
+            let k = 1.0 - (-12.0 * time.delta_secs()).exp();
+            aim.rot = aim.rot.slerp(goal, k).normalize();
+        }
+    }
     aim.level(time.delta_secs());
     if cursor.grab_mode == CursorGrabMode::None {
         return;

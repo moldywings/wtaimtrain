@@ -12,8 +12,13 @@ impl Plugin for WorldPlugin {
     }
 }
 
-const GROUND_SIZE: f32 = 60_000.0;
+/// The ground is a disc this wide, m.
+const GROUND_RADIUS: f32 = 60_000.0;
 const SCATTER_RADIUS: f32 = 15_000.0;
+/// Fields and roads cover the ground out to here, m.
+const FARMLAND_RADIUS: f32 = 30_000.0;
+/// Farmland comes in square districts this wide, each turned its own way.
+const DISTRICT: f32 = 2_400.0;
 
 fn spawn_world(
     mut commands: Commands,
@@ -32,49 +37,84 @@ fn spawn_world(
         Transform::from_xyz(0.0, 1.0, 0.0).looking_at(Vec3::new(0.4, -1.0, -0.6), Vec3::Y),
     ));
 
-    // Ground.
+    // Ground: a big round plain.
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(GROUND_SIZE, GROUND_SIZE))),
+        Mesh3d(meshes.add(Circle::new(GROUND_RADIUS).mesh().resolution(160))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.33, 0.45, 0.25),
             perceptual_roughness: 1.0,
             ..default()
         })),
+        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
     ));
 
     let mut rng = Lcg(0x5eed_1234);
 
-    // Fields: flat patches in a few colors break up the ground.
-    let field_mesh = meshes.add(Plane3d::default().mesh().size(1.0, 1.0));
+    // Fields and roads, all in one flat mesh (one draw call) painted with
+    // vertex colors. They make it easy to judge height down low.
+    let mut farm = FlatMesh::default();
     let field_colors = [
-        Color::srgb(0.45, 0.50, 0.28),
-        Color::srgb(0.55, 0.48, 0.30),
-        Color::srgb(0.28, 0.40, 0.22),
+        Vec3::new(0.45, 0.50, 0.28),
+        Vec3::new(0.55, 0.48, 0.30),
+        Vec3::new(0.28, 0.40, 0.22),
+        Vec3::new(0.62, 0.56, 0.34),
+        Vec3::new(0.38, 0.47, 0.24),
     ];
-    let field_mats: Vec<_> = field_colors
-        .iter()
-        .map(|c| {
-            materials.add(StandardMaterial {
-                base_color: *c,
-                perceptual_roughness: 1.0,
-                ..default()
-            })
-        })
-        .collect();
-    for _ in 0..500 {
-        let pos = rng.disc(SCATTER_RADIUS * 1.5);
-        commands.spawn((
-            Mesh3d(field_mesh.clone()),
-            MeshMaterial3d(field_mats[rng.index(field_mats.len())].clone()),
-            Transform::from_xyz(pos.x, rng.range(0.5, 3.0), pos.y)
-                .with_rotation(Quat::from_rotation_y(rng.range(0.0, std::f32::consts::PI)))
-                .with_scale(Vec3::new(
-                    rng.range(300.0, 900.0),
-                    1.0,
-                    rng.range(300.0, 900.0),
-                )),
-        ));
+    let road = Vec3::new(0.50, 0.47, 0.42);
+    let n = (FARMLAND_RADIUS / DISTRICT).ceil() as i32;
+    for dx in -n..=n {
+        for dz in -n..=n {
+            let center = Vec2::new(dx as f32, dz as f32) * DISTRICT;
+            if center.length() > FARMLAND_RADIUS {
+                continue;
+            }
+            let turn = Vec2::from_angle(rng.range(-0.5, 0.5));
+            let size = rng.range(220.0, 480.0);
+            let cells = (DISTRICT / size).floor() as i32;
+            let half = cells as f32 * size / 2.0;
+            for i in 0..cells {
+                for j in 0..cells {
+                    if rng.next() > 0.7 {
+                        continue;
+                    }
+                    let local = Vec2::new(
+                        i as f32 * size - half + size / 2.0,
+                        j as f32 * size - half + size / 2.0,
+                    );
+                    let at = center + turn.rotate(local);
+                    let color = field_colors[rng.index(field_colors.len())] * rng.range(0.92, 1.08);
+                    farm.quad(at, turn, Vec2::splat(size * 0.92), 0.8, color);
+                }
+            }
+            // A road along one or two sides of the district.
+            let edge = half + 6.0;
+            if rng.next() < 0.6 {
+                let at = center + turn.rotate(Vec2::new(0.0, -edge));
+                farm.quad(at, turn, Vec2::new(half * 2.0 + 12.0, 9.0), 1.4, road);
+            }
+            if rng.next() < 0.4 {
+                let at = center + turn.rotate(Vec2::new(-edge, 0.0));
+                farm.quad(at, turn, Vec2::new(9.0, half * 2.0 + 12.0), 1.4, road);
+            }
+        }
     }
+    // Long straight highways across the whole map.
+    for _ in 0..24 {
+        let a = rng.disc(FARMLAND_RADIUS * 0.8);
+        let dir = Vec2::from_angle(rng.range(0.0, std::f32::consts::PI));
+        let len = rng.range(15_000.0, 40_000.0);
+        farm.quad(a, dir, Vec2::new(len, 14.0), 1.8, road * 0.9);
+    }
+    commands.spawn((
+        Mesh3d(meshes.add(farm.build())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 1.0,
+            // Draw over the ground even far away, without flicker.
+            depth_bias: 50.0,
+            ..default()
+        })),
+    ));
 
     // Buildings: small boxes give a sense of height and speed down low.
     let building_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
@@ -105,6 +145,7 @@ struct Cloud;
 /// fall behind reappear ahead, so there are always some around.
 const CLOUD_RANGE: f32 = 9_000.0;
 const CLOUD_COUNT: usize = 70;
+const CLOUD_ALPHA: f32 = 0.78;
 
 fn spawn_clouds(
     mut commands: Commands,
@@ -112,15 +153,18 @@ fn spawn_clouds(
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let puff = meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap());
+    // Slightly see-through.
     let white = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.96, 0.97, 1.0),
+        base_color: Color::srgba(0.96, 0.97, 1.0, CLOUD_ALPHA),
+        alpha_mode: AlphaMode::Blend,
         emissive: LinearRgba::rgb(0.35, 0.36, 0.38),
         perceptual_roughness: 1.0,
         reflectance: 0.0,
         ..default()
     });
     let shade = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.85, 0.87, 0.92),
+        base_color: Color::srgba(0.85, 0.87, 0.92, CLOUD_ALPHA),
+        alpha_mode: AlphaMode::Blend,
         emissive: LinearRgba::rgb(0.28, 0.29, 0.32),
         perceptual_roughness: 1.0,
         reflectance: 0.0,
@@ -173,6 +217,49 @@ fn wrap_clouds(
                 tf.translation[axis] += span;
             }
         }
+    }
+}
+
+/// Flat colored quads on the ground, gathered into one mesh.
+#[derive(Default)]
+struct FlatMesh {
+    positions: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+}
+
+impl FlatMesh {
+    /// A `size` (length along `dir`, width across) rectangle centered on
+    /// `at`, `y` above the ground.
+    fn quad(&mut self, at: Vec2, dir: Vec2, size: Vec2, y: f32, color: Vec3) {
+        let across = dir.perp();
+        let (hx, hz) = (dir * size.x / 2.0, across * size.y / 2.0);
+        let base = self.positions.len() as u32;
+        for c in [at - hx - hz, at + hx - hz, at + hx + hz, at - hx + hz] {
+            self.positions.push([c.x, y, c.y]);
+            // Vertex colors are linear; the numbers above are sRGB.
+            let c = Color::srgb(color.x, color.y, color.z).to_linear();
+            self.colors.push([c.red, c.green, c.blue, 1.0]);
+        }
+        // Counter-clockwise seen from above, so the face points up.
+        let order = if dir.perp_dot(across) > 0.0 {
+            [0, 2, 1, 0, 3, 2]
+        } else {
+            [0, 1, 2, 0, 2, 3]
+        };
+        self.indices.extend(order.iter().map(|i| base + i));
+    }
+
+    fn build(self) -> Mesh {
+        let normals = vec![[0.0, 1.0, 0.0]; self.positions.len()];
+        Mesh::new(
+            bevy::mesh::PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::RENDER_WORLD,
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        .with_inserted_indices(bevy::mesh::Indices::U32(self.indices))
     }
 }
 

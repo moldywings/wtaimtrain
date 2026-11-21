@@ -7,12 +7,14 @@
 // No console window behind the game in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai;
 mod camera;
 mod flight;
 mod flight_model;
 mod hud;
 mod menu;
 mod multiplayer;
+mod names;
 mod settings;
 mod sound;
 mod target;
