@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
-use crate::multiplayer::{Mp, RemoteHit, RemotePlane, world_runs};
+use crate::multiplayer::{Bot, BotHit, Mp, RemoteHit, RemotePlane, world_runs};
 use crate::settings::Settings;
 use crate::sound::{self, Sounds};
 use crate::target::{PlayerHit, ResetScenario, ScenarioState, Target, TargetHit};
@@ -156,6 +156,7 @@ impl GunCard {
     }
 
     /// Width of the spread circle at 500 m, m.
+    #[allow(dead_code)]
     pub fn spread_at_500(&self) -> f32 {
         self.spread_mils() * MILS_TO_M_AT_500
     }
@@ -186,12 +187,14 @@ impl GunCard {
 
 /// Where a round is after flying `range` metres straight ahead at sea
 /// level: time of flight, speed left, and drop below the line of fire.
+#[allow(dead_code)]
 pub struct Ballistics {
     pub time: f32,
     pub speed: f32,
     pub drop: f32,
 }
 
+#[allow(dead_code)]
 pub fn ballistics_at(gun: &GunCard, range: f32) -> Ballistics {
     let mut v = Vec3::NEG_Z * gun.muzzle_velocity;
     let mut p = Vec3::ZERO;
@@ -424,6 +427,7 @@ impl Loadout {
         place_muzzles(slot, count, self.belly_back, self.wing_out)
     }
 
+    #[allow(dead_code)]
     pub fn total_guns(&self) -> u32 {
         Slot::ALL
             .iter()
@@ -917,6 +921,8 @@ enum Owner {
     Target,
     /// Another player (only for show: their game works out their hits).
     Remote,
+    /// An AI target in multiplayer, flown here (only on the host).
+    Bot(u64),
 }
 
 #[derive(Component)]
@@ -1005,6 +1011,7 @@ fn fire_guns(
         Has<Player>,
         Option<&Target>,
         Option<&RemotePlane>,
+        Has<Bot>,
     )>,
 ) {
     let dt = time.delta_secs();
@@ -1012,16 +1019,19 @@ fn fire_guns(
         && mp.guns_free()
         && trigger_now(&mouse, &cursor, settings.single_fire);
     let eye = camera.translation();
-    for (tf, aircraft, mut guns, is_player, target, remote) in planes {
+    for (tf, aircraft, mut guns, is_player, target, remote, is_bot) in planes {
         let (firing, owner) = if is_player {
             (player_trigger, Owner::Player)
         } else if let Some(r) = remote {
-            (r.firing && r.alive, Owner::Remote)
+            let owner = if is_bot {
+                Owner::Bot(r.id)
+            } else {
+                Owner::Remote
+            };
+            (r.firing && r.alive, owner)
         } else {
             (
-                !mp.online()
-                    && settings.enemy_fires
-                    && target.is_some_and(|t| t.firing && !t.destroyed()),
+                !mp.online() && target.is_some_and(|t| t.firing && !t.destroyed()),
                 Owner::Target,
             )
         };
@@ -1343,6 +1353,7 @@ struct HitWriters<'w> {
     target: MessageWriter<'w, TargetHit>,
     player: MessageWriter<'w, PlayerHit>,
     remote: MessageWriter<'w, RemoteHit>,
+    bot: MessageWriter<'w, BotHit>,
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -1432,9 +1443,15 @@ fn fly_bullets(
 
             for (plane, prev, now, kind) in &poses {
                 // Your rounds hit the target and other players; theirs hit you.
-                let can_hit = match bullet.owner {
-                    Owner::Player => *kind != Kind::Player,
-                    Owner::Target | Owner::Remote => *kind == Kind::Player,
+                // (No friendly fire in team games.)
+                let can_hit = match (bullet.owner, *kind) {
+                    (Owner::Player, Kind::Player) => false,
+                    (Owner::Player, Kind::Target) => true,
+                    (Owner::Player, Kind::Remote(id)) => mp.enemies(mp.my_id, id),
+                    (Owner::Target | Owner::Remote, k) => k == Kind::Player,
+                    (Owner::Bot(b), Kind::Player) => mp.enemies(b, mp.my_id),
+                    (Owner::Bot(b), Kind::Remote(id)) => mp.enemies(b, id),
+                    (Owner::Bot(_), Kind::Target) => false,
                 };
                 if !can_hit {
                     continue;
@@ -1474,6 +1491,17 @@ fn fly_bullets(
                 let Some(t) = hit else {
                     continue;
                 };
+                if let Owner::Bot(bot) = bullet.owner {
+                    let victim = match kind {
+                        Kind::Remote(id) => *id,
+                        _ => mp.my_id,
+                    };
+                    out.bot.write(BotHit {
+                        bot,
+                        victim,
+                        damage: bullet.damage,
+                    });
+                }
                 if *kind == Kind::Player {
                     if bullet.owner == Owner::Target {
                         out.player.write(PlayerHit {
@@ -1486,6 +1514,20 @@ fn fly_bullets(
                         *last_hit_sound = now;
                         sound::play(&mut commands, sounds.hit(), 0.6, 0.62);
                     }
+                    commands.entity(entity).despawn();
+                    continue 'bullets;
+                }
+                if let Owner::Bot(_) = bullet.owner {
+                    // An AI target's round: a spark, but not your hit.
+                    let local = crate::model_correction().transform_point(a.lerp(b, t));
+                    commands.entity(*plane).with_children(|p| {
+                        p.spawn((
+                            Spark { age: 0.0 },
+                            Transform::from_translation(local),
+                            Mesh3d(weapon_assets.spark_mesh.clone()),
+                            MeshMaterial3d(weapon_assets.spark_material.clone()),
+                        ));
+                    });
                     commands.entity(entity).despawn();
                     continue 'bullets;
                 }
@@ -1669,7 +1711,6 @@ pub fn lead_tendency(ahead: u32, behind: u32) -> Option<String> {
 fn update_hit_ui(
     real: Res<Time<Real>>,
     stats: Res<HitStats>,
-    settings: Res<Settings>,
     scenario: Res<ScenarioState>,
     mp: Res<Mp>,
     mut marker: Single<&mut Visibility, With<HitMarker>>,
@@ -1697,7 +1738,7 @@ fn update_hit_ui(
         text += "\n";
         text += &line;
     }
-    if settings.enemy_fires && !mp.online() {
+    if !mp.online() {
         text += &format!(
             "\nYour damage {:.0}%",
             (scenario.player_damage * 100.0).min(100.0)

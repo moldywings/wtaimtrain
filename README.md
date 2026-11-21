@@ -27,7 +27,7 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | S / W | Pitch up / down (overrides mouse aim while held) |
 | A / D | Roll left / right |
 | Q / E | Yaw left / right |
-| L Alt (hold) | Free look |
+| L Alt (hold) | Free look (the aim circle rides along with the crosshair, so the plane flies straight) |
 | R | Restart the scenario (in multiplayer the host holds it 3 s to start a round) |
 | Tab (hold) | Multiplayer scoreboard |
 | Esc | Pause menu |
@@ -41,7 +41,7 @@ The white circle is where you're aiming. The crosshair is where the nose points.
 - **Head on:** you fly straight at each other. The target holds a straight line at a random speed, from a slightly different height and toward a different point near you each time.
 - **Chase:** you start behind the target (300 to 800 m by default). It keeps its heading but weaves and dodges: some runs hard, some gently, some not at all.
 - **Stall:** the target starts just above and ahead of you and pulls straight up, rolling and dodging.
-- **Dogfight:** the target starts close by, usually ahead of you, at a random spot, height, heading and speed, and tries to ram you. With **Enemy shoots back** on (Scenario page), it hunts you with its own guns instead: it fires when lined up, breaks off if it gets too close, and its hits show as "Your damage". At 100% you're shot down and the scenario resets 2 seconds later. Enemy fire works in the other scenarios too.
+- **Dogfight:** the target starts close by, usually ahead of you, at a random spot, height, heading and speed, and dogfights you with its own guns: it leads its shots for its biggest gun, manages its speed and throttle, breaks off if it gets too close and keeps clear of the ground. Its hits show as "Your damage". At 100% you're shot down and the scenario resets 2 seconds later. The target shoots back in the other scenarios too, and every target AI pulls up before the ground.
 - **Banking:** the target starts ahead (500 to 1300 m by default), off to one side and above, below or level with you, then pulls a hard banked turn, usually across your nose and sometimes away. The path changes every run (low to high, high to low, or straight across, from either side). After turning 150 to 300 degrees it rolls out, and the run ends after about 22 seconds.
 - **Diving:** you start above the target (300 to 1200 m higher and 800 to 2000 m ahead by default) and dive on it. Half the time it hasn't seen you and flies straight on until you open fire. The other half it's watching and reacts as soon as you dive at it. Once alerted it goes to full throttle and dives away from you, leveling off near the ground, while jinking, rolling or corkscrewing (some hard, some gently, some not at all).
 - **All in one:** a random one of the others each time, using each scenario's own start distances.
@@ -79,14 +79,19 @@ The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. 
 
 ## Multiplayer
 
-Free for all: the last plane flying wins the round. One player hosts from the Multiplayer page, and the others type the host's address and join. There's no practice target online.
+One player hosts from the Multiplayer page, and the others type the host's address and join.
+
+- **Free for all:** the last plane flying wins the round.
+- **Team deathmatch:** each player picks Team A or Team B. A team wins the round when everyone on the other team is eliminated. Teammates' markers are blue and can't be hurt.
+- **AI targets:** the host can add AI planes (in TDM, to each team). They fly the target preset, get a random name with "(AI)", lead their shots for their biggest gun, manage their energy and throttle, and chase the nearest enemy (in free for all that includes other AI targets).
+- A new round starts by itself 3 seconds after a win. Eliminated planes explode.
 
 - **Joining over the internet:** the host forwards UDP port 5050 (or the port they picked) on their router to their computer, and friends join with the host's public IP address, like `203.0.113.5:5050`. Without port forwarding, everyone can join the same free VPN (Radmin VPN, ZeroTier or Tailscale) and use the host's VPN address. On the same home network, use the host's local address.
 - **Rounds:** the host holds the reset key (R) for 3 seconds to start a round, with a countdown everyone sees. Everyone is placed around a circle, and can fly during the countdown but not fire. "FIGHT!" shows when guns are free.
 - **Host settings** (change them any time, no need to host again): whether lead indicators are allowed (if so, each player's own setting applies), the countdown, spawn distance, average altitude, altitude range, and facing each other or random headings.
-- **Players** pick a name and a paint color (the cockpit keeps its color). Other planes get the same marker as the target, in red, with the player's name above the aircraft name.
+- **Players** pick a name and a paint color (the cockpit keeps its color). Other planes get the same marker as the target, red for enemies and blue for teammates, with the player's name above the aircraft name.
 - **Presets:** joined players can fly the host's aircraft presets (but not change them), or their own. The host can lock any player to one of the host's presets.
-- Hits, eliminations ("X was eliminated by Y") and wins are worked out by the host. Eliminated players watch the others: left click for the next player, right click for the previous one. Hold Tab for the scoreboard (wins and kills).
+- Hits, eliminations ("X was eliminated by Y") and wins are worked out by the host. Eliminated players watch the others: left click for the next player, right click for the previous one. Hold Tab for the scoreboard: wins, kills and deaths in free for all; each team's round wins and every player's kills and deaths in team deathmatch.
 - The pause menu doesn't pause the game for everyone: your plane keeps flying while it's open.
 
 ## Layout
