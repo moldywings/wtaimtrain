@@ -442,8 +442,17 @@ fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
 
 /// Start hosting on `port`.
 fn start_host(mp: &mut Mp, port: u16) -> Result<(), String> {
-    let socket = UdpSocket::bind(("0.0.0.0", port))
-        .map_err(|e| format!("Couldn't open port {port}: {e}"))?;
+    let socket = UdpSocket::bind(("0.0.0.0", port)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            format!(
+                "Port {port} is already in use on this computer. If another copy \
+                 of the game is hosting, join it with 127.0.0.1 instead. Otherwise \
+                 pick another port (and forward that one on your router)."
+            )
+        } else {
+            format!("Couldn't open port {port}: {e}")
+        }
+    })?;
     let addr = socket
         .local_addr()
         .map_err(|e| format!("Couldn't read the port: {e}"))?;
