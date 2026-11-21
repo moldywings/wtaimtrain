@@ -7,6 +7,8 @@ edition = "2024"
 bevy = { version = "0.20.1", features = ["serialize", "wav"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+renet = "2.0.1"
+renet_netcode = "2.0.1"
 
 # Faster dev builds: optimize dependencies, keep our code quick to compile.
 [profile.dev]

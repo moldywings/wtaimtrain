@@ -31,7 +31,8 @@ impl Plugin for TargetPlugin {
                     fly_target.run_if(in_state(GameState::Playing)),
                 )
                     .chain()
-                    .after(crate::flight::fly_player),
+                    .after(crate::flight::fly_player)
+                    .run_if(crate::multiplayer::offline),
             )
             .add_systems(
                 Update,
@@ -44,7 +45,8 @@ impl Plugin for TargetPlugin {
                 )
                     .chain()
                     .after(fly_target)
-                    .run_if(in_state(GameState::Playing)),
+                    .run_if(in_state(GameState::Playing))
+                    .run_if(crate::multiplayer::offline),
             );
     }
 }
@@ -312,7 +314,11 @@ fn reset_scenario(
         return;
     }
     let (mut player, mut player_tf) = player.into_inner();
-    player.body = start_body(&player.model);
+    let fraction = state.rng.range(
+        crate::flight::START_SPEED_MIN,
+        crate::flight::START_SPEED_MAX,
+    );
+    player.body = start_body(&player.model, fraction);
     player.controls.throttle = 1.0;
     *player_tf = Transform::from_translation(player.body.position);
     aim.reset();

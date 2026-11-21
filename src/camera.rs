@@ -116,14 +116,24 @@ pub struct ChaseCamera {
     zoom: f32,
 }
 
-/// Camera offset behind and above the player, in view space.
-const CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 3.0, 20.0);
+/// Camera offset behind and above the player, in view space, measured
+/// from War Thunder's chase view: the plane sits about 15 m ahead and
+/// 3.6 m below the line of sight (about 14 degrees below it).
+const CAMERA_OFFSET: Vec3 = Vec3::new(0.0, 3.6, 15.0);
+/// Zoomed in, the game pulls the camera in close over the tail, so only
+/// the top of the fuselage shows at the bottom of the screen.
+const ZOOM_OFFSET: Vec3 = Vec3::new(0.0, 3.4, 11.0);
+/// The view points this far below the aim, so the aim circle sits a
+/// little above the middle of the screen, as in the game.
+const VIEW_TILT_DEG: f32 = 3.3;
 
 /// How quickly the view catches up with the aim circle (1/s). Higher is snappier.
 const CAMERA_FOLLOW_RATE: f32 = 5.0;
 
-const NORMAL_FOV: f32 = 60.0;
-const ZOOM_FOV: f32 = 25.0;
+/// Vertical field of view, degrees: about 61 normally, and the game's zoom
+/// narrows it about 2.2 times.
+const NORMAL_FOV: f32 = 61.0;
+const ZOOM_FOV: f32 = 30.0;
 /// How quickly zoom and free look settle (1/s).
 const ZOOM_RATE: f32 = 10.0;
 const LOOK_RETURN_RATE: f32 = 6.0;
@@ -133,6 +143,18 @@ const LOOK_FOLLOW_RATE: f32 = 10.0;
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
+        // HDR with bloom that only picks up over-bright things (the
+        // tracers), so they glow without blurring the rest of the scene.
+        bevy::camera::Hdr,
+        bevy::post_process::bloom::Bloom {
+            intensity: 0.2,
+            prefilter: bevy::post_process::bloom::BloomPrefilter {
+                threshold: 3.0,
+                threshold_softness: 0.5,
+            },
+            composite_mode: bevy::post_process::bloom::BloomCompositeMode::Additive,
+            ..bevy::post_process::bloom::Bloom::NATURAL
+        },
         Projection::Perspective(PerspectiveProjection {
             fov: NORMAL_FOV.to_radians(),
             far: 30_000.0,
@@ -192,24 +214,38 @@ fn current_fov(zoom: f32) -> f32 {
     NORMAL_FOV + (ZOOM_FOV - NORMAL_FOV) * zoom
 }
 
+#[allow(clippy::too_many_arguments)]
 fn follow_player(
     time: Res<Time<Real>>,
     state: Res<State<GameState>>,
     mouse: Res<ButtonInput<MouseButton>>,
     aim: Res<MouseAim>,
     player: Single<&Transform, (With<Player>, Without<ChaseCamera>)>,
+    mp: Res<crate::multiplayer::Mp>,
+    remotes: Query<(&Transform, &crate::multiplayer::RemotePlane), Without<ChaseCamera>>,
     camera: Single<(&mut Transform, &mut ChaseCamera, &mut Projection)>,
 ) {
+    // Out of a multiplayer round: ride along behind the player you watch.
+    let watched = mp
+        .spectate
+        .and_then(|id| remotes.iter().find(|(_, r)| r.id == id))
+        .map(|(tf, _)| *tf);
+    let followed = watched.unwrap_or(**player);
     let (mut tf, mut cam, mut projection) = camera.into_inner();
     // Real time so the view keeps settling smoothly in the pause menu.
     let dt = time.delta_secs();
     let ease = |rate: f32| 1.0 - (-rate * dt).exp();
 
     if *state.get() == GameState::Playing {
-        cam.view = cam
-            .view
-            .slerp(aim.rotation(), ease(CAMERA_FOLLOW_RATE))
-            .normalize();
+        let goal = match watched {
+            // Level with the horizon, looking where they fly.
+            Some(w) => {
+                let f = w.forward().as_vec3();
+                Transform::default().looking_to(f, Vec3::Y).rotation
+            }
+            None => aim.rotation(),
+        };
+        cam.view = cam.view.slerp(goal, ease(CAMERA_FOLLOW_RATE)).normalize();
 
         // Free look eases toward where the mouse put it, and springs back
         // once the key is released.
@@ -222,7 +258,8 @@ fn follow_player(
         cam.look_yaw += (cam.look_goal.x - cam.look_yaw) * k;
         cam.look_pitch += (cam.look_goal.y - cam.look_pitch) * k;
 
-        if mouse.just_pressed(MouseButton::Right) {
+        // (Watching someone, the mouse buttons pick who.)
+        if mouse.just_pressed(MouseButton::Right) && watched.is_none() {
             cam.zoomed = !cam.zoomed;
         }
         let zoom_target = if cam.zoomed { 1.0 } else { 0.0 };
@@ -235,7 +272,8 @@ fn follow_player(
 
     // Testing aid: WTAT_LOOK="yaw,pitch,distance" (degrees, metres) holds
     // a fixed view of the player's plane for screenshots.
-    let mut offset = CAMERA_OFFSET;
+    let mut offset = CAMERA_OFFSET.lerp(ZOOM_OFFSET, cam.zoom);
+    let mut tilt = Quat::from_rotation_x(-VIEW_TILT_DEG.to_radians());
     if let Ok(look) = std::env::var("WTAT_LOOK") {
         let v: Vec<f32> = look
             .split(',')
@@ -245,12 +283,13 @@ fn follow_player(
         cam.look_pitch = v.get(1).copied().unwrap_or(0.0).to_radians();
         if let Some(d) = v.get(2) {
             offset = Vec3::new(0.0, 0.0, *d);
+            tilt = Quat::IDENTITY;
         }
     }
     let look = Quat::from_euler(EulerRot::YXZ, cam.look_yaw, cam.look_pitch, 0.0);
     let rot = cam.view * look;
-    tf.translation = player.translation + rot * offset;
-    tf.rotation = rot;
+    tf.translation = followed.translation + rot * offset;
+    tf.rotation = rot * tilt;
 }
 
 /// Snap the view straight to the aim direction (used on reset).

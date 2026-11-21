@@ -2,26 +2,33 @@
 //! an instructor (like War Thunder's) that works the stick for you; holding
 //! a pitch, roll or yaw key takes over that axis until it's released.
 
+use std::collections::HashMap;
+
+use bevy::gltf::GltfMaterialName;
 use bevy::prelude::*;
 
 use crate::GameState;
 use crate::camera::MouseAim;
 use crate::flight_model::{self, AircraftCard, Body, Controls, FlightModel};
-use crate::settings::{Action, Settings};
+use crate::multiplayer::{Mp, local_flies, offline};
+use crate::settings::{Action, PlaneColor, Settings};
 use crate::target::{ResetScenario, Target};
 
 pub struct FlightPlugin;
 
 impl Plugin for FlightPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_player).add_systems(
-            Update,
-            (
-                apply_presets,
-                (fly_player, reset).run_if(in_state(GameState::Playing)),
+        app.add_systems(Startup, spawn_player)
+            .add_systems(
+                Update,
+                (
+                    apply_presets,
+                    fly_player.run_if(local_flies),
+                    reset.run_if(in_state(GameState::Playing)).run_if(offline),
+                )
+                    .chain(),
             )
-                .chain(),
-        );
+            .add_systems(Update, (find_paintwork, paint_planes).chain());
     }
 }
 
@@ -59,6 +66,84 @@ impl Aircraft {
     }
 }
 
+/// The paint on a plane (not the cockpit). Planes without one keep the
+/// model's own red.
+#[derive(Component, Clone, Copy, PartialEq)]
+pub struct PaintColor(pub PlaneColor);
+
+/// A painted part of a plane's model.
+#[derive(Component)]
+struct Paintwork {
+    plane: Entity,
+    original: Handle<StandardMaterial>,
+    shown: PlaneColor,
+}
+
+/// The model's paint material.
+const PAINT_MATERIAL: &str = "Red";
+
+/// Find the painted parts of newly loaded plane models.
+fn find_paintwork(
+    mut commands: Commands,
+    parts: Query<
+        (Entity, &GltfMaterialName, &MeshMaterial3d<StandardMaterial>),
+        Added<GltfMaterialName>,
+    >,
+    parents: Query<&ChildOf>,
+    painted: Query<(), With<PaintColor>>,
+) {
+    for (entity, name, material) in &parts {
+        if name.0 != PAINT_MATERIAL {
+            continue;
+        }
+        let Some(plane) = parents
+            .iter_ancestors(entity)
+            .find(|a| painted.contains(*a))
+        else {
+            continue;
+        };
+        commands.entity(entity).insert(Paintwork {
+            plane,
+            original: material.0.clone(),
+            shown: PlaneColor::Red,
+        });
+    }
+}
+
+/// Repaint planes whose color changed.
+fn paint_planes(
+    mut parts: Query<(&mut Paintwork, &mut MeshMaterial3d<StandardMaterial>)>,
+    planes: Query<&PaintColor>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut cache: Local<HashMap<PlaneColor, Handle<StandardMaterial>>>,
+) {
+    for (mut part, mut material) in &mut parts {
+        let Ok(paint) = planes.get(part.plane) else {
+            continue;
+        };
+        if part.shown == paint.0 {
+            continue;
+        }
+        let handle = if paint.0 == PlaneColor::Red {
+            part.original.clone()
+        } else if let Some(h) = cache.get(&paint.0) {
+            h.clone()
+        } else {
+            let Some(base) = materials.get(&part.original).cloned() else {
+                continue;
+            };
+            let h = materials.add(StandardMaterial {
+                base_color: paint.0.color(),
+                ..base
+            });
+            cache.insert(paint.0, h.clone());
+            h
+        };
+        material.0 = handle;
+        part.shown = paint.0;
+    }
+}
+
 #[derive(Component, Default)]
 pub struct Player {
     /// Keyboard pitch/roll/yaw, eased toward -1..=1 while keys are held.
@@ -66,16 +151,19 @@ pub struct Player {
 }
 
 pub const START_ALTITUDE: f32 = 1_500.0;
-/// Start at this fraction of the preset's top speed at the start altitude.
-pub const START_SPEED_FRACTION: f32 = 0.85;
+/// Start between these fractions of the preset's top speed at the start
+/// altitude.
+pub const START_SPEED_MIN: f32 = 0.5;
+pub const START_SPEED_MAX: f32 = 0.6;
 /// How quickly keyboard inputs reach full deflection (per second).
 const KEY_RAMP: f32 = 4.0;
 
-pub fn start_body(model: &FlightModel) -> Body {
+/// A body at the start spot flying at `fraction` of top speed.
+pub fn start_body(model: &FlightModel, fraction: f32) -> Body {
     Body::new(
         Vec3::new(0.0, START_ALTITUDE, 0.0),
         Quat::IDENTITY,
-        START_SPEED_FRACTION * model.top_speed(START_ALTITUDE),
+        fraction * model.top_speed(START_ALTITUDE),
     )
 }
 
@@ -84,12 +172,13 @@ fn spawn_player(mut commands: Commands, assets: Res<AssetServer>, settings: Res<
         settings.player_card(),
         Body::new(Vec3::ZERO, Quat::IDENTITY, 0.0),
     );
-    aircraft.body = start_body(&aircraft.model);
+    aircraft.body = start_body(&aircraft.model, 0.55);
     commands
         .spawn((
             Transform::from_translation(aircraft.body.position),
             Visibility::default(),
             Player::default(),
+            PaintColor(settings.plane_color),
             aircraft,
         ))
         .with_children(|plane| {
@@ -106,26 +195,33 @@ fn spawn_player(mut commands: Commands, assets: Res<AssetServer>, settings: Res<
 /// Rebuild flight models when presets change in the menu.
 fn apply_presets(
     settings: Res<Settings>,
+    mp: Res<Mp>,
     mut player: Query<&mut Aircraft, (With<Player>, Without<Target>)>,
     mut targets: Query<&mut Aircraft, (With<Target>, Without<Player>)>,
 ) {
     if !settings.is_changed() {
         return;
     }
-    for mut a in &mut player {
-        a.set_card(settings.player_card());
+    // Online, the multiplayer code picks your preset (it may be the host's).
+    if !mp.online() {
+        for mut a in &mut player {
+            a.set_card(settings.player_card());
+        }
     }
     for mut a in &mut targets {
         a.set_card(settings.target_card());
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fly_player(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     settings: Res<Settings>,
     aim: Res<MouseAim>,
     mut reset: MessageWriter<ResetScenario>,
+    mp: Res<Mp>,
+    state: Res<State<GameState>>,
     player: Single<(&mut Transform, &mut Aircraft, &mut Player)>,
 ) {
     let dt = time.delta_secs();
@@ -133,7 +229,13 @@ pub fn fly_player(
         return;
     }
     let (mut tf, mut aircraft, mut player) = player.into_inner();
+    // In the menu (only online does the plane keep flying) the keys are
+    // for the menu.
+    let playing = *state.get() == GameState::Playing;
     let axis = |plus: Action, minus: Action| -> f32 {
+        if !playing {
+            return 0.0;
+        }
         settings.pressed(&keys, plus) as i32 as f32 - settings.pressed(&keys, minus) as i32 as f32
     };
 
@@ -177,7 +279,8 @@ pub fn fly_player(
     flight_model::step(model, body, &controls, dt);
 
     // No crash damage yet: hitting the ground just restarts you.
-    if body.position.y < 3.0 {
+    // (Online, the multiplayer code deals with it.)
+    if body.position.y < 3.0 && !mp.online() {
         reset.write(ResetScenario);
     }
 

@@ -21,19 +21,20 @@ Run it with `cargo run` from the repository folder so the game can find `assets/
 | Input | Action |
 | --- | --- |
 | Mouse | Move the aim circle. The camera swings after it and the plane turns to follow |
-| Left click (hold) | Fire all guns |
+| Left click | Fire all guns (hold, or one shot per click with Single fire on) |
 | Right click | Toggle zoom |
 | L Shift / L Ctrl | Throttle up / down (you start at 100%; jets with an afterburner go to 110% to light it) |
 | S / W | Pitch up / down (overrides mouse aim while held) |
 | A / D | Roll left / right |
 | Q / E | Yaw left / right |
 | L Alt (hold) | Free look |
-| R | Restart the scenario |
+| R | Restart the scenario (in multiplayer the host holds it 3 s to start a round) |
+| Tab (hold) | Multiplayer scoreboard |
 | Esc | Pause menu |
 
-The pause menu has five pages. **Settings** covers aim, zoomed aim and free look sensitivity, crosshair style and color, the lead indicator, and every key binding. **Units** has a drop-down for each kind of number: airspeed (km/h, mph, kn, m/s), altitude (m, ft), distance and range (km, mi, nmi, m, ft, yd), climb rate (m/s, ft/min, ft/s), engine power (hp, kW), thrust (kgf, lbf, kN), mass (kg, lb) and wing area (sq m, sq ft). Presets are stored in fixed units, so switching a unit converts everything shown, presets included. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies from drop-down lists. **Weapons** has gun presets and each aircraft preset's loadout. **Scenario** picks what you practice and sets that scenario's start distances. Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
+The pause menu has six pages. **Settings** covers aim, zoomed aim and free look sensitivity, crosshair style and color, the lead indicator, single or automatic fire, and every key binding. **Units** has a drop-down for each kind of number: airspeed (km/h, mph, kn, m/s), altitude (m, ft), distance and range (km, mi, nmi, m, ft, yd), climb rate (m/s, ft/min, ft/s), engine power (hp, kW), thrust (kgf, lbf, kN), mass (kg, lb) and wing area (sq m, sq ft). Presets are stored in fixed units, so switching a unit converts everything shown, presets included. **Aircraft** has the flight model presets: you pick which preset you fly and which one the target flies from drop-down lists. **Weapons** has gun presets and each aircraft preset's loadout. **Scenario** picks what you practice and sets that scenario's start distances. **Multiplayer** hosts or joins a game (see below). Settings and all your presets are saved to `WT Aim Trainer/settings.json` in your user config folder (`%APPDATA%` on Windows, `~/.config` on Linux), so they're there every time you open the game. Set `WTAT_CONFIG_DIR` to use another folder.
 
-The white circle is where you're aiming. The crosshair is where the nose points. The target shows its preset name, a bracket marker and its range. When it's off screen, a red arrow at the screen edge points to it. The readout shows indicated (IAS) and true (TAS) airspeed. Hits and accuracy show in the top right, and "HIT" flashes when a round connects. With the lead indicator on, a green circle shows where to put your gun crosshair to hit the target. It's worked out for the biggest gun on your plane, counting your speed, the target's speed, bullet drop and drag.
+The white circle is where you're aiming. The crosshair is where the nose points. The target shows its preset name, a bracket marker and its range. When it's off screen, a red arrow at the screen edge points to it. The readout shows indicated (IAS) and true (TAS) airspeed. Hits and accuracy show in the top right, and "HIT" flashes when a round connects. They start over when you change aircraft or guns. Underneath, once enough rounds have gone close by, it says whether your misses mostly pass ahead of the plane (over-leading) or behind it (under-leading). With the lead indicator on, a green circle shows where to put your gun crosshair to hit the target. It's worked out for the biggest gun on your plane, counting your speed, the target's speed, bullet drop and drag.
 
 ## Scenarios
 
@@ -61,7 +62,7 @@ Roll rate builds up with speed to the preset's best roll rate at its best roll s
 
 ## Weapons
 
-A gun preset has a name, muzzle velocity (m/s), projectile mass (kg), fire rate (rounds per minute) and tracer color. Caliber, spread and hits to kill are optional. A blank caliber is estimated from the projectile mass, spread is the width of the circle the rounds land in at 500 m, in meters (1 m by default), and hits to kill comes from the caliber (about 6 for 20 mm, 16 for 12.7 mm, 50 for 7.62 mm). Hits from different guns add up: each takes its share of the target's health. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. Tracers are true to caliber (thin round streaks with a soft glow just wider than the round, kept about a pixel wide far away), and disappear after 2.5 miles (about 4 km).
+A gun preset has a name, muzzle velocity (m/s), projectile mass (kg), fire rate (rounds per minute) and tracer color. Caliber, spread and hits to kill are optional. A blank caliber is estimated from the projectile mass, spread is the width of the circle the rounds land in at 500 m, in meters (1 m by default), and hits to kill comes from the caliber (about 6 for 20 mm, 16 for 12.7 mm, 50 for 7.62 mm). Hits from different guns add up: each takes its share of the target's health. Rounds fly with gravity and air drag worked out from the caliber and mass. The editor shows each gun's flight time, remaining speed and drop at 1 km. Tracers are true to caliber: a solid white core with a bright glow around it in the tracer color, kept about a pixel wide far away. They disappear after 2.5 miles (about 4 km).
 
 Gunshots and hits have sounds made in code, with no sound files. Small, fast rounds crack higher and big, slow ones boom lower. The built-in gun is the 20 mm ShVAK (800 m/s, 0.1 kg, 800 rpm), and it can't be changed or deleted. The 12.7 mm UBS comes as a second preset.
 
@@ -76,6 +77,18 @@ Belly and wing guns can mix calibers: with two or more, each position gets its o
 
 The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. Nose guns fire straight ahead. Wing and belly guns angle in sideways only (like War Thunder's horizontal convergence) to meet at the loadout's gun targeting distance, 400 m by default. Pick it from the same list the game has (No, 50 to 300 m in 50 m steps, then 400 to 800 m); No fires them parallel. The Yak-3 carries a ShVAK in the spinner and two UBS above it. Changing its loadout saves a copy.
 
+## Multiplayer
+
+Free for all: the last plane flying wins the round. One player hosts from the Multiplayer page, and the others type the host's address and join. There's no practice target online.
+
+- **Joining over the internet:** the host forwards UDP port 5050 (or the port they picked) on their router to their computer, and friends join with the host's public IP address, like `203.0.113.5:5050`. Without port forwarding, everyone can join the same free VPN (Radmin VPN, ZeroTier or Tailscale) and use the host's VPN address. On the same home network, use the host's local address.
+- **Rounds:** the host holds the reset key (R) for 3 seconds to start a round, with a countdown everyone sees. Everyone is placed around a circle, and can fly during the countdown but not fire. "FIGHT!" shows when guns are free.
+- **Host settings** (change them any time, no need to host again): whether lead indicators are allowed (if so, each player's own setting applies), the countdown, spawn distance, average altitude, altitude range, and facing each other or random headings.
+- **Players** pick a name and a paint color (the cockpit keeps its color). Other planes get the same marker as the target, in red, with the player's name above the aircraft name.
+- **Presets:** joined players can fly the host's aircraft presets (but not change them), or their own. The host can lock any player to one of the host's presets.
+- Hits, eliminations ("X was eliminated by Y") and wins are worked out by the host. Eliminated players watch the others: left click for the next player, right click for the previous one. Hold Tab for the scoreboard (wins and kills).
+- The pause menu doesn't pause the game for everyone: your plane keeps flying while it's open.
+
 ## Layout
 
 - `src/camera.rs` handles mouse aim and the chase camera.
@@ -88,6 +101,8 @@ The gun model (`assets/models/gun.glb`) appears in each spot, sized by caliber. 
 - `src/menu.rs` is the pause menu.
 - `src/sound.rs` makes the gunshot and hit sounds.
 - `src/weapons.rs` holds gun presets, loadouts and mount positions, firing, ballistics and hit detection.
+- `src/multiplayer.rs` hosts and joins games (renet over UDP), runs rounds and shows the scoreboard.
+- `assets/presets.json` holds extra gun and aircraft presets that are added to everyone's game once.
 - `assets/models/airplane.glb` is the aircraft model. It's scaled 1.33x in code to roughly match a real Yak-3.
 
 ## Roadmap

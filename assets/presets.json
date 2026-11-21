@@ -1,0 +1,443 @@
+{
+  "guns": [
+    {
+      "name": "30 mm MK 108",
+      "muzzle_velocity": 500.0,
+      "projectile_mass": 0.37,
+      "fire_rate": 500.0,
+      "caliber": 30.0,
+      "spread": null,
+      "tracer": "White",
+      "hits_to_kill": null
+    },
+    {
+      "name": "GSh-23L",
+      "muzzle_velocity": 715.0,
+      "projectile_mass": 0.2,
+      "fire_rate": 3396.0,
+      "caliber": 23.0,
+      "spread": 2.0,
+      "tracer": "Yellow",
+      "hits_to_kill": 5.0
+    },
+    {
+      "name": "20 mm M39A3",
+      "muzzle_velocity": 990.0,
+      "projectile_mass": 0.1,
+      "fire_rate": 1698.0,
+      "caliber": 20.0,
+      "spread": null,
+      "tracer": "White",
+      "hits_to_kill": null
+    },
+    {
+      "name": "ShVAK 20 mm copy",
+      "muzzle_velocity": 800.0,
+      "projectile_mass": 0.1,
+      "fire_rate": 800.0,
+      "caliber": 20.0,
+      "spread": null,
+      "tracer": "White",
+      "hits_to_kill": null
+    },
+    {
+      "name": "20 mm Hispano Mk. V",
+      "muzzle_velocity": 869.0,
+      "projectile_mass": 0.13,
+      "fire_rate": 750.0,
+      "caliber": 20.0,
+      "spread": null,
+      "tracer": "White",
+      "hits_to_kill": null
+    },
+    {
+      "name": "30 mm Type 5",
+      "muzzle_velocity": 770.0,
+      "projectile_mass": 0.35,
+      "fire_rate": 500.0,
+      "caliber": 30.0,
+      "spread": 5.2,
+      "tracer": "Yellow",
+      "hits_to_kill": 2.0
+    },
+    {
+      "name": "23 mm NR-23",
+      "muzzle_velocity": 690.0,
+      "projectile_mass": 0.2,
+      "fire_rate": 900.0,
+      "caliber": 23.0,
+      "spread": 8.0,
+      "tracer": "Orange",
+      "hits_to_kill": null
+    },
+    {
+      "name": "37 mm N-37D",
+      "muzzle_velocity": 690.0,
+      "projectile_mass": 0.74,
+      "fire_rate": 400.0,
+      "caliber": 37.0,
+      "spread": 2.2,
+      "tracer": "White",
+      "hits_to_kill": null
+    },
+    {
+      "name": "20 mm Type 99 Mk 1",
+      "muzzle_velocity": 600.0,
+      "projectile_mass": 0.13,
+      "fire_rate": 535.0,
+      "caliber": 20.0,
+      "spread": 4.0,
+      "tracer": "Yellow",
+      "hits_to_kill": 3.0
+    },
+    {
+      "name": "23 mm NS-23",
+      "muzzle_velocity": 690.0,
+      "projectile_mass": 0.2,
+      "fire_rate": 600.0,
+      "caliber": 23.0,
+      "spread": 2.0,
+      "tracer": "Yellow",
+      "hits_to_kill": 1.0
+    }
+  ],
+  "aircraft": [
+    {
+      "name": "L-39",
+      "engine": "Jet",
+      "power": 1690.0,
+      "engines": 1,
+      "climb_rate": 19.99996,
+      "sustained_turn_rate": 16.99,
+      "sustained_turn_speed": 92.08558,
+      "instant_turn_rate": 32.3,
+      "instant_turn_speed": 180.0556,
+      "top_speed": 197.54672,
+      "top_speed_altitude": 0.0,
+      "mass": 3905.0,
+      "wing_area": 18.78,
+      "cl_max": 1.31,
+      "roll_rate": 150.0,
+      "roll_speed": 144.04448,
+      "afterburner": false,
+      "afterburner_thrust": null,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "belly": {
+          "gun": "GSh-23L",
+          "count": 1
+        },
+        "wings": {
+          "gun": "30 mm MK 108",
+          "count": 0
+        },
+        "convergence": 0.0,
+        "belly_back": 2.5,
+        "wing_out": 0.5
+      }
+    },
+    {
+      "name": "F-5E",
+      "engine": "Jet",
+      "power": 1480.0,
+      "engines": 2,
+      "climb_rate": 150.00223,
+      "sustained_turn_rate": 19.88,
+      "sustained_turn_speed": 169.25227,
+      "instant_turn_rate": 32.6,
+      "instant_turn_speed": 228.92784,
+      "top_speed": 492.83792,
+      "top_speed_altitude": 11579.047,
+      "mass": 5543.0,
+      "wing_area": 17.28,
+      "cl_max": 1.33,
+      "roll_rate": 180.0,
+      "roll_speed": 180.0556,
+      "afterburner": true,
+      "afterburner_thrust": 2220.0,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm copy",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "UBS 12.7 mm",
+          "count": 2
+        },
+        "belly": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "wings": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "convergence": 400.0,
+        "belly_back": 1.7,
+        "wing_out": 0.5
+      }
+    },
+    {
+      "name": "Me 262 A-1a",
+      "engine": "Jet",
+      "power": 720.0,
+      "engines": 2,
+      "climb_rate": 18.4912,
+      "sustained_turn_rate": 18.68,
+      "sustained_turn_speed": 117.80781,
+      "instant_turn_rate": 35.3,
+      "instant_turn_speed": 212.98006,
+      "top_speed": 232.52895,
+      "top_speed_altitude": 0.0,
+      "mass": 4980.0,
+      "wing_area": 21.7,
+      "cl_max": 1.18,
+      "roll_rate": 130.0,
+      "roll_speed": 133.33334,
+      "afterburner": false,
+      "afterburner_thrust": null,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "20 mm Hispano Mk. V",
+          "count": 4
+        },
+        "belly": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "wings": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "convergence": 400.0,
+        "belly_back": 1.7,
+        "wing_out": 0.5
+      }
+    },
+    {
+      "name": "F4D-1",
+      "engine": "Jet",
+      "power": 4250.0,
+      "engines": 1,
+      "climb_rate": 122.001274,
+      "sustained_turn_rate": 21.95,
+      "sustained_turn_speed": 139.92892,
+      "instant_turn_rate": 30.6,
+      "instant_turn_speed": 162.56448,
+      "top_speed": 317.41232,
+      "top_speed_altitude": 0.0,
+      "mass": 7811.0,
+      "wing_area": 48.0,
+      "cl_max": 0.95,
+      "roll_rate": 150.0,
+      "roll_speed": 205.77783,
+      "afterburner": true,
+      "afterburner_thrust": 7270.0,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "belly": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "wings": {
+          "gun": "20 mm M39A3",
+          "count": 2
+        },
+        "convergence": 800.0,
+        "belly_back": 1.7,
+        "wing_out": 1.6
+      }
+    },
+    {
+      "name": "Kikka",
+      "engine": "Jet",
+      "power": 650.0,
+      "engines": 2,
+      "climb_rate": 23.642319,
+      "sustained_turn_rate": 22.97,
+      "sustained_turn_speed": 136.32782,
+      "instant_turn_rate": 31.8,
+      "instant_turn_speed": 212.4656,
+      "top_speed": 238.18784,
+      "top_speed_altitude": 0.0,
+      "mass": 2741.0,
+      "wing_area": 13.24,
+      "cl_max": 1.13,
+      "roll_rate": 110.0,
+      "roll_speed": 154.33337,
+      "afterburner": false,
+      "afterburner_thrust": null,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "30 mm Type 5",
+          "count": 2
+        },
+        "belly": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "wings": {
+          "gun": "UBS 12.7 mm",
+          "count": 0,
+          "each": [
+            "ShVAK 20 mm",
+            "GSh-23L"
+          ]
+        },
+        "convergence": 0.0,
+        "belly_back": 1.7,
+        "wing_out": 1.0
+      }
+    },
+    {
+      "name": "MiG-15bis",
+      "engine": "Jet",
+      "power": 2450.0,
+      "engines": 1,
+      "climb_rate": 50.002438,
+      "sustained_turn_rate": 19.4,
+      "sustained_turn_speed": 128.61115,
+      "instant_turn_rate": 29.0,
+      "instant_turn_speed": 174.91116,
+      "top_speed": 298.37787,
+      "top_speed_altitude": 0.0,
+      "mass": 3905.0,
+      "wing_area": 20.6,
+      "cl_max": 1.13,
+      "roll_rate": 85.0,
+      "roll_speed": 154.33337,
+      "afterburner": false,
+      "afterburner_thrust": null,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "belly": {
+          "gun": "ShVAK 20 mm",
+          "count": 3,
+          "each": [
+            "37 mm N-37D",
+            "23 mm NR-23",
+            "23 mm NR-23"
+          ]
+        },
+        "wings": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "convergence": 400.0,
+        "belly_back": 1.3,
+        "wing_out": 0.5
+      }
+    },
+    {
+      "name": "P1Y1",
+      "engine": "Prop",
+      "power": 1545.0,
+      "engines": 2,
+      "climb_rate": 10.20064,
+      "sustained_turn_rate": 22.98,
+      "sustained_turn_speed": 92.08558,
+      "instant_turn_rate": 28.3,
+      "instant_turn_speed": 113.69225,
+      "top_speed": 151.2467,
+      "top_speed_altitude": 5898.4897,
+      "mass": 8513.0,
+      "wing_area": 56.24,
+      "cl_max": 1.3,
+      "roll_rate": 73.8,
+      "roll_speed": 111.12003,
+      "afterburner": false,
+      "afterburner_thrust": null,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "20 mm Type 99 Mk 1",
+          "count": 1
+        },
+        "belly": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "wings": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "convergence": 400.0,
+        "belly_back": 1.7,
+        "wing_out": 0.5
+      }
+    },
+    {
+      "name": "Yak-15",
+      "engine": "Jet",
+      "power": 850.0,
+      "engines": 1,
+      "climb_rate": 21.30044,
+      "sustained_turn_rate": 23.59,
+      "sustained_turn_speed": 90.0278,
+      "instant_turn_rate": 41.1,
+      "instant_turn_speed": 155.36226,
+      "top_speed": 193.43117,
+      "top_speed_altitude": 3999.8904,
+      "mass": 2464.0,
+      "wing_area": 14.83,
+      "cl_max": null,
+      "roll_rate": 165.0,
+      "roll_speed": 133.24115,
+      "afterburner": false,
+      "afterburner_thrust": null,
+      "weapons": {
+        "nose_center": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "nose_ring": {
+          "gun": "23 mm NS-23",
+          "count": 1
+        },
+        "belly": {
+          "gun": "ShVAK 20 mm",
+          "count": 0
+        },
+        "wings": {
+          "gun": "UBS 12.7 mm",
+          "count": 0
+        },
+        "convergence": 400.0,
+        "belly_back": 1.7,
+        "wing_out": 0.5
+      }
+    }
+  ]
+}
