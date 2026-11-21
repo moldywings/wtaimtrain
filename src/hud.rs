@@ -8,8 +8,10 @@ use crate::GameState;
 use crate::camera::{ChaseCamera, MouseAim};
 use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
+use crate::multiplayer::{Mp, RemotePlane};
 use crate::settings::{Crosshair, CrosshairColor, Settings};
 use crate::target::Target;
+use crate::weapons::GunBook;
 
 pub struct HudPlugin;
 
@@ -390,8 +392,10 @@ fn update_hud(
     state: Res<State<GameState>>,
     cursor: Single<&CursorOptions>,
     camera: Single<(&Camera, &GlobalTransform), With<ChaseCamera>>,
-    player: Single<(&GlobalTransform, &Aircraft), With<Player>>,
+    player: Single<(&GlobalTransform, &Aircraft, Option<&GunBook>), With<Player>>,
     target: Single<(&GlobalTransform, &Aircraft, &Target)>,
+    mp: Res<Mp>,
+    remotes: Query<(&GlobalTransform, &Aircraft, &RemotePlane), Without<Player>>,
     mut nodes: ParamSet<(
         Single<(&mut Node, &mut Visibility), With<AimCircle>>,
         Single<(&mut Node, &mut Visibility), With<GunCrosshair>>,
@@ -408,8 +412,10 @@ fn update_hud(
     )>,
 ) {
     let (cam, cam_tf) = *camera;
-    let (player_tf, plane) = *player;
+    let (player_tf, plane, book) = *player;
     let (target_tf, target_plane, target_state) = *target;
+    let online = mp.online();
+    let flying = mp.alive();
     let units = settings.units;
     let project = |world: Vec3| -> Option<Vec2> {
         // Behind the camera means not on screen.
@@ -423,7 +429,7 @@ fn update_hud(
     let aim_point = cam_tf.translation() + aim.direction() * 20_000.0;
     place(
         nodes.p0().into_inner(),
-        project(aim_point),
+        project(aim_point).filter(|_| flying),
         Vec2::splat(AIM_SIZE / 2.0),
     );
 
@@ -431,40 +437,59 @@ fn update_hud(
     let nose_point = player_tf.translation() + player_tf.forward().as_vec3() * 20_000.0;
     place(
         nodes.p1().into_inner(),
-        project(nose_point),
+        project(nose_point).filter(|_| flying),
         Vec2::splat(CROSSHAIR_SIZE / 2.0),
     );
 
     // Target marker, anchored so the diamond's center sits on the target.
+    // (Online there's no target; other players have their own markers.)
     let target_pos = target_tf.translation();
     let range = player_tf.translation().distance(target_pos);
     place(
         nodes.p2().into_inner(),
-        project(target_pos).filter(|_| !target_state.destroyed()),
+        project(target_pos).filter(|_| !target_state.destroyed() && !online),
         Vec2::new(MARKER_WIDTH / 2.0, NAME_HEIGHT + DIAMOND_BOX / 2.0),
     );
+    // Who the lead indicator and edge arrow are for: the target, or online
+    // the other plane nearest your aim.
+    let aim_dir = aim.direction();
+    let enemy: Option<(Vec3, Vec3)> = if online {
+        remotes
+            .iter()
+            .filter(|(_, _, r)| r.alive)
+            .map(|(tf, a, _)| (tf.translation(), a.body.velocity))
+            .max_by(|a, b| {
+                let score = |p: Vec3| {
+                    (p - player_tf.translation())
+                        .normalize_or_zero()
+                        .dot(aim_dir)
+                };
+                score(a.0).total_cmp(&score(b.0))
+            })
+    } else {
+        (!target_state.destroyed()).then_some((target_pos, target_plane.body.velocity))
+    };
     // Lead indicator, worked out for the biggest gun on the plane.
-    let lead = settings
-        .lead_indicator
+    let lead = (settings.lead_indicator && mp.lead_allowed() && flying)
         .then(|| {
             plane
                 .card
                 .weapons
                 .guns()
                 .iter()
-                .map(|(_, g, _)| settings.gun(g))
+                .map(|(_, g, _)| GunBook::gun(book, &settings, g))
                 .max_by(|a, b| a.caliber_mm().total_cmp(&b.caliber_mm()))
                 .cloned()
         })
         .flatten()
-        .filter(|_| !target_state.destroyed())
-        .and_then(|gun| {
+        .zip(enemy)
+        .and_then(|(gun, (pos, vel))| {
             crate::weapons::lead_direction(
                 &gun,
                 player_tf.translation(),
                 plane.body.velocity,
-                target_pos,
-                target_plane.body.velocity,
+                pos,
+                vel,
             )
         })
         .and_then(|dir| project(player_tf.translation() + dir * 2_000.0));
@@ -476,12 +501,12 @@ fn update_hud(
         let size = cam
             .logical_viewport_size()
             .unwrap_or(Vec2::new(1280.0, 720.0));
-        let on_screen = project(target_pos)
+        let arrow_to = enemy.map(|e| e.0).filter(|_| flying);
+        let on_screen = arrow_to
+            .and_then(project)
             .is_some_and(|p| p.x >= 0.0 && p.y >= 0.0 && p.x <= size.x && p.y <= size.y);
-        if on_screen || target_state.destroyed() {
-            *vis = Visibility::Hidden;
-        } else {
-            let local = cam_tf.rotation().inverse() * (target_pos - cam_tf.translation());
+        if let Some(to) = arrow_to.filter(|_| !on_screen) {
+            let local = cam_tf.rotation().inverse() * (to - cam_tf.translation());
             // Screen direction (x right, y down). Straight behind: point down.
             let dir = Vec2::new(local.x, -local.y)
                 .try_normalize()
@@ -494,6 +519,8 @@ fn update_hud(
             // The chevron points up when unturned.
             turn.rotation = Rot2::radians(dir.x.atan2(-dir.y));
             *vis = Visibility::Visible;
+        } else {
+            *vis = Visibility::Hidden;
         }
     }
 

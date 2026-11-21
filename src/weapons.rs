@@ -8,9 +8,9 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::GameState;
 use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
+use crate::multiplayer::{Mp, RemoteHit, RemotePlane, world_runs};
 use crate::settings::Settings;
 use crate::sound::{self, Sounds};
 use crate::target::{PlayerHit, ResetScenario, ScenarioState, Target, TargetHit};
@@ -558,12 +558,29 @@ impl Plugin for WeaponsPlugin {
                         .after(crate::flight::fly_player)
                         .after(crate::target::fly_target)
                         .after(sync_player_guns)
-                        .run_if(in_state(GameState::Playing)),
-                    fade_sparks.run_if(in_state(GameState::Playing)),
+                        .in_set(Firing)
+                        .run_if(world_runs),
+                    fade_sparks.run_if(world_runs),
                     clear_rounds,
-                    update_hit_ui,
+                    (reset_stats_on_change, update_hit_ui).chain(),
                 ),
             );
+    }
+}
+
+/// Firing and flying rounds.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Firing;
+
+/// Gun presets a plane's loadout uses, when they aren't your own (other
+/// players' planes, or the host's presets you fly).
+#[derive(Component, Clone, PartialEq, Default)]
+pub struct GunBook(pub Vec<GunCard>);
+
+impl GunBook {
+    pub fn gun<'a>(book: Option<&'a GunBook>, settings: &'a Settings, name: &str) -> &'a GunCard {
+        book.and_then(|b| b.0.iter().find(|g| g.name == name))
+            .unwrap_or_else(|| settings.gun(name))
     }
 }
 
@@ -611,17 +628,25 @@ fn setup_assets(
             .iter()
             .map(|c| {
                 let rgb = c.rgb();
-                let core = rgb.lerp(Vec3::ONE, 0.45);
+                // Over-bright colors light up the camera's bloom, so the
+                // glow spills light around the streak.
+                let glow = LinearRgba::from(Color::srgb(rgb.x, rgb.y, rgb.z)) * TRACER_GLOW;
                 (
                     *c,
                     (
+                        // A plain, solid white core with no shading.
                         materials.add(StandardMaterial {
-                            base_color: Color::srgb(core.x, core.y, core.z),
+                            base_color: Color::LinearRgba(LinearRgba::rgb(
+                                TRACER_CORE,
+                                TRACER_CORE,
+                                TRACER_CORE,
+                            )),
                             unlit: true,
+                            fog_enabled: false,
                             ..default()
                         }),
                         materials.add(StandardMaterial {
-                            base_color: Color::srgba(rgb.x, rgb.y, rgb.z, TRACER_GLOW),
+                            base_color: Color::LinearRgba(LinearRgba { alpha: 1.0, ..glow }),
                             base_color_texture: Some(glow_texture.clone()),
                             unlit: true,
                             double_sided: true,
@@ -732,11 +757,11 @@ fn sync_gun_models(
     mut commands: Commands,
     settings: Res<Settings>,
     weapon_assets: Res<WeaponAssets>,
-    planes: Query<(&Aircraft, &Children)>,
+    planes: Query<(&Aircraft, &Children, Option<&GunBook>)>,
     models: Query<(Entity, Option<&ShownGuns>, Option<&Children>), With<PlaneModel>>,
     gun_models: Query<(), With<GunModel>>,
 ) {
-    for (aircraft, children) in &planes {
+    for (aircraft, children, book) in &planes {
         let Some((model, shown, model_children)) = children.iter().find_map(|c| models.get(c).ok())
         else {
             continue;
@@ -747,7 +772,7 @@ fn sync_gun_models(
                 .weapons
                 .guns()
                 .into_iter()
-                .map(|(_, gun, p)| (p, settings.gun(&gun).caliber_mm()))
+                .map(|(_, gun, p)| (p, GunBook::gun(book, &settings, &gun).caliber_mm()))
                 .collect(),
         );
         if shown == Some(&wanted) {
@@ -798,10 +823,10 @@ struct Guns {
 fn sync_player_guns(
     mut commands: Commands,
     settings: Res<Settings>,
-    mut planes: Query<(Entity, &Aircraft, Option<&mut Guns>)>,
+    mut planes: Query<(Entity, &Aircraft, Option<&GunBook>, Option<&mut Guns>)>,
 ) {
-    for (entity, aircraft, guns) in &mut planes {
-        sync_guns(&mut commands, &settings, entity, aircraft, guns);
+    for (entity, aircraft, book, guns) in &mut planes {
+        sync_guns(&mut commands, &settings, entity, aircraft, book, guns);
     }
 }
 
@@ -810,19 +835,21 @@ fn sync_guns(
     settings: &Settings,
     entity: Entity,
     aircraft: &Aircraft,
+    book: Option<&GunBook>,
     guns: Option<Mut<Guns>>,
 ) {
+    let cards = book.map(|b| &b.0).unwrap_or(&settings.guns);
     // Nothing to do unless the loadout or a gun changed (checked without
     // copying anything, since this runs every frame).
     if guns.as_ref().is_some_and(|g| {
         g.built_from
             .as_ref()
-            .is_some_and(|(l, c)| *l == aircraft.card.weapons && *c == settings.guns)
+            .is_some_and(|(l, c)| *l == aircraft.card.weapons && c == cards)
     }) {
         return;
     }
     let loadout = aircraft.card.weapons.clone();
-    let key = (loadout.clone(), settings.guns.clone());
+    let key = (loadout.clone(), cards.clone());
     let correction = crate::model_correction();
     let built = Guns {
         last_sound: HashMap::new(),
@@ -837,7 +864,7 @@ fn sync_guns(
             .map(|(slot, gun, p)| GunState {
                 slot,
                 muzzle: correction.transform_point(p),
-                card: settings.gun(&gun).clone(),
+                card: GunBook::gun(book, settings, &gun).clone(),
                 cooldown: 0.0,
             })
             .collect(),
@@ -873,8 +900,23 @@ struct Bullet {
     drag: f32,
     /// Share of a plane's health one hit takes.
     damage: f32,
-    /// Fired by the target at you.
-    enemy: bool,
+    owner: Owner,
+    /// Your rounds: the closest they came to an enemy plane so far, and how
+    /// far ahead of it (+) or behind (-) they were then, m.
+    near: Option<(f32, f32)>,
+    /// The near miss has been counted.
+    judged: bool,
+}
+
+/// Who fired a round.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Owner {
+    /// You.
+    Player,
+    /// The practice target, at you.
+    Target,
+    /// Another player (only for show: their game works out their hits).
+    Remote,
 }
 
 #[derive(Component)]
@@ -889,7 +931,23 @@ pub struct HitStats {
     pub hits: u32,
     /// `Time<Real>` seconds of the latest hit.
     pub last_hit: f32,
+    /// Near misses that passed ahead of the plane, and behind it.
+    pub ahead: u32,
+    pub behind: u32,
 }
+
+impl HitStats {
+    /// Start counting over.
+    pub fn reset(&mut self) {
+        *self = HitStats::default();
+    }
+}
+
+/// Near misses this close count toward the lead readout, m.
+const NEAR_MISS: f32 = 40.0;
+/// Misses closer than this along the plane's path were about level with
+/// it, neither ahead nor behind, m.
+const LEVEL_MISS: f32 = 2.0;
 
 #[derive(Default)]
 struct Rng(u32);
@@ -906,12 +964,22 @@ impl Rng {
     }
 }
 
-fn trigger_held(mouse: &ButtonInput<MouseButton>, cursor: &CursorOptions) -> bool {
+/// The trigger is pulled this frame: held, or (single fire) just clicked.
+pub fn trigger_now(
+    mouse: &ButtonInput<MouseButton>,
+    cursor: &CursorOptions,
+    single_fire: bool,
+) -> bool {
     // Testing aid: WTAT_FIRE=1 holds the trigger.
     if std::env::var("WTAT_FIRE").is_ok() {
         return true;
     }
-    mouse.pressed(MouseButton::Left) && cursor.grab_mode != CursorGrabMode::None
+    let pulled = if single_fire {
+        mouse.just_pressed(MouseButton::Left)
+    } else {
+        mouse.pressed(MouseButton::Left)
+    };
+    pulled && cursor.grab_mode != CursorGrabMode::None
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -928,22 +996,34 @@ fn fire_guns(
     mut rng: Local<Rng>,
     camera: Single<&GlobalTransform, With<Camera3d>>,
     settings: Res<Settings>,
+    mp: Res<Mp>,
+    state: Res<State<crate::GameState>>,
     planes: Query<(
         &Transform,
         &Aircraft,
         &mut Guns,
         Has<Player>,
         Option<&Target>,
+        Option<&RemotePlane>,
     )>,
 ) {
     let dt = time.delta_secs();
-    let player_trigger = trigger_held(&mouse, &cursor);
+    let player_trigger = *state.get() == crate::GameState::Playing
+        && mp.guns_free()
+        && trigger_now(&mouse, &cursor, settings.single_fire);
     let eye = camera.translation();
-    for (tf, aircraft, mut guns, is_player, target) in planes {
-        let firing = if is_player {
-            player_trigger
+    for (tf, aircraft, mut guns, is_player, target, remote) in planes {
+        let (firing, owner) = if is_player {
+            (player_trigger, Owner::Player)
+        } else if let Some(r) = remote {
+            (r.firing && r.alive, Owner::Remote)
         } else {
-            settings.enemy_fires && target.is_some_and(|t| t.firing && !t.destroyed())
+            (
+                !mp.online()
+                    && settings.enemy_fires
+                    && target.is_some_and(|t| t.firing && !t.destroyed()),
+                Owner::Target,
+            )
         };
         // The enemy's guns sound fainter the farther away they are.
         let loudness = if is_player {
@@ -965,7 +1045,7 @@ fn fire_guns(
             aircraft,
             &mut guns,
             firing,
-            !is_player,
+            owner,
             loudness,
         );
     }
@@ -986,7 +1066,7 @@ fn fire_plane(
     aircraft: &Aircraft,
     guns: &mut Guns,
     firing: bool,
-    enemy: bool,
+    owner: Owner,
     loudness: f32,
 ) {
     let forward = tf.forward().as_vec3();
@@ -1040,7 +1120,9 @@ fn fire_plane(
                     drag: gun.card.drag_factor(),
                     damage: 1.0 / gun.card.hits_to_destroy() as f32,
                     size,
-                    enemy,
+                    owner,
+                    near: None,
+                    judged: false,
                 },
                 Transform::from_translation(position),
                 Visibility::default(),
@@ -1059,7 +1141,7 @@ fn fire_plane(
                     )
                 ],
             ));
-            if !enemy {
+            if owner == Owner::Player {
                 stats.shots += 1;
             }
             gun.cooldown += gun.card.interval();
@@ -1169,9 +1251,12 @@ const TRACER_WIDTH: f32 = 0.02;
 /// pixel at normal zoom).
 const MIN_TRACER_ANGLE: f32 = 0.0012;
 /// The glow is this many times wider than the streak.
-const GLOW_WIDTH: f32 = 2.0;
-/// Strength of the glow around a tracer (0 to 1).
-const TRACER_GLOW: f32 = 1.0;
+const GLOW_WIDTH: f32 = 3.5;
+/// Brightness of the colored glow around a tracer (above 1 blooms).
+const TRACER_GLOW: f32 = 5.0;
+/// Brightness of the white core (above 1 so it stays pure white after
+/// tone mapping, and blooms a little).
+const TRACER_CORE: f32 = 3.0;
 
 /// The target's pose at the start of the frame, so bullets can be tested
 /// against where it actually was during the frame.
@@ -1181,7 +1266,10 @@ struct PrevPose(Transform);
 #[allow(clippy::type_complexity)]
 fn record_target_pose(
     mut commands: Commands,
-    targets: Query<(Entity, &Transform, Option<&mut PrevPose>), Or<(With<Target>, With<Player>)>>,
+    targets: Query<
+        (Entity, &Transform, Option<&mut PrevPose>),
+        Or<(With<Target>, With<Player>, With<RemotePlane>)>,
+    >,
 ) {
     for (e, tf, prev) in targets {
         match prev {
@@ -1249,6 +1337,14 @@ pub const BULLET_RANGE: f32 = 2.5 * 1609.344;
 const BULLET_LIFETIME: f32 = 15.0;
 const BULLET_SUBSTEPS: usize = 4;
 
+/// Where hits are reported.
+#[derive(bevy::ecs::system::SystemParam)]
+struct HitWriters<'w> {
+    target: MessageWriter<'w, TargetHit>,
+    player: MessageWriter<'w, PlayerHit>,
+    remote: MessageWriter<'w, RemoteHit>,
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn fly_bullets(
     mut commands: Commands,
@@ -1277,10 +1373,17 @@ fn fly_bullets(
             Without<PrevPose>,
         ),
     >,
-    planes: Query<(Entity, &Transform, &PrevPose, Option<&Target>, Has<Player>)>,
-    mut hit_messages: MessageWriter<TargetHit>,
-    mut player_hits: MessageWriter<PlayerHit>,
+    planes: Query<(
+        Entity,
+        &Transform,
+        &PrevPose,
+        Option<&Target>,
+        Has<Player>,
+        Option<&RemotePlane>,
+    )>,
+    mut out: HitWriters,
     scenario: Res<ScenarioState>,
+    mp: Res<Mp>,
     camera: Single<&GlobalTransform, With<Camera3d>>,
 ) {
     let eye = camera.translation();
@@ -1289,17 +1392,32 @@ fn fly_bullets(
         return;
     }
     let h = dt / BULLET_SUBSTEPS as f32;
-    // Planes that can be hit: the target (by your rounds) and you (by its).
-    let poses: Vec<(Entity, Transform, Transform, bool)> = planes
+    /// What a plane is, for who can hit it.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Player,
+        Target,
+        Remote(u64),
+    }
+    // Planes that can be hit: the target and other players (by your
+    // rounds), and you (by theirs).
+    let poses: Vec<(Entity, Transform, Transform, Kind)> = planes
         .iter()
-        .filter(|(_, _, _, t, is_player)| {
-            if *is_player {
-                !scenario.player_down()
+        .filter_map(|(e, tf, p, t, is_player, remote)| {
+            let kind = if is_player {
+                let up = if mp.online() {
+                    mp.alive()
+                } else {
+                    !scenario.player_down()
+                };
+                up.then_some(Kind::Player)
+            } else if let Some(r) = remote {
+                r.alive.then_some(Kind::Remote(r.id))
             } else {
-                t.is_some_and(|t| !t.destroyed())
-            }
+                (!mp.online() && t.is_some_and(|t| !t.destroyed())).then_some(Kind::Target)
+            }?;
+            Some((e, p.0, *tf, kind))
         })
-        .map(|(e, tf, p, _, is_player)| (e, p.0, *tf, is_player))
         .collect();
     'bullets: for (entity, mut bullet, mut tf, children) in &mut bullets {
         let mut pos = bullet.position;
@@ -1312,57 +1430,98 @@ fn fly_bullets(
             pos += bullet.velocity * h;
             bullet.traveled += (pos - start).length();
 
-            for (target, prev, now, is_player) in &poses {
-                // Your rounds hit the target; its rounds hit you.
-                if bullet.enemy != *is_player {
+            for (plane, prev, now, kind) in &poses {
+                // Your rounds hit the target and other players; theirs hit you.
+                let can_hit = match bullet.owner {
+                    Owner::Player => *kind != Kind::Player,
+                    Owner::Target | Owner::Remote => *kind == Kind::Player,
+                };
+                if !can_hit {
                     continue;
                 }
+                let frac = (i + 1) as f32 / BULLET_SUBSTEPS as f32;
                 let pose_a = lerp_pose(prev, now, i as f32 / BULLET_SUBSTEPS as f32);
-                let pose_b = lerp_pose(prev, now, (i + 1) as f32 / BULLET_SUBSTEPS as f32);
+                let pose_b = lerp_pose(prev, now, frac);
+                // Your near misses: was the round ahead of the plane or
+                // behind it when it passed closest?
+                if bullet.owner == Owner::Player && !bullet.judged {
+                    let off = pos - pose_b.translation;
+                    let dist = off.length();
+                    match bullet.near {
+                        Some((best, _)) if dist < best => {
+                            bullet.near = Some((dist, off.dot(pose_b.forward().as_vec3())));
+                        }
+                        None if dist < NEAR_MISS => {
+                            bullet.near = Some((dist, off.dot(pose_b.forward().as_vec3())));
+                        }
+                        Some((best, along)) if dist > best + 1.0 => {
+                            bullet.judged = true;
+                            if along > LEVEL_MISS {
+                                stats.ahead += 1;
+                            } else if along < -LEVEL_MISS {
+                                stats.behind += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let a = to_model(&pose_a).transform_point3(start);
                 let b = to_model(&pose_b).transform_point3(pos);
                 let hit = HIT_BOXES
                     .iter()
                     .filter_map(|(min, max)| segment_hits_box(a, b, *min, *max))
                     .reduce(f32::min);
-                if let Some(t) = hit {
-                    if bullet.enemy {
-                        player_hits.write(PlayerHit {
+                let Some(t) = hit else {
+                    continue;
+                };
+                if *kind == Kind::Player {
+                    if bullet.owner == Owner::Target {
+                        out.player.write(PlayerHit {
                             damage: bullet.damage,
                         });
-                        // A deeper thud when you're the one hit.
-                        let now = real.elapsed_secs();
-                        if now - *last_hit_sound > 0.065 {
-                            *last_hit_sound = now;
-                            sound::play(&mut commands, sounds.hit(), 0.6, 0.62);
-                        }
-                        commands.entity(entity).despawn();
-                        continue 'bullets;
                     }
-                    stats.hits += 1;
-                    hit_messages.write(TargetHit {
-                        damage: bullet.damage,
-                    });
-                    stats.last_hit = real.elapsed_secs();
-                    // A hit sound, up to about 15 a second.
-                    if stats.last_hit - *last_hit_sound > 0.065 {
-                        *last_hit_sound = stats.last_hit;
-                        let speed = 0.92 + 0.16 * ((stats.hits * 7919) % 100) as f32 / 100.0;
-                        sound::play(&mut commands, sounds.hit(), 0.5, speed);
+                    // A deeper thud when you're the one hit.
+                    let now = real.elapsed_secs();
+                    if now - *last_hit_sound > 0.065 {
+                        *last_hit_sound = now;
+                        sound::play(&mut commands, sounds.hit(), 0.6, 0.62);
                     }
-                    // Spark where it struck, riding along with the target.
-                    let local = crate::model_correction().transform_point(a.lerp(b, t));
-                    commands.entity(*target).with_children(|p| {
-                        p.spawn((
-                            Spark { age: 0.0 },
-                            Transform::from_translation(local),
-                            Mesh3d(weapon_assets.spark_mesh.clone()),
-                            MeshMaterial3d(weapon_assets.spark_material.clone()),
-                        ));
-                    });
                     commands.entity(entity).despawn();
                     continue 'bullets;
                 }
+                stats.hits += 1;
+                match kind {
+                    Kind::Remote(id) => {
+                        out.remote.write(RemoteHit {
+                            id: *id,
+                            damage: bullet.damage,
+                        });
+                    }
+                    _ => {
+                        out.target.write(TargetHit {
+                            damage: bullet.damage,
+                        });
+                    }
+                }
+                stats.last_hit = real.elapsed_secs();
+                // A hit sound, up to about 15 a second.
+                if stats.last_hit - *last_hit_sound > 0.065 {
+                    *last_hit_sound = stats.last_hit;
+                    let speed = 0.92 + 0.16 * ((stats.hits * 7919) % 100) as f32 / 100.0;
+                    sound::play(&mut commands, sounds.hit(), 0.5, speed);
+                }
+                // Spark where it struck, riding along with the plane.
+                let local = crate::model_correction().transform_point(a.lerp(b, t));
+                commands.entity(*plane).with_children(|p| {
+                    p.spawn((
+                        Spark { age: 0.0 },
+                        Transform::from_translation(local),
+                        Mesh3d(weapon_assets.spark_mesh.clone()),
+                        MeshMaterial3d(weapon_assets.spark_material.clone()),
+                    ));
+                });
+                commands.entity(entity).despawn();
+                continue 'bullets;
             }
         }
         bullet.position = pos;
@@ -1462,11 +1621,57 @@ fn spawn_hit_ui(mut commands: Commands) {
     ));
 }
 
+/// Start the hit count over when you change aircraft or guns.
+fn reset_stats_on_change(
+    mut stats: ResMut<HitStats>,
+    player: Single<(&Aircraft, Option<&GunBook>), With<Player>>,
+    settings: Res<Settings>,
+    mut last: Local<Option<(String, Vec<GunCard>)>>,
+) {
+    let (aircraft, book) = *player;
+    let key = (
+        aircraft.card.name.clone(),
+        aircraft
+            .card
+            .weapons
+            .guns()
+            .iter()
+            .map(|(_, g, _)| GunBook::gun(book, &settings, g).clone())
+            .collect(),
+    );
+    if last.as_ref() != Some(&key) {
+        if last.is_some() {
+            stats.reset();
+        }
+        *last = Some(key);
+    }
+}
+
+/// Which way your misses tend to go, once there are enough of them.
+pub fn lead_tendency(ahead: u32, behind: u32) -> Option<String> {
+    let total = ahead + behind;
+    if total < 5 {
+        return None;
+    }
+    let share = ahead as f32 / total as f32;
+    let verdict = if share > 0.6 {
+        "you tend to over-lead"
+    } else if share < 0.4 {
+        "you tend to under-lead"
+    } else {
+        "your lead is about right"
+    };
+    Some(format!(
+        "Misses: {ahead} ahead, {behind} behind ({verdict})"
+    ))
+}
+
 fn update_hit_ui(
     real: Res<Time<Real>>,
     stats: Res<HitStats>,
     settings: Res<Settings>,
     scenario: Res<ScenarioState>,
+    mp: Res<Mp>,
     mut marker: Single<&mut Visibility, With<HitMarker>>,
     mut counter: Single<&mut Text, With<HitCounter>>,
 ) {
@@ -1479,28 +1684,27 @@ fn update_hit_ui(
     if **marker != vis {
         **marker = vis;
     }
-    if stats.is_changed() {
-        let accuracy = if stats.shots > 0 {
-            100.0 * stats.hits as f32 / stats.shots as f32
-        } else {
-            0.0
-        };
-        counter.0 = format!(
-            "Hits {} / {} shots ({accuracy:.0}%)",
-            stats.hits, stats.shots
-        );
+    let accuracy = if stats.shots > 0 {
+        100.0 * stats.hits as f32 / stats.shots as f32
+    } else {
+        0.0
+    };
+    let mut text = format!(
+        "Hits {} / {} shots ({accuracy:.0}%)",
+        stats.hits, stats.shots
+    );
+    if let Some(line) = lead_tendency(stats.ahead, stats.behind) {
+        text += "\n";
+        text += &line;
     }
-    if settings.enemy_fires {
-        let line = format!(
+    if settings.enemy_fires && !mp.online() {
+        text += &format!(
             "\nYour damage {:.0}%",
             (scenario.player_damage * 100.0).min(100.0)
         );
-        if !counter.0.ends_with(&line) {
-            let base = counter.0.split('\n').next().unwrap_or("").to_string();
-            counter.0 = base + &line;
-        }
-    } else if counter.0.contains('\n') {
-        counter.0 = counter.0.split('\n').next().unwrap_or("").to_string();
+    }
+    if counter.0 != text {
+        counter.0 = text;
     }
 }
 
@@ -1625,16 +1829,18 @@ mod tests {
                 Vec3::new(x, 1000.0 + y, -320.0),
             )
         };
-        assert!(shot(0.0, 0.8), "through the fuselage");
-        assert!(shot(4.0, 0.4), "through a wing (scaled span 9.3 m)");
-        assert!(!shot(5.5, 0.4), "past the wingtip");
+        // The plane's origin is on the fuselage center line, which sits
+        // above the wings.
+        assert!(shot(0.0, 0.0), "through the fuselage");
+        assert!(shot(4.0, -0.5), "through a wing (scaled span 9.3 m)");
+        assert!(!shot(5.5, -0.5), "past the wingtip");
         assert!(!shot(0.0, 3.0), "over the top");
         // A plane turned side-on presents its fuselage length instead.
         let side = pose.with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2));
         assert!(hits_plane_at(
             &side,
-            Vec3::new(4.0, 1000.8, -280.0),
-            Vec3::new(4.0, 1000.8, -320.0)
+            Vec3::new(4.0, 1000.0, -280.0),
+            Vec3::new(4.0, 1000.0, -320.0)
         ));
     }
 

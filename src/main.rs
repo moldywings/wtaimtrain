@@ -12,6 +12,7 @@ mod flight;
 mod flight_model;
 mod hud;
 mod menu;
+mod multiplayer;
 mod settings;
 mod sound;
 mod target;
@@ -29,9 +30,14 @@ pub const AIRPLANE_MODEL: &str = "models/airplane.glb";
 pub const MODEL_SCALE: f32 = 1.33;
 
 /// The model's nose points +Z; Bevy treats -Z as forward.
+/// Height in the model of the fuselage's center line, which the plane
+/// rolls about (the model's origin is at the bottom of the fuselage).
+pub const MODEL_ROLL_AXIS_Y: f32 = 0.6;
+
 pub fn model_correction() -> Transform {
     Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::PI))
         .with_scale(Vec3::splat(MODEL_SCALE))
+        .with_translation(Vec3::new(0.0, -MODEL_ROLL_AXIS_Y * MODEL_SCALE, 0.0))
 }
 
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,13 +68,15 @@ fn main() {
             menu::MenuPlugin,
             weapons::WeaponsPlugin,
             sound::SoundPlugin,
+            multiplayer::MultiplayerPlugin,
         ))
         .add_systems(OnEnter(GameState::Playing), (resume_time, capture_cursor))
-        .add_systems(OnEnter(GameState::Paused), (pause_time, release_cursor))
+        .add_systems(OnEnter(GameState::Paused), release_cursor)
         .add_systems(
             Update,
             (
                 click_to_capture.run_if(in_state(GameState::Playing)),
+                pause_time,
                 debug_screenshot,
             ),
         )
@@ -97,8 +105,21 @@ fn click_to_capture(cursor: Single<&mut CursorOptions>, mouse: Res<ButtonInput<M
     }
 }
 
-fn pause_time(mut time: ResMut<Time<Virtual>>) {
-    time.pause();
+/// The menu pauses the game, except in multiplayer, where the world goes on
+/// for everyone else.
+fn pause_time(
+    mut time: ResMut<Time<Virtual>>,
+    state: Res<State<GameState>>,
+    mp: Res<multiplayer::Mp>,
+) {
+    let pause = *state.get() == GameState::Paused && !mp.online();
+    if pause != time.is_paused() {
+        if pause {
+            time.pause();
+        } else {
+            time.unpause();
+        }
+    }
 }
 
 fn resume_time(mut time: ResMut<Time<Virtual>>) {

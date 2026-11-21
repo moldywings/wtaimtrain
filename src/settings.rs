@@ -280,10 +280,11 @@ pub enum Action {
     YawRight,
     FreeLook,
     Reset,
+    Scoreboard,
 }
 
 impl Action {
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 11] = [
         Action::ThrottleUp,
         Action::ThrottleDown,
         Action::PitchUp,
@@ -294,6 +295,7 @@ impl Action {
         Action::YawRight,
         Action::FreeLook,
         Action::Reset,
+        Action::Scoreboard,
     ];
 
     pub fn label(self) -> &'static str {
@@ -307,7 +309,8 @@ impl Action {
             Action::YawLeft => "Yaw left",
             Action::YawRight => "Yaw right",
             Action::FreeLook => "Free look (hold)",
-            Action::Reset => "Reset scenario",
+            Action::Reset => "Reset (host holds it in multiplayer)",
+            Action::Scoreboard => "Scoreboard (hold, multiplayer)",
         }
     }
 
@@ -324,6 +327,7 @@ impl Action {
             Action::YawRight => KeyCode::KeyE,
             Action::FreeLook => KeyCode::AltLeft,
             Action::Reset => KeyCode::KeyR,
+            Action::Scoreboard => KeyCode::Tab,
         }
     }
 }
@@ -441,6 +445,85 @@ pub struct Settings {
     pub lead_indicator: bool,
     /// The target shoots back.
     pub enemy_fires: bool,
+    /// One shot from each gun per click, instead of holding to fire.
+    pub single_fire: bool,
+    /// Your name in multiplayer.
+    pub nickname: String,
+    /// Your aircraft's paint (the canopy keeps its color).
+    pub plane_color: PlaneColor,
+    /// Options for multiplayer games you host.
+    pub host: crate::multiplayer::HostOptions,
+    /// The address you last joined, and the port you last hosted on.
+    pub join_address: String,
+    pub host_port: u16,
+    /// How many bundles of built-in presets have been added already, so a
+    /// preset you delete doesn't come back.
+    pub bundled_presets: u32,
+}
+
+/// Paint colors for your aircraft.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PlaneColor {
+    #[default]
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Olive,
+    Blue,
+    Navy,
+    Purple,
+    Gray,
+    Black,
+    White,
+}
+
+impl PlaneColor {
+    pub const ALL: [PlaneColor; 11] = [
+        PlaneColor::Red,
+        PlaneColor::Orange,
+        PlaneColor::Yellow,
+        PlaneColor::Green,
+        PlaneColor::Olive,
+        PlaneColor::Blue,
+        PlaneColor::Navy,
+        PlaneColor::Purple,
+        PlaneColor::Gray,
+        PlaneColor::Black,
+        PlaneColor::White,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlaneColor::Red => "Red",
+            PlaneColor::Orange => "Orange",
+            PlaneColor::Yellow => "Yellow",
+            PlaneColor::Green => "Green",
+            PlaneColor::Olive => "Olive drab",
+            PlaneColor::Blue => "Blue",
+            PlaneColor::Navy => "Navy",
+            PlaneColor::Purple => "Purple",
+            PlaneColor::Gray => "Gray",
+            PlaneColor::Black => "Black",
+            PlaneColor::White => "White",
+        }
+    }
+
+    pub fn color(self) -> Color {
+        match self {
+            PlaneColor::Red => Color::srgb(0.85, 0.16, 0.12),
+            PlaneColor::Orange => Color::srgb(0.92, 0.45, 0.1),
+            PlaneColor::Yellow => Color::srgb(0.9, 0.78, 0.15),
+            PlaneColor::Green => Color::srgb(0.2, 0.55, 0.22),
+            PlaneColor::Olive => Color::srgb(0.33, 0.36, 0.2),
+            PlaneColor::Blue => Color::srgb(0.2, 0.42, 0.85),
+            PlaneColor::Navy => Color::srgb(0.1, 0.16, 0.38),
+            PlaneColor::Purple => Color::srgb(0.48, 0.2, 0.7),
+            PlaneColor::Gray => Color::srgb(0.5, 0.52, 0.55),
+            PlaneColor::Black => Color::srgb(0.07, 0.07, 0.08),
+            PlaneColor::White => Color::srgb(0.9, 0.9, 0.9),
+        }
+    }
 }
 
 /// Practice scenarios.
@@ -665,8 +748,26 @@ impl Default for Settings {
             ranges: Ranges::default(),
             lead_indicator: false,
             enemy_fires: false,
+            single_fire: false,
+            nickname: "Pilot".into(),
+            plane_color: PlaneColor::Red,
+            host: Default::default(),
+            join_address: String::new(),
+            host_port: crate::multiplayer::DEFAULT_PORT,
+            bundled_presets: 0,
         }
     }
+}
+
+/// Gun and aircraft presets that come with the game (beyond the built-in
+/// Yak-3 and ShVAK). Bump [`BUNDLE_VERSION`] when adding more.
+const BUNDLED_PRESETS: &str = include_str!("../assets/presets.json");
+const BUNDLE_VERSION: u32 = 1;
+
+#[derive(Deserialize)]
+struct Bundle {
+    guns: Vec<GunCard>,
+    aircraft: Vec<AircraftCard>,
 }
 
 pub fn default_bindings() -> BTreeMap<Action, KeyCode> {
@@ -811,8 +912,33 @@ impl Settings {
 
     fn load() -> Self {
         let mut settings = Self::load_file();
+        settings.add_bundled_presets();
         settings.ensure_aircraft();
         settings
+    }
+
+    /// Add the presets that ship with the game, once: any you already have
+    /// by that name stay as they are.
+    pub fn add_bundled_presets(&mut self) {
+        if self.bundled_presets >= BUNDLE_VERSION {
+            return;
+        }
+        match serde_json::from_str::<Bundle>(BUNDLED_PRESETS) {
+            Ok(bundle) => {
+                for g in bundle.guns {
+                    if !self.guns.iter().any(|x| x.name == g.name) {
+                        self.guns.push(g);
+                    }
+                }
+                for a in bundle.aircraft {
+                    if !self.aircraft.iter().any(|x| x.name == a.name) {
+                        self.aircraft.push(a);
+                    }
+                }
+            }
+            Err(e) => warn!("Bundled presets are unreadable: {e}"),
+        }
+        self.bundled_presets = BUNDLE_VERSION;
     }
 
     fn load_file() -> Self {

@@ -22,9 +22,10 @@ use bevy::ui_widgets::{
 
 use crate::GameState;
 use crate::flight_model::{AircraftCard, EngineKind, FlightModel};
+use crate::multiplayer::{HOST_ID, Mp, MpCommand};
 use crate::settings::{
-    Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, RangeId, Scenario,
-    Settings, UnitKind, Units, default_bindings, is_builtin, key_name,
+    Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, PlaneColor, RangeId,
+    Scenario, Settings, UnitKind, Units, default_bindings, is_builtin, key_name,
 };
 use crate::weapons::{
     BELLY_BACK_MAX, BELLY_BACK_MIN, CONVERGENCE_CHOICES, GunCard, Loadout, MILS_TO_M_AT_500, Slot,
@@ -43,7 +44,10 @@ impl Plugin for MenuPlugin {
             .add_observer(on_slider_change)
             .add_observer(on_scroll)
             .add_systems(OnEnter(GameState::Paused), open_menu)
-            .add_systems(OnExit(GameState::Paused), (despawn_menu, cancel_rebind))
+            .add_systems(
+                OnExit(GameState::Paused),
+                (commit_mp_fields, despawn_menu, cancel_rebind),
+            )
             .add_systems(
                 Update,
                 (
@@ -78,6 +82,7 @@ enum Page {
     Aircraft,
     Weapons,
     Scenario,
+    Multiplayer,
 }
 
 /// Menu state that isn't a saved setting.
@@ -97,6 +102,8 @@ struct MenuUi {
     gun_draft: GunDraft,
     loadout_for: String,
     gun_message: String,
+    /// Multiplayer page: nickname, port and address as typed.
+    mp_fields: [String; 3],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,6 +119,11 @@ enum Dropdown {
     StationGun(Slot, u8),
     Unit(UnitKind),
     Convergence,
+    PlaneColor,
+    /// Joined: which aircraft preset you fly (yours or one of the host's).
+    FlyPreset,
+    /// Host: the preset a player is locked to.
+    Lock(u64),
 }
 
 /// Scrollable lists, so their scroll position survives a menu rebuild.
@@ -529,10 +541,78 @@ enum MenuAction {
     PickStationGun(Slot, u8, String),
     /// Gun targeting distance, m (0 = off).
     SetConvergence(u32),
+    ToggleSingleFire,
+    PickPlaneColor(PlaneColor),
+    MpHost,
+    MpJoin,
+    MpLeave,
+    ToggleMpLead,
+    ToggleFacing,
+    HostStep(HostOpt, i32),
+    LockPlayer(u64, Option<String>),
+    FlyHostPreset(Option<String>),
 }
 
 const PANEL_BG: Color = Color::srgba(0.08, 0.09, 0.11, 0.94);
 const BUTTON_BG: Color = Color::srgb(0.18, 0.20, 0.24);
+/// A text field on the multiplayer page.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum MpField {
+    Nickname,
+    Port,
+    Address,
+}
+
+/// A host option changed with - and + buttons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HostOpt {
+    Countdown,
+    SpawnDistance,
+    Altitude,
+    AltitudeSpread,
+}
+
+impl HostOpt {
+    /// Step per click and limits, in seconds or metres.
+    fn step(self) -> (f32, f32, f32) {
+        match self {
+            HostOpt::Countdown => (1.0, 0.0, 30.0),
+            HostOpt::SpawnDistance => (250.0, 250.0, 12_000.0),
+            HostOpt::Altitude => (250.0, 500.0, 8_000.0),
+            HostOpt::AltitudeSpread => (100.0, 0.0, 3_000.0),
+        }
+    }
+}
+
+/// Copy what's typed on the multiplayer page into the settings.
+fn commit_fields(settings: &mut Settings, fields: &[String; 3]) {
+    let name = fields[0].trim();
+    if settings.nickname != name {
+        settings.nickname = name.to_string();
+    }
+    if let Ok(port) = fields[1].trim().parse::<u16>()
+        && port != 0
+        && settings.host_port != port
+    {
+        settings.host_port = port;
+    }
+    let address = fields[2].trim();
+    if settings.join_address != address {
+        settings.join_address = address.to_string();
+    }
+}
+
+fn commit_mp_fields(mut settings: ResMut<Settings>, ui: Res<MenuUi>) {
+    let mut copy = settings.clone();
+    commit_fields(&mut copy, &ui.mp_fields);
+    if copy.nickname != settings.nickname
+        || copy.host_port != settings.host_port
+        || copy.join_address != settings.join_address
+    {
+        commit_fields(&mut settings, &ui.mp_fields);
+    }
+}
+
 const BUTTON_HOVER: Color = Color::srgb(0.27, 0.30, 0.36);
 const BUTTON_PRESS: Color = Color::srgb(0.35, 0.55, 0.40);
 const BUTTON_SELECTED: Color = Color::srgb(0.42, 0.34, 0.16);
@@ -599,12 +679,18 @@ fn open_menu(settings: Res<Settings>, mut ui: ResMut<MenuUi>) {
     }
     ui.gun_draft = GunDraft::from_card(settings.gun(&ui.gun_editing));
     ui.loadout_for = settings.player_aircraft.clone();
+    ui.mp_fields = [
+        settings.nickname.clone(),
+        settings.host_port.to_string(),
+        settings.join_address.clone(),
+    ];
     // Testing aid: WTAT_PAGE=aircraft or weapons opens straight onto that page.
     match std::env::var("WTAT_PAGE").as_deref() {
         Ok("aircraft") => ui.page = Page::Aircraft,
         Ok("weapons") => ui.page = Page::Weapons,
         Ok("scenario") => ui.page = Page::Scenario,
         Ok("units") => ui.page = Page::Units,
+        Ok("multiplayer") => ui.page = Page::Multiplayer,
         _ => {}
     }
 }
@@ -614,6 +700,7 @@ fn sync_draft(
     mut ui: ResMut<MenuUi>,
     inputs: Query<(&Field, &EditableText)>,
     gun_inputs: Query<(&GunField, &EditableText)>,
+    mp_inputs: Query<(&MpField, &EditableText)>,
 ) {
     // A click just replaced the draft (new preset, save, ...): the fields on
     // screen are stale until the rebuild, so don't copy them back.
@@ -633,18 +720,41 @@ fn sync_draft(
             ui.gun_draft.fields[field.index()] = value;
         }
     }
+    for (field, text) in &mp_inputs {
+        let value = text.value().to_string();
+        let i = *field as usize;
+        if ui.mp_fields[i] != value {
+            ui.mp_fields[i] = value;
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_menu(
     mut commands: Commands,
     settings: Res<Settings>,
     rebinding: Res<Rebinding>,
     ui: Res<MenuUi>,
     scroll: Res<ScrollMemory>,
+    mp: Res<Mp>,
+    mut mp_shown: Local<String>,
     menus: Query<Entity, With<PauseMenu>>,
 ) {
     let exists = !menus.is_empty();
-    if exists && !settings.is_changed() && !rebinding.is_changed() && !ui.is_changed() {
+    // The multiplayer page shows the players and connection, so redraw it
+    // when they change.
+    let mp_now = mp_summary(&mp);
+    let mp_changed = *mp_shown != mp_now;
+    if mp_changed {
+        *mp_shown = mp_now;
+    }
+    let mp_changed = mp_changed && ui.page == Page::Multiplayer;
+    if exists
+        && !settings.is_changed()
+        && !rebinding.is_changed()
+        && !ui.is_changed()
+        && !mp_changed
+    {
         return;
     }
     for menu in &menus {
@@ -691,8 +801,10 @@ fn rebuild_menu(
                         (Page::Aircraft, "Aircraft"),
                         (Page::Weapons, "Weapons"),
                         (Page::Scenario, "Scenario"),
+                        (Page::Multiplayer, "Multiplayer"),
                     ] {
-                        let mut b = r.spawn(button(MenuAction::Page(page), name, px(104)));
+                        let width = if page == Page::Multiplayer { 120 } else { 104 };
+                        let mut b = r.spawn(button(MenuAction::Page(page), name, px(width)));
                         if ui.page == page {
                             b.insert(Selected);
                         }
@@ -704,6 +816,7 @@ fn rebuild_menu(
                     Page::Aircraft => aircraft_page(panel, &settings, &ui, &scroll),
                     Page::Weapons => weapons_page(panel, &settings, &ui, &scroll),
                     Page::Scenario => scenario_page(panel, &settings),
+                    Page::Multiplayer => multiplayer_page(panel, &settings, &ui, &scroll, &mp),
                 }
             });
         });
@@ -821,9 +934,20 @@ fn settings_page(
                     percent(100),
                 ));
 
+                col.spawn(section_header("Fire mode"));
+                col.spawn(button(
+                    MenuAction::ToggleSingleFire,
+                    if settings.single_fire {
+                        "Single fire (one shot per click)"
+                    } else {
+                        "Automatic (hold to fire)"
+                    },
+                    percent(100),
+                ));
+
                 col.spawn(section_header("Mouse"));
                 col.spawn(label(
-                    "Move: aim\nRight click: toggle zoom\nLeft click (hold): fire",
+                    "Move: aim\nRight click: toggle zoom\nLeft click: fire",
                     15.0,
                     TEXT,
                 ));
@@ -2051,10 +2175,23 @@ fn on_menu_click(
     mut scroll: ResMut<ScrollMemory>,
     mut next: ResMut<NextState<GameState>>,
     mut exit: MessageWriter<AppExit>,
+    mut mp: ResMut<Mp>,
+    mut mp_commands: MessageWriter<MpCommand>,
 ) {
     let Ok(action) = actions.get(activate.entity) else {
         return;
     };
+    if ui.page == Page::Multiplayer {
+        let fields = ui.mp_fields.clone();
+        let mut copy = settings.clone();
+        commit_fields(&mut copy, &fields);
+        if copy.nickname != settings.nickname
+            || copy.host_port != settings.host_port
+            || copy.join_address != settings.join_address
+        {
+            commit_fields(&mut settings, &fields);
+        }
+    }
     // Any click other than opening a list closes the open one.
     if !matches!(action, MenuAction::ToggleDropdown(_)) && ui.open.is_some() {
         ui.open = None;
@@ -2130,6 +2267,10 @@ fn on_menu_click(
                         settings.guns.iter().position(|g| g.name == gun)
                     }
                     Dropdown::Unit(kind) => Some(settings.units.index(kind)),
+                    Dropdown::PlaneColor => PlaneColor::ALL
+                        .iter()
+                        .position(|c| *c == settings.plane_color),
+                    Dropdown::FlyPreset | Dropdown::Lock(_) => None,
                     Dropdown::Convergence => {
                         let c = settings.card(&ui.loadout_for).weapons.convergence;
                         CONVERGENCE_CHOICES.iter().position(|v| *v == c)
@@ -2322,7 +2463,338 @@ fn on_menu_click(
         MenuAction::SetConvergence(m) => {
             edit_loadout(&mut settings, &mut ui, |l| l.convergence = m as f32);
         }
+        MenuAction::ToggleSingleFire => settings.single_fire = !settings.single_fire,
+        MenuAction::PickPlaneColor(c) => settings.plane_color = c,
+        MenuAction::MpHost => {
+            mp_commands.write(MpCommand::Host);
+        }
+        MenuAction::MpJoin => {
+            mp_commands.write(MpCommand::Join);
+        }
+        MenuAction::MpLeave => {
+            mp_commands.write(MpCommand::Leave);
+        }
+        MenuAction::ToggleMpLead => {
+            settings.host.lead_indicators = !settings.host.lead_indicators;
+        }
+        MenuAction::ToggleFacing => {
+            settings.host.face_each_other = !settings.host.face_each_other;
+        }
+        MenuAction::HostStep(opt, dir) => {
+            let (step, lo, hi) = opt.step();
+            let h = &mut settings.host;
+            match opt {
+                HostOpt::Countdown => {
+                    h.countdown = (h.countdown as f32 + step * dir as f32).clamp(lo, hi) as u32;
+                }
+                HostOpt::SpawnDistance => {
+                    h.spawn_distance = (h.spawn_distance + step * dir as f32).clamp(lo, hi);
+                }
+                HostOpt::Altitude => {
+                    h.altitude = (h.altitude + step * dir as f32).clamp(lo, hi);
+                }
+                HostOpt::AltitudeSpread => {
+                    h.altitude_spread = (h.altitude_spread + step * dir as f32).clamp(lo, hi);
+                }
+            }
+        }
+        MenuAction::LockPlayer(id, preset) => {
+            mp_commands.write(MpCommand::Lock(id, preset));
+        }
+        MenuAction::FlyHostPreset(preset) => {
+            mp.use_host_preset = preset;
+            // Redraw the page with the new choice.
+            ui.set_changed();
+        }
     }
+}
+
+/// What the multiplayer page shows about the session, to spot changes.
+fn mp_summary(mp: &Mp) -> String {
+    let mut s = format!(
+        "{}|{}|{}|{:?}|{:?}|{}",
+        mp.online(),
+        mp.is_host(),
+        mp.status,
+        mp.use_host_preset,
+        mp.locked(),
+        mp.host_aircraft.len()
+    );
+    for e in &mp.roster {
+        s += &format!("|{}:{}:{:?}", e.id, e.name(), e.locked);
+    }
+    s
+}
+
+/// The multiplayer page: who you are, hosting or joining, and (host) the
+/// game's settings and the players.
+fn multiplayer_page(
+    panel: &mut ChildSpawnerCommands,
+    settings: &Settings,
+    ui: &MenuUi,
+    scroll: &ScrollMemory,
+    mp: &Mp,
+) {
+    panel
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            column_gap: px(28),
+            ..default()
+        })
+        .with_children(|cols| {
+            cols.spawn(column(px(360))).with_children(|col| {
+                col.spawn(section_header("Your name"));
+                col.spawn(text_field(1, &ui.mp_fields[0], MpField::Nickname, 360.0));
+
+                col.spawn(section_header("Your plane's color"));
+                let colors: Vec<_> = PlaneColor::ALL
+                    .iter()
+                    .map(|c| Choice {
+                        action: MenuAction::PickPlaneColor(*c),
+                        label: c.label().into(),
+                        selected: *c == settings.plane_color,
+                        swatch: Some(c.color()),
+                    })
+                    .collect();
+                col.spawn((Node::default(), GlobalZIndex(32)))
+                    .with_children(|w| {
+                        dropdown(
+                            w,
+                            Dropdown::PlaneColor,
+                            ui,
+                            scroll,
+                            settings.plane_color.label(),
+                            Some(settings.plane_color.color()),
+                            &colors,
+                            px(360),
+                        );
+                    });
+
+                if mp.online() {
+                    col.spawn(section_header(if mp.is_host() {
+                        "You're hosting"
+                    } else {
+                        "You've joined a game"
+                    }));
+                    if mp.is_client() {
+                        // Fly your own preset or one of the host's.
+                        col.spawn(section_header("Aircraft you fly"));
+                        if let Some(locked) = mp.locked() {
+                            col.spawn(label(
+                                &format!("The host set your aircraft to {locked}."),
+                                15.0,
+                                ACCENT,
+                            ));
+                        } else {
+                            let mut choices = vec![Choice {
+                                action: MenuAction::FlyHostPreset(None),
+                                label: format!("Mine: {}", settings.player_aircraft),
+                                selected: mp.use_host_preset.is_none(),
+                                swatch: None,
+                            }];
+                            for c in &mp.host_aircraft {
+                                choices.push(Choice {
+                                    action: MenuAction::FlyHostPreset(Some(c.name.clone())),
+                                    label: format!("Host's: {}", c.name),
+                                    selected: mp.use_host_preset.as_deref() == Some(&c.name),
+                                    swatch: None,
+                                });
+                            }
+                            let current = match &mp.use_host_preset {
+                                Some(n) => format!("Host's: {n}"),
+                                None => format!("Mine: {}", settings.player_aircraft),
+                            };
+                            col.spawn((Node::default(), GlobalZIndex(31)))
+                                .with_children(|w| {
+                                    dropdown(
+                                        w,
+                                        Dropdown::FlyPreset,
+                                        ui,
+                                        scroll,
+                                        &current,
+                                        None,
+                                        &choices,
+                                        px(360),
+                                    );
+                                });
+                            col.spawn(label(
+                                "The host's presets can be flown but not changed. \
+                                 Your own are picked on the Aircraft page.",
+                                13.0,
+                                DIM,
+                            ));
+                        }
+                    }
+                    col.spawn(button(MenuAction::MpLeave, "Leave the game", percent(100)));
+                } else {
+                    col.spawn(section_header("Host a game"));
+                    col.spawn(row()).with_children(|r| {
+                        r.spawn(label("Port", 16.0, TEXT));
+                        r.spawn(text_field(2, &ui.mp_fields[1], MpField::Port, 90.0));
+                        r.spawn(button(MenuAction::MpHost, "Host", px(200)));
+                    });
+                    col.spawn(section_header("Join a game (host's address)"));
+                    col.spawn(row()).with_children(|r| {
+                        r.spawn(text_field(3, &ui.mp_fields[2], MpField::Address, 250.0));
+                        r.spawn(button(MenuAction::MpJoin, "Join", px(102)));
+                    });
+                }
+                if !mp.status.is_empty() {
+                    col.spawn(label(&mp.status, 14.0, ACCENT));
+                }
+                col.spawn(label(
+                    "Friends join with the host's IP address, like \
+                     203.0.113.5:5050. Over the internet the host forwards \
+                     UDP port 5050 on their router, or everyone joins the same \
+                     VPN (Radmin VPN, ZeroTier, Tailscale) and uses its address.",
+                    13.0,
+                    DIM,
+                ));
+                col.spawn(label(
+                    "Free for all: the last plane flying wins. The host holds \
+                     the reset key 3 s to start a round. Tab: scoreboard.",
+                    13.0,
+                    DIM,
+                ));
+                col.spawn(Node {
+                    flex_grow: 1.0,
+                    min_height: px(8),
+                    ..default()
+                });
+                col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
+            });
+
+            // The game's settings: the host changes them (any time), others
+            // see them.
+            cols.spawn(column(px(400))).with_children(|col| {
+                let host = !mp.is_client();
+                let o = if mp.is_client() {
+                    &mp.options
+                } else {
+                    &settings.host
+                };
+                col.spawn(section_header(if host {
+                    "Game settings (you can change these while hosting)"
+                } else {
+                    "Game settings (the host picks these)"
+                }));
+                let units = settings.units;
+                let stepper =
+                    |col: &mut ChildSpawnerCommands, name: &str, value: String, opt: HostOpt| {
+                        col.spawn(row()).with_children(|r| {
+                            r.spawn((label(name, 16.0, TEXT), grow()));
+                            if host {
+                                r.spawn(button(MenuAction::HostStep(opt, -1), "-", px(36)));
+                            }
+                            r.spawn((
+                                label(&value, 16.0, TEXT),
+                                Node {
+                                    width: px(110),
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                TextLayout::justify(Justify::Center),
+                            ));
+                            if host {
+                                r.spawn(button(MenuAction::HostStep(opt, 1), "+", px(36)));
+                            }
+                        });
+                    };
+                col.spawn(row()).with_children(|r| {
+                    r.spawn((label("Lead indicators", 16.0, TEXT), grow()));
+                    let text = if o.lead_indicators { "Allowed" } else { "Off" };
+                    if host {
+                        r.spawn(button(MenuAction::ToggleMpLead, text, px(190)));
+                    } else {
+                        r.spawn(label(text, 16.0, TEXT));
+                    }
+                });
+                stepper(
+                    col,
+                    "Countdown",
+                    format!("{} s", o.countdown),
+                    HostOpt::Countdown,
+                );
+                stepper(
+                    col,
+                    "Spawn distance",
+                    units.range(o.spawn_distance),
+                    HostOpt::SpawnDistance,
+                );
+                stepper(
+                    col,
+                    "Average altitude",
+                    units.altitude(o.altitude),
+                    HostOpt::Altitude,
+                );
+                stepper(
+                    col,
+                    "Altitude range (+/-)",
+                    units.altitude(o.altitude_spread),
+                    HostOpt::AltitudeSpread,
+                );
+                col.spawn(row()).with_children(|r| {
+                    r.spawn((label("Start", 16.0, TEXT), grow()));
+                    let text = if o.face_each_other {
+                        "Facing each other"
+                    } else {
+                        "Random headings"
+                    };
+                    if host {
+                        r.spawn(button(MenuAction::ToggleFacing, text, px(190)));
+                    } else {
+                        r.spawn(label(text, 16.0, TEXT));
+                    }
+                });
+
+                if mp.is_host() {
+                    col.spawn(section_header(
+                        "Players (lock someone to one of your presets)",
+                    ));
+                    let others: Vec<_> = mp.roster.iter().filter(|e| e.id != HOST_ID).collect();
+                    if others.is_empty() {
+                        col.spawn(label("Nobody has joined yet.", 15.0, DIM));
+                    }
+                    for (n, e) in others.into_iter().enumerate() {
+                        col.spawn((row(), GlobalZIndex(20 - n as i32)))
+                            .with_children(|r| {
+                                r.spawn((label(&e.name(), 16.0, TEXT), grow()));
+                                let mut choices = vec![Choice {
+                                    action: MenuAction::LockPlayer(e.id, None),
+                                    label: "Their choice".into(),
+                                    selected: e.locked.is_none(),
+                                    swatch: None,
+                                }];
+                                for c in &settings.aircraft {
+                                    choices.push(Choice {
+                                        action: MenuAction::LockPlayer(e.id, Some(c.name.clone())),
+                                        label: c.name.clone(),
+                                        selected: e.locked.as_deref() == Some(&c.name),
+                                        swatch: None,
+                                    });
+                                }
+                                let current =
+                                    e.locked.clone().unwrap_or_else(|| "Their choice".into());
+                                dropdown(
+                                    r,
+                                    Dropdown::Lock(e.id),
+                                    ui,
+                                    scroll,
+                                    &current,
+                                    None,
+                                    &choices,
+                                    px(190),
+                                );
+                            });
+                    }
+                } else if mp.is_client() {
+                    col.spawn(section_header("Players"));
+                    for e in &mp.roster {
+                        col.spawn(label(&e.name(), 15.0, TEXT));
+                    }
+                }
+            });
+        });
 }
 
 /// Change the loadout of the aircraft shown on the weapons page. The
