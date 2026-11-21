@@ -8,12 +8,15 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 use serde::{Deserialize, Serialize};
 
+use crate::damage::HitPart;
 use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
+use crate::models::PlaneModel;
 use crate::multiplayer::{Bot, BotHit, Mp, RemoteHit, RemotePlane, world_runs};
 use crate::settings::Settings;
 use crate::sound::{self, Sounds};
 use crate::target::{PlayerHit, ResetScenario, ScenarioState, Target, TargetHit};
+use crate::turrets::Turrets;
 
 /// Path of the gun model, relative to `assets/`.
 pub const GUN_MODEL: &str = "models/gun.glb";
@@ -44,6 +47,9 @@ pub struct GunCard {
     /// Optional: hits from this gun that destroy an aircraft. Estimated
     /// from the caliber when blank.
     pub hits_to_kill: Option<f32>,
+    /// Optional: one round in this many is a tracer; the rest fly unseen.
+    /// Blank: 1 in 4 up to 13 mm, 1 in 3 above.
+    pub tracers: Option<u32>,
 }
 
 /// Tracer colors to pick from.
@@ -127,6 +133,7 @@ impl GunCard {
             spread: None,
             tracer: TracerColor::Orange,
             hits_to_kill: None,
+            tracers: Some(3),
         }
     }
 
@@ -141,6 +148,7 @@ impl GunCard {
             spread: None,
             tracer: TracerColor::Red,
             hits_to_kill: None,
+            tracers: Some(4),
         }
     }
 
@@ -149,6 +157,13 @@ impl GunCard {
     pub fn caliber_mm(&self) -> f32 {
         self.caliber
             .unwrap_or_else(|| 20.0 * (self.projectile_mass.max(0.001) / 0.1).cbrt())
+    }
+
+    /// One round in this many is a tracer.
+    pub fn tracer_every(&self) -> u32 {
+        self.tracers
+            .unwrap_or(if self.caliber_mm() <= 13.5 { 4 } else { 3 })
+            .max(1)
     }
 
     pub fn spread_mils(&self) -> f32 {
@@ -370,6 +385,9 @@ pub struct Loadout {
     /// Distance from the wing root out to the first wing gun, m (full
     /// size aircraft).
     pub wing_out: f32,
+    /// Gun turrets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turrets: Vec<crate::turrets::Turret>,
 }
 
 impl Default for Loadout {
@@ -383,6 +401,7 @@ impl Default for Loadout {
             convergence: CONVERGENCE,
             belly_back: BELLY_BACK,
             wing_out: WING_OUT,
+            turrets: vec![],
         }
     }
 }
@@ -406,25 +425,44 @@ impl Loadout {
         }
     }
 
-    /// Every gun: its slot, gun preset name, and muzzle position in model
-    /// space (the airplane model's own axes, nose toward +Z).
+    /// Every fixed gun (not turrets): its slot, gun preset name, and
+    /// muzzle position in the fighter's model space (see [`Self::guns_on`]
+    /// for other airframes).
     pub fn guns(&self) -> Vec<(Slot, String, Vec3)> {
+        self.guns_on(crate::models::ModelKind::Fighter)
+    }
+
+    /// Every fixed gun on an airframe, with muzzle positions in its model
+    /// space (the model's own axes, nose toward +Z).
+    pub fn guns_on(&self, kind: crate::models::ModelKind) -> Vec<(Slot, String, Vec3)> {
         let mut out = vec![];
         for slot in Slot::ALL {
             let m = self.mount(slot);
             let n = m.count.min(slot.max());
             let per = if slot == Slot::Wings { 2 } else { 1 };
-            for (i, p) in self.muzzles(slot, n).into_iter().enumerate() {
+            for (i, p) in self.muzzles_on(kind, slot, n).into_iter().enumerate() {
                 out.push((slot, m.gun_at(i / per).to_string(), p));
             }
         }
         out
     }
 
-    /// Muzzle positions for `count` guns in a slot, in model space, with
-    /// this loadout's belly and wing placement.
+    /// Every gun preset the loadout uses, turrets included.
+    pub fn gun_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.guns().into_iter().map(|g| g.1).collect();
+        names.extend(self.turrets.iter().map(|t| t.gun.clone()));
+        names
+    }
+
+    /// Muzzle positions for `count` guns in a slot, in the fighter's model
+    /// space, with this loadout's belly and wing placement.
+    #[cfg(test)]
     pub fn muzzles(&self, slot: Slot, count: u32) -> Vec<Vec3> {
-        place_muzzles(slot, count, self.belly_back, self.wing_out)
+        self.muzzles_on(crate::models::ModelKind::Fighter, slot, count)
+    }
+
+    pub fn muzzles_on(&self, kind: crate::models::ModelKind, slot: Slot, count: u32) -> Vec<Vec3> {
+        place_muzzles(kind.spec(), slot, count, self.belly_back, self.wing_out)
     }
 
     #[allow(dead_code)]
@@ -439,46 +477,38 @@ impl Loadout {
     }
 }
 
-// Airframe reference points in model space, measured from airplane.glb.
-const SPINNER: Vec3 = Vec3::new(0.0, 0.50, 2.46);
-/// How far the spinner gun's muzzle pokes out of the spinner.
-const SPINNER_MUZZLE_Z: f32 = 2.53;
-/// The ring guns' muzzles sit at the front of the cowling.
-const RING_MUZZLE_Z: f32 = 2.30;
-const RING_RADIUS: f32 = 0.17;
-const BELLY_Y: f32 = -0.04;
-const BELLY_SPACING: f32 = 0.17;
 /// Default and limits for how far behind the spinner the belly guns sit,
 /// m on the full size aircraft.
 pub const BELLY_BACK: f32 = 1.7;
 pub const BELLY_BACK_MIN: f32 = 0.9;
 pub const BELLY_BACK_MAX: f32 = 4.5;
-/// Where the wing meets the fuselage, and the outermost spot a gun fits,
-/// model space.
-const WING_ROOT_X: f32 = 0.48;
-const WING_GUN_MAX_X: f32 = 3.0;
-const WING_SPACING: f32 = 0.3;
 /// Default and limits for the root-to-first-wing-gun distance, m on the
 /// full size aircraft.
 pub const WING_OUT: f32 = 0.5;
 pub const WING_OUT_MIN: f32 = 0.1;
-pub const WING_OUT_MAX: f32 = 3.3;
 
 /// Muzzle positions for `count` guns in a slot at the default placement,
 /// in model space.
 #[cfg(test)]
 pub fn muzzle_positions(slot: Slot, count: u32) -> Vec<Vec3> {
-    place_muzzles(slot, count, BELLY_BACK, WING_OUT)
+    place_muzzles(&crate::models::FIGHTER, slot, count, BELLY_BACK, WING_OUT)
 }
 
 /// Muzzle positions for `count` guns in a slot, in model space. Belly guns
 /// sit `belly_back` m behind the spinner; the first wing gun `wing_out` m
 /// out from the root (both full size meters).
-fn place_muzzles(slot: Slot, count: u32, belly_back: f32, wing_out: f32) -> Vec<Vec3> {
-    let scale = crate::MODEL_SCALE;
+fn place_muzzles(
+    spec: &crate::models::ModelSpec,
+    slot: Slot,
+    count: u32,
+    belly_back: f32,
+    wing_out: f32,
+) -> Vec<Vec3> {
+    let scale = spec.scale;
+    let nose = spec.nose;
     match slot {
         Slot::NoseCenter => (0..count.min(1))
-            .map(|_| Vec3::new(SPINNER.x, SPINNER.y, SPINNER_MUZZLE_Z))
+            .map(|_| Vec3::new(nose.x, nose.y, spec.spinner_muzzle_z))
             .collect(),
         Slot::NoseRing => {
             // Hexagon corners, in degrees from "right", picked so every count
@@ -497,9 +527,9 @@ fn place_muzzles(slot: Slot, count: u32, belly_back: f32, wing_out: f32) -> Vec<
                 .map(|a| {
                     let r = a.to_radians();
                     Vec3::new(
-                        SPINNER.x + RING_RADIUS * r.cos(),
-                        SPINNER.y + RING_RADIUS * r.sin(),
-                        RING_MUZZLE_Z,
+                        nose.x + spec.ring_radius * r.cos(),
+                        nose.y + spec.ring_radius * r.sin(),
+                        spec.ring_muzzle_z,
                     )
                 })
                 .collect()
@@ -508,24 +538,23 @@ fn place_muzzles(slot: Slot, count: u32, belly_back: f32, wing_out: f32) -> Vec<
             let n = count.min(4) as f32;
             (0..count.min(4))
                 .map(|i| {
-                    let x = (i as f32 - (n - 1.0) / 2.0) * BELLY_SPACING;
+                    let x = (i as f32 - (n - 1.0) / 2.0) * spec.belly_spacing;
                     let back = belly_back.clamp(BELLY_BACK_MIN, BELLY_BACK_MAX) / scale;
-                    Vec3::new(x, BELLY_Y, SPINNER.z - back)
+                    Vec3::new(x, spec.belly_y, nose.z - back)
                 })
                 .collect()
         }
         Slot::Wings => {
             let mut out = vec![];
             let n = count.min(4);
-            let first = (WING_ROOT_X + wing_out.clamp(WING_OUT_MIN, WING_OUT_MAX) / scale)
-                .min(WING_GUN_MAX_X - (n.max(1) - 1) as f32 * WING_SPACING);
+            let out_max = spec.wing_out_max();
+            let first = (spec.wing_root_x + wing_out.clamp(WING_OUT_MIN, out_max) / scale)
+                .min(spec.wing_max_x - (n.max(1) - 1) as f32 * spec.wing_spacing);
             for i in 0..n {
-                let x = first + i as f32 * WING_SPACING;
-                // The wing sweeps back and has dihedral toward the tip.
-                let leading_edge = 0.88 - (x - 0.48) * 0.49 / 2.76;
-                let y = 0.19 + (x - 0.48) * 0.09;
+                let x = first + i as f32 * spec.wing_spacing;
+                let (z, y) = spec.wing_at(x);
                 for side in [-1.0, 1.0] {
-                    out.push(Vec3::new(side * x, y, leading_edge + 0.2));
+                    out.push(Vec3::new(side * x, y, z));
                 }
             }
             out
@@ -534,7 +563,7 @@ fn place_muzzles(slot: Slot, count: u32, belly_back: f32, wing_out: f32) -> Vec<
 }
 
 /// Size of a gun model for a caliber, relative to the model as drawn (20 mm).
-fn gun_model_scale(caliber_mm: f32) -> f32 {
+pub fn gun_model_scale(caliber_mm: f32) -> f32 {
     (caliber_mm / 20.0).clamp(0.5, 2.0)
 }
 
@@ -587,10 +616,6 @@ impl GunBook {
             .unwrap_or_else(|| settings.gun(name))
     }
 }
-
-/// Marks the airplane model under a plane, which the gun models attach to.
-#[derive(Component)]
-pub struct PlaneModel;
 
 #[derive(Component)]
 struct GunModel;
@@ -762,11 +787,15 @@ fn sync_gun_models(
     settings: Res<Settings>,
     weapon_assets: Res<WeaponAssets>,
     planes: Query<(&Aircraft, &Children, Option<&GunBook>)>,
-    models: Query<(Entity, Option<&ShownGuns>, Option<&Children>), With<PlaneModel>>,
+    models: Query<(Entity, &PlaneModel, Option<&ShownGuns>, Option<&Children>)>,
     gun_models: Query<(), With<GunModel>>,
 ) {
     for (aircraft, children, book) in &planes {
-        let Some((model, shown, model_children)) = children.iter().find_map(|c| models.get(c).ok())
+        let kind = aircraft.card.model_kind();
+        let Some((model, _, shown, model_children)) = children
+            .iter()
+            .filter_map(|c| models.get(c).ok())
+            .find(|m| m.1.0 == kind)
         else {
             continue;
         };
@@ -774,7 +803,7 @@ fn sync_gun_models(
             aircraft
                 .card
                 .weapons
-                .guns()
+                .guns_on(kind)
                 .into_iter()
                 .map(|(_, gun, p)| (p, GunBook::gun(book, &settings, &gun).caliber_mm()))
                 .collect(),
@@ -807,9 +836,13 @@ struct GunState {
     slot: Slot,
     /// Muzzle in the plane's local frame (model correction applied).
     muzzle: Vec3,
+    /// A turret gun: which turret, and which of its guns.
+    turret: Option<(usize, usize)>,
     card: GunCard,
     /// Time until the next shot, s (negative = overdue).
     cooldown: f32,
+    /// Rounds fired, to tell which are tracers.
+    fired: u32,
 }
 
 #[derive(Component, Default)]
@@ -819,8 +852,8 @@ struct Guns {
     guns: Vec<GunState>,
     /// Where wing and belly guns meet, m.
     convergence: f32,
-    /// The loadout and gun cards this was built from.
-    built_from: Option<(Loadout, Vec<GunCard>)>,
+    /// The airframe, loadout and gun cards this was built from.
+    built_from: Option<(crate::models::ModelKind, Loadout, Vec<GunCard>)>,
 }
 
 /// Give every plane (yours and the target) the guns its preset carries.
@@ -845,16 +878,41 @@ fn sync_guns(
     let cards = book.map(|b| &b.0).unwrap_or(&settings.guns);
     // Nothing to do unless the loadout or a gun changed (checked without
     // copying anything, since this runs every frame).
+    let kind = aircraft.card.model_kind();
     if guns.as_ref().is_some_and(|g| {
         g.built_from
             .as_ref()
-            .is_some_and(|(l, c)| *l == aircraft.card.weapons && c == cards)
+            .is_some_and(|(k, l, c)| *k == kind && *l == aircraft.card.weapons && c == cards)
     }) {
         return;
     }
     let loadout = aircraft.card.weapons.clone();
-    let key = (loadout.clone(), cards.clone());
-    let correction = crate::model_correction();
+    let key = (kind, loadout.clone(), cards.clone());
+    let correction = kind.spec().correction();
+    let mut list: Vec<GunState> = loadout
+        .guns_on(kind)
+        .into_iter()
+        .map(|(slot, gun, p)| GunState {
+            slot,
+            muzzle: correction.transform_point(p),
+            turret: None,
+            card: GunBook::gun(book, settings, &gun).clone(),
+            cooldown: 0.0,
+            fired: 0,
+        })
+        .collect();
+    for (i, t) in loadout.turrets.iter().enumerate() {
+        for j in 0..t.guns() as usize {
+            list.push(GunState {
+                slot: Slot::NoseCenter,
+                muzzle: Vec3::ZERO,
+                turret: Some((i, j)),
+                card: GunBook::gun(book, settings, &t.gun).clone(),
+                cooldown: 0.0,
+                fired: 0,
+            });
+        }
+    }
     let built = Guns {
         last_sound: HashMap::new(),
         convergence: if loadout.convergence > 0.0 {
@@ -862,16 +920,7 @@ fn sync_guns(
         } else {
             0.0
         },
-        guns: loadout
-            .guns()
-            .into_iter()
-            .map(|(slot, gun, p)| GunState {
-                slot,
-                muzzle: correction.transform_point(p),
-                card: GunBook::gun(book, settings, &gun).clone(),
-                cooldown: 0.0,
-            })
-            .collect(),
+        guns: list,
         built_from: Some(key),
     };
     match guns {
@@ -1004,10 +1053,12 @@ fn fire_guns(
     settings: Res<Settings>,
     mp: Res<Mp>,
     state: Res<State<crate::GameState>>,
+    gunner: Res<crate::camera::GunnerView>,
     planes: Query<(
         &Transform,
         &Aircraft,
         &mut Guns,
+        Option<&Turrets>,
         Has<Player>,
         Option<&Target>,
         Option<&RemotePlane>,
@@ -1015,11 +1066,13 @@ fn fire_guns(
     )>,
 ) {
     let dt = time.delta_secs();
+    // In gunner view the trigger works the turrets, not the fixed guns.
     let player_trigger = *state.get() == crate::GameState::Playing
         && mp.guns_free()
+        && !gunner.active
         && trigger_now(&mouse, &cursor, settings.single_fire);
     let eye = camera.translation();
-    for (tf, aircraft, mut guns, is_player, target, remote, is_bot) in planes {
+    for (tf, aircraft, mut guns, turrets, is_player, target, remote, is_bot) in planes {
         let (firing, owner) = if is_player {
             (player_trigger, Owner::Player)
         } else if let Some(r) = remote {
@@ -1054,6 +1107,7 @@ fn fire_guns(
             tf,
             aircraft,
             &mut guns,
+            turrets,
             firing,
             owner,
             loudness,
@@ -1075,6 +1129,7 @@ fn fire_plane(
     tf: &Transform,
     aircraft: &Aircraft,
     guns: &mut Guns,
+    turrets: Option<&Turrets>,
     firing: bool,
     owner: Owner,
     loudness: f32,
@@ -1087,23 +1142,36 @@ fn fire_plane(
     // them), so a full battery doesn't stack dozens of sounds.
     let mut fired: Vec<(GunCard, u32)> = vec![];
     for gun in &mut guns.guns {
-        if !firing {
+        // Turret guns fire when their turret does, and point where it does.
+        let turret = gun
+            .turret
+            .and_then(|(t, j)| turrets.and_then(|ts| ts.list.get(t)).map(|t| (t, j)));
+        let shooting = match (gun.turret, turret) {
+            (None, _) => firing,
+            (Some(_), Some((t, _))) => t.fire,
+            (Some(_), None) => false,
+        };
+        if !shooting {
             // Ready to fire again once the gun has cycled.
             gun.cooldown = (gun.cooldown - dt).max(0.0);
             continue;
         }
         gun.cooldown -= dt;
         while gun.cooldown <= 0.0 {
-            let muzzle = tf.transform_point(gun.muzzle);
-            let aim = match gun.slot {
-                Slot::NoseCenter | Slot::NoseRing => forward,
+            let muzzle = match turret {
+                Some((t, j)) => tf.transform_point(t.muzzle(j)),
+                None => tf.transform_point(gun.muzzle),
+            };
+            let aim = match (turret, gun.slot) {
+                (Some((t, _)), _) => tf.rotation * t.direction(),
+                (None, Slot::NoseCenter | Slot::NoseRing) => forward,
                 // Angled in sideways only (War Thunder's horizontal
                 // convergence): the guns still fire parallel up and down.
-                Slot::Belly | Slot::Wings if converging => {
+                (None, Slot::Belly | Slot::Wings) if converging => {
                     let side = (muzzle - tf.translation).dot(right);
                     (forward * guns.convergence - right * side).normalize_or(forward)
                 }
-                Slot::Belly | Slot::Wings => forward,
+                (None, Slot::Belly | Slot::Wings) => forward,
             };
             // Rounds land evenly over a circle `spread` wide.
             let radius = gun.card.spread_mils() * 0.001 * 0.5;
@@ -1115,13 +1183,11 @@ fn fire_plane(
             let early = -gun.cooldown;
             let position = muzzle + velocity * early;
             let size = tracer_size(gun.card.caliber_mm());
-            let (core_tf, glow_tf) = tracer_shape(position, velocity, eye, size);
-            let (core, glow) = weapon_assets
-                .tracer_materials
-                .get(&gun.card.tracer)
-                .cloned()
-                .unwrap_or_default();
-            commands.spawn((
+            // Only every few rounds is a tracer; the others are there all
+            // the same, just unseen.
+            let tracer = gun.fired % gun.card.tracer_every() == 0;
+            gun.fired = gun.fired.wrapping_add(1);
+            let mut round = commands.spawn((
                 Bullet {
                     position,
                     velocity,
@@ -1135,22 +1201,32 @@ fn fire_plane(
                     judged: false,
                 },
                 Transform::from_translation(position),
-                Visibility::default(),
-                children![
-                    (
-                        TracerCore,
-                        Mesh3d(weapon_assets.tracer_mesh.clone()),
-                        MeshMaterial3d(core),
-                        core_tf,
-                    ),
-                    (
-                        TracerGlow,
-                        Mesh3d(weapon_assets.glow_mesh.clone()),
-                        MeshMaterial3d(glow),
-                        glow_tf,
-                    )
-                ],
             ));
+            if tracer {
+                let (core_tf, glow_tf) = tracer_shape(position, velocity, eye, size);
+                let (core, glow) = weapon_assets
+                    .tracer_materials
+                    .get(&gun.card.tracer)
+                    .cloned()
+                    .unwrap_or_default();
+                round.insert((
+                    Visibility::default(),
+                    children![
+                        (
+                            TracerCore,
+                            Mesh3d(weapon_assets.tracer_mesh.clone()),
+                            MeshMaterial3d(core),
+                            core_tf,
+                        ),
+                        (
+                            TracerGlow,
+                            Mesh3d(weapon_assets.glow_mesh.clone()),
+                            MeshMaterial3d(glow),
+                            glow_tf,
+                        )
+                    ],
+                ));
+            }
             if owner == Owner::Player {
                 stats.shots += 1;
             }
@@ -1291,17 +1367,39 @@ fn record_target_pose(
     }
 }
 
-/// Hit boxes in model space (min, max), from airplane.glb.
-const HIT_BOXES: [(Vec3, Vec3); 4] = [
-    // Fuselage
-    (Vec3::new(-0.34, 0.0, -2.7), Vec3::new(0.34, 1.12, 2.5)),
-    // Tail
-    (Vec3::new(-0.1, 0.38, -3.92), Vec3::new(0.1, 1.64, -2.7)),
-    // Wings
-    (Vec3::new(-3.5, 0.0, -1.3), Vec3::new(3.5, 0.5, 1.0)),
-    // Tailplane
-    (Vec3::new(-1.26, 0.70, -3.7), Vec3::new(1.26, 0.83, -2.74)),
-];
+/// What a segment (in the plane's own frame) strikes first, and where
+/// along it: a direct hit on the cockpit counts before anything else, then
+/// whichever of the airframe or a working turret it reaches first.
+fn strike(
+    spec: &crate::models::ModelSpec,
+    to_model: &Mat4,
+    turrets: &[(Vec3, f32, bool)],
+    a: Vec3,
+    b: Vec3,
+) -> Option<(HitPart, f32)> {
+    let (ma, mb) = (to_model.transform_point3(a), to_model.transform_point3(b));
+    if let Some(t) = segment_hits_box(ma, mb, spec.cockpit.0, spec.cockpit.1) {
+        return Some((HitPart::Cockpit, t));
+    }
+    let mut best: Option<(HitPart, f32)> = spec
+        .boxes
+        .iter()
+        .filter_map(|(min, max)| segment_hits_box(ma, mb, *min, *max))
+        .reduce(f32::min)
+        .map(|t| (HitPart::Airframe, t));
+    for (i, (center, half, alive)) in turrets.iter().enumerate() {
+        if !alive {
+            continue;
+        }
+        let h = Vec3::splat(*half);
+        if let Some(t) = segment_hits_box(a, b, *center - h, *center + h)
+            && best.is_none_or(|(_, bt)| t < bt)
+        {
+            best = Some((HitPart::Turret(i as u8), t));
+        }
+    }
+    best
+}
 
 /// Where the segment a→b first enters the box, as a fraction of the way.
 fn segment_hits_box(a: Vec3, b: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
@@ -1328,9 +1426,9 @@ fn segment_hits_box(a: Vec3, b: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     Some(t0)
 }
 
-/// The world → model space transform for a plane at `pose`.
-fn to_model(pose: &Transform) -> Mat4 {
-    (pose.to_matrix() * crate::model_correction().to_matrix()).inverse()
+/// The world → plane frame transform for a plane at `pose`.
+fn to_local(pose: &Transform) -> Mat4 {
+    pose.to_matrix().inverse()
 }
 
 fn lerp_pose(a: &Transform, b: &Transform, t: f32) -> Transform {
@@ -1365,7 +1463,7 @@ fn fly_bullets(
     mut stats: ResMut<HitStats>,
     sounds: Res<Sounds>,
     mut last_hit_sound: Local<f32>,
-    mut bullets: Query<(Entity, &mut Bullet, &mut Transform, &Children), Without<PrevPose>>,
+    mut bullets: Query<(Entity, &mut Bullet, &mut Transform, Option<&Children>), Without<PrevPose>>,
     mut cores: Query<
         &mut Transform,
         (
@@ -1388,6 +1486,8 @@ fn fly_bullets(
         Entity,
         &Transform,
         &PrevPose,
+        &Aircraft,
+        Option<&Turrets>,
         Option<&Target>,
         Has<Player>,
         Option<&RemotePlane>,
@@ -1412,9 +1512,22 @@ fn fly_bullets(
     }
     // Planes that can be hit: the target and other players (by your
     // rounds), and you (by theirs).
-    let poses: Vec<(Entity, Transform, Transform, Kind)> = planes
+    struct Pose {
+        entity: Entity,
+        prev: Transform,
+        now: Transform,
+        kind: Kind,
+        spec: &'static crate::models::ModelSpec,
+        /// Plane frame to model space.
+        to_model: Mat4,
+        /// Nothing of the plane is farther than this from its center, m.
+        reach: f32,
+        /// Turret hit boxes: center, half size, working.
+        turrets: Vec<(Vec3, f32, bool)>,
+    }
+    let poses: Vec<Pose> = planes
         .iter()
-        .filter_map(|(e, tf, p, t, is_player, remote)| {
+        .filter_map(|(e, tf, p, aircraft, turrets, t, is_player, remote)| {
             let kind = if is_player {
                 let up = if mp.online() {
                     mp.alive()
@@ -1427,7 +1540,24 @@ fn fly_bullets(
             } else {
                 (!mp.online() && t.is_some_and(|t| !t.destroyed())).then_some(Kind::Target)
             }?;
-            Some((e, p.0, *tf, kind))
+            Some(Pose {
+                entity: e,
+                prev: p.0,
+                now: *tf,
+                kind,
+                spec: aircraft.card.model_kind().spec(),
+                to_model: aircraft
+                    .card
+                    .model_kind()
+                    .spec()
+                    .correction()
+                    .to_matrix()
+                    .inverse(),
+                reach: aircraft.card.model_kind().spec().reach(),
+                turrets: turrets
+                    .map(|ts| ts.list.iter().map(|t| (t.mount, t.half, !t.lost)).collect())
+                    .unwrap_or_default(),
+            })
         })
         .collect();
     'bullets: for (entity, mut bullet, mut tf, children) in &mut bullets {
@@ -1441,7 +1571,8 @@ fn fly_bullets(
             pos += bullet.velocity * h;
             bullet.traveled += (pos - start).length();
 
-            for (plane, prev, now, kind) in &poses {
+            for pose in &poses {
+                let (plane, prev, now, kind) = (&pose.entity, &pose.prev, &pose.now, &pose.kind);
                 // Your rounds hit the target and other players; theirs hit you.
                 // (No friendly fire in team games.)
                 let can_hit = match (bullet.owner, *kind) {
@@ -1454,6 +1585,13 @@ fn fly_bullets(
                     (Owner::Bot(_), Kind::Target) => false,
                 };
                 if !can_hit {
+                    continue;
+                }
+                // Far from this plane: nothing to hit, and not a near miss.
+                let far = pos.distance(now.translation) - (pos - start).length();
+                if far > pose.reach + 60.0
+                    && (bullet.owner != Owner::Player || bullet.judged || bullet.near.is_none())
+                {
                     continue;
                 }
                 let frac = (i + 1) as f32 / BULLET_SUBSTEPS as f32;
@@ -1482,13 +1620,9 @@ fn fly_bullets(
                         _ => {}
                     }
                 }
-                let a = to_model(&pose_a).transform_point3(start);
-                let b = to_model(&pose_b).transform_point3(pos);
-                let hit = HIT_BOXES
-                    .iter()
-                    .filter_map(|(min, max)| segment_hits_box(a, b, *min, *max))
-                    .reduce(f32::min);
-                let Some(t) = hit else {
+                let a = to_local(&pose_a).transform_point3(start);
+                let b = to_local(&pose_b).transform_point3(pos);
+                let Some((part, t)) = strike(pose.spec, &pose.to_model, &pose.turrets, a, b) else {
                     continue;
                 };
                 if let Owner::Bot(bot) = bullet.owner {
@@ -1500,12 +1634,14 @@ fn fly_bullets(
                         bot,
                         victim,
                         damage: bullet.damage,
+                        part,
                     });
                 }
                 if *kind == Kind::Player {
                     if bullet.owner == Owner::Target {
                         out.player.write(PlayerHit {
                             damage: bullet.damage,
+                            part,
                         });
                     }
                     // A deeper thud when you're the one hit.
@@ -1519,7 +1655,7 @@ fn fly_bullets(
                 }
                 if let Owner::Bot(_) = bullet.owner {
                     // An AI target's round: a spark, but not your hit.
-                    let local = crate::model_correction().transform_point(a.lerp(b, t));
+                    let local = a.lerp(b, t);
                     commands.entity(*plane).with_children(|p| {
                         p.spawn((
                             Spark { age: 0.0 },
@@ -1537,11 +1673,13 @@ fn fly_bullets(
                         out.remote.write(RemoteHit {
                             id: *id,
                             damage: bullet.damage,
+                            part,
                         });
                     }
                     _ => {
                         out.target.write(TargetHit {
                             damage: bullet.damage,
+                            part,
                         });
                     }
                 }
@@ -1553,7 +1691,7 @@ fn fly_bullets(
                     sound::play(&mut commands, sounds.hit(), 0.5, speed);
                 }
                 // Spark where it struck, riding along with the plane.
-                let local = crate::model_correction().transform_point(a.lerp(b, t));
+                let local = a.lerp(b, t);
                 commands.entity(*plane).with_children(|p| {
                     p.spawn((
                         Spark { age: 0.0 },
@@ -1573,6 +1711,9 @@ fn fly_bullets(
             continue;
         }
         tf.translation = pos;
+        let Some(children) = children else {
+            continue;
+        };
         let (core, glow) = tracer_shape(pos, bullet.velocity, eye, bullet.size);
         for c in children {
             if let Ok(mut t) = cores.get_mut(*c) {
@@ -1824,7 +1965,7 @@ mod tests {
         l.belly_back = 3.5;
         assert!(l.muzzles(Slot::Belly, 1)[0].z < fwd - 1.0);
         // Four guns far out still fit on the wing.
-        l.wing_out = WING_OUT_MAX;
+        l.wing_out = crate::models::FIGHTER.wing_out_max();
         assert!(l.muzzles(Slot::Wings, 4).iter().all(|p| p.x.abs() <= 3.01));
 
         // Old saves without the new fields load with the defaults.
@@ -1853,11 +1994,42 @@ mod tests {
     }
 
     fn hits_plane_at(pose: &Transform, a: Vec3, b: Vec3) -> bool {
-        let m = to_model(pose);
+        let m = to_local(pose);
         let (a, b) = (m.transform_point3(a), m.transform_point3(b));
-        HIT_BOXES
-            .iter()
-            .any(|(min, max)| segment_hits_box(a, b, *min, *max).is_some())
+        let spec = &crate::models::FIGHTER;
+        strike(spec, &spec.correction().to_matrix().inverse(), &[], a, b).is_some()
+    }
+
+    #[test]
+    fn cockpit_and_turret_hits_are_told_apart() {
+        let spec = &crate::models::BOMBER;
+        let c = spec
+            .correction()
+            .transform_point((spec.cockpit.0 + spec.cockpit.1) * 0.5);
+        // From above, straight down through the cockpit.
+        let m = spec.correction().to_matrix().inverse();
+        let hit = strike(spec, &m, &[], c + Vec3::Y * 10.0, c - Vec3::Y * 10.0);
+        assert_eq!(hit.map(|h| h.0), Some(HitPart::Cockpit));
+        // A turret on top is struck before the fuselage under it.
+        let turret = (Vec3::new(0.0, 1.8, 0.0), 0.7, true);
+        let hit = strike(
+            spec,
+            &m,
+            &[turret],
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::new(0.0, -10.0, 0.0),
+        );
+        assert_eq!(hit.map(|h| h.0), Some(HitPart::Turret(0)));
+        // A knocked out turret isn't there to hit.
+        let gone = (turret.0, turret.1, false);
+        let hit = strike(
+            spec,
+            &m,
+            &[gone],
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec3::new(0.0, -10.0, 0.0),
+        );
+        assert_eq!(hit.map(|h| h.0), Some(HitPart::Airframe));
     }
 
     #[test]

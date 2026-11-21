@@ -167,29 +167,19 @@ pub fn start_body(model: &FlightModel, fraction: f32) -> Body {
     )
 }
 
-fn spawn_player(mut commands: Commands, assets: Res<AssetServer>, settings: Res<Settings>) {
+fn spawn_player(mut commands: Commands, settings: Res<Settings>) {
     let mut aircraft = Aircraft::new(
         settings.player_card(),
         Body::new(Vec3::ZERO, Quat::IDENTITY, 0.0),
     );
     aircraft.body = start_body(&aircraft.model, 0.55);
-    commands
-        .spawn((
-            Transform::from_translation(aircraft.body.position),
-            Visibility::default(),
-            Player::default(),
-            PaintColor(settings.plane_color),
-            aircraft,
-        ))
-        .with_children(|plane| {
-            plane.spawn((
-                WorldAssetRoot(
-                    assets.load(GltfAssetLabel::Scene(0).from_asset(crate::AIRPLANE_MODEL)),
-                ),
-                crate::model_correction(),
-                crate::weapons::PlaneModel,
-            ));
-        });
+    commands.spawn((
+        Transform::from_translation(aircraft.body.position),
+        Visibility::default(),
+        Player::default(),
+        PaintColor(settings.plane_color),
+        aircraft,
+    ));
 }
 
 /// Rebuild flight models when presets change in the menu.

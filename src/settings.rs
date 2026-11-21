@@ -279,12 +279,14 @@ pub enum Action {
     YawLeft,
     YawRight,
     FreeLook,
+    PilotView,
+    GunnerView,
     Reset,
     Scoreboard,
 }
 
 impl Action {
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 13] = [
         Action::ThrottleUp,
         Action::ThrottleDown,
         Action::PitchUp,
@@ -294,6 +296,8 @@ impl Action {
         Action::YawLeft,
         Action::YawRight,
         Action::FreeLook,
+        Action::PilotView,
+        Action::GunnerView,
         Action::Reset,
         Action::Scoreboard,
     ];
@@ -309,6 +313,8 @@ impl Action {
             Action::YawLeft => "Yaw left",
             Action::YawRight => "Yaw right",
             Action::FreeLook => "Free look (hold)",
+            Action::PilotView => "Pilot view",
+            Action::GunnerView => "Gunner view (planes with turrets)",
             Action::Reset => "Reset (host holds it in multiplayer)",
             Action::Scoreboard => "Scoreboard (hold, multiplayer)",
         }
@@ -326,6 +332,8 @@ impl Action {
             Action::YawLeft => KeyCode::KeyQ,
             Action::YawRight => KeyCode::KeyE,
             Action::FreeLook => KeyCode::AltLeft,
+            Action::PilotView => KeyCode::F3,
+            Action::GunnerView => KeyCode::F6,
             Action::Reset => KeyCode::KeyR,
             Action::Scoreboard => KeyCode::Tab,
         }

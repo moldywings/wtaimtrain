@@ -27,9 +27,10 @@ use crate::settings::{
     Action, Crosshair, CrosshairColor, MAX_SENSITIVITY, MIN_SENSITIVITY, PlaneColor, RangeId,
     Scenario, Settings, UnitKind, Units, default_bindings, is_builtin, key_name,
 };
+use crate::turrets::{MAX_GUNS, Turret, TurretPlace};
 use crate::weapons::{
     BELLY_BACK_MAX, BELLY_BACK_MIN, CONVERGENCE_CHOICES, GunCard, Loadout, MILS_TO_M_AT_500, Slot,
-    TracerColor, WING_OUT_MAX, WING_OUT_MIN, is_builtin_gun,
+    TracerColor, WING_OUT_MIN, is_builtin_gun,
 };
 
 pub struct MenuPlugin;
@@ -132,6 +133,7 @@ enum ScrollList {
     Presets,
     Guns,
     Dropdown,
+    Turrets,
 }
 
 /// Remembered scroll offsets, kept outside `MenuUi` so scrolling doesn't
@@ -141,6 +143,7 @@ struct ScrollMemory {
     presets: f32,
     guns: f32,
     dropdown: f32,
+    turrets: f32,
 }
 
 impl ScrollMemory {
@@ -149,6 +152,7 @@ impl ScrollMemory {
             ScrollList::Presets => &mut self.presets,
             ScrollList::Guns => &mut self.guns,
             ScrollList::Dropdown => &mut self.dropdown,
+            ScrollList::Turrets => &mut self.turrets,
         }
     }
 }
@@ -165,6 +169,8 @@ const PRESET_ROWS: f32 = 7.5;
 struct Draft {
     engine: Option<EngineKind>,
     afterburner: Option<bool>,
+    model: Option<crate::models::ModelKind>,
+    damage: Option<crate::damage::DamageModel>,
     fields: [String; Field::ALL.len()],
 }
 
@@ -286,12 +292,29 @@ impl Draft {
         Draft {
             engine: Some(card.engine),
             afterburner: Some(card.afterburner),
+            model: card.model,
+            damage: card.damage,
             fields,
         }
     }
 
     fn get(&self, f: Field) -> &str {
         self.fields[f.index()].trim()
+    }
+
+    /// The model shown: the one picked, or the one the engines suggest.
+    fn model_kind(&self) -> crate::models::ModelKind {
+        self.model.unwrap_or_else(|| {
+            let engines = self.get(Field::Engines).parse::<u32>().unwrap_or(1);
+            crate::models::ModelKind::guess(self.engine.unwrap_or(EngineKind::Prop), engines)
+        })
+    }
+
+    fn damage_model(&self) -> crate::damage::DamageModel {
+        self.damage.unwrap_or(match self.model_kind() {
+            crate::models::ModelKind::Bomber => crate::damage::DamageModel::Bomber,
+            _ => crate::damage::DamageModel::Fighter,
+        })
     }
 
     /// Build a card from the fields. Blank optional fields stay blank, and
@@ -354,6 +377,8 @@ impl Draft {
             afterburner: self.afterburner.unwrap_or(base.afterburner),
             afterburner_thrust: optional(Field::AbThrust, units.unit(UnitKind::Thrust).1)?,
             weapons: base.weapons.clone(),
+            model: self.model.or(base.model),
+            damage: self.damage.or(base.damage),
         };
         if card.power <= 0.0 || card.climb_rate <= 0.0 || card.top_speed <= 0.0 {
             return Err("Power, climb rate and top speed must be above zero.".into());
@@ -395,10 +420,11 @@ enum GunField {
     Caliber,
     Spread,
     Hits,
+    Tracers,
 }
 
 impl GunField {
-    const ALL: [GunField; 7] = [
+    const ALL: [GunField; 8] = [
         GunField::Name,
         GunField::Velocity,
         GunField::Mass,
@@ -406,6 +432,7 @@ impl GunField {
         GunField::Caliber,
         GunField::Spread,
         GunField::Hits,
+        GunField::Tracers,
     ];
 
     fn index(self) -> usize {
@@ -421,6 +448,7 @@ impl GunField {
             GunField::Caliber => ("Caliber (optional)", "mm"),
             GunField::Spread => ("Spread at 500 m (optional)", "m"),
             GunField::Hits => ("Hits to kill (optional)", "hits"),
+            GunField::Tracers => ("Tracers, 1 in (optional)", "rounds"),
         }
     }
 }
@@ -450,6 +478,7 @@ impl GunDraft {
                     .map(|v| n(v * MILS_TO_M_AT_500))
                     .unwrap_or_default(),
                 GunField::Hits => gun.hits_to_kill.map(n).unwrap_or_default(),
+                GunField::Tracers => gun.tracers.map(|t| t.to_string()).unwrap_or_default(),
             };
         }
         GunDraft {
@@ -492,6 +521,7 @@ impl GunDraft {
             spread: num(GunField::Spread)?.map(|m| m / MILS_TO_M_AT_500),
             tracer: self.tracer,
             hits_to_kill: num(GunField::Hits)?.map(|h| h.round().max(1.0)),
+            tracers: num(GunField::Tracers)?.map(|t| t.round().max(1.0) as u32),
         };
         if gun.projectile_mass > 5.0 {
             return Err("Projectile mass is in kg (a 20 mm round is about 0.1).".into());
@@ -526,6 +556,8 @@ enum MenuAction {
     DeletePreset,
     ToggleEngine,
     ToggleAfterburner,
+    CycleModel,
+    CycleDamage,
     SavePreset,
     PickPlayerAircraft(String),
     PickTargetAircraft(String),
@@ -537,6 +569,12 @@ enum MenuAction {
     PickTracer(TracerColor),
     PickMountGun(Slot, String),
     MountCount(Slot, i32),
+    AddTurret(TurretPlace),
+    RemoveTurret(u8),
+    /// Next gun preset for a turret.
+    TurretGun(u8),
+    TurretFacing(u8),
+    TurretStep(u8, TurretSetting, i32),
     PickStationGun(Slot, u8, String),
     /// Gun targeting distance, m (0 = off).
     SetConvergence(u32),
@@ -1135,6 +1173,23 @@ fn aircraft_page(
                         ..default()
                     });
                 });
+                for (text, action, value) in [
+                    ("Model", MenuAction::CycleModel, ui.draft.model_kind().label()),
+                    (
+                        "Damage model",
+                        MenuAction::CycleDamage,
+                        ui.draft.damage_model().label(),
+                    ),
+                ] {
+                    col.spawn(row()).with_children(|r| {
+                        r.spawn((label(text, 15.0, TEXT), grow()));
+                        r.spawn(button(action, value, px(150)));
+                        r.spawn(Node {
+                            width: px(52),
+                            ..default()
+                        });
+                    });
+                }
                 let afterburner = engine == EngineKind::Jet && ui.draft.afterburner == Some(true);
                 if engine == EngineKind::Jet {
                     col.spawn(row()).with_children(|r| {
@@ -1552,7 +1607,7 @@ fn weapons_page(
                                 SliderId::WingOut,
                                 loadout.wing_out,
                                 WING_OUT_MIN,
-                                WING_OUT_MAX,
+                                card.model_kind().spec().wing_out_max(),
                                 "From wing root",
                             )
                         };
@@ -1602,7 +1657,195 @@ fn weapons_page(
                 });
                 col.spawn(button(MenuAction::Resume, "Resume", percent(100)));
             });
+
+            // Far right: turrets.
+            cols.spawn(column(px(330))).with_children(|col| {
+                turret_editor(col, settings, ui, scroll);
+            });
         });
+}
+
+/// A turret setting changed with - and + buttons.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TurretSetting {
+    Guns,
+    Left,
+    Right,
+    Down,
+    Up,
+    Speed,
+}
+
+impl TurretSetting {
+    fn label(self) -> &'static str {
+        match self {
+            TurretSetting::Guns => "Guns",
+            TurretSetting::Left => "Left",
+            TurretSetting::Right => "Right",
+            TurretSetting::Down => "Down",
+            TurretSetting::Up => "Up",
+            TurretSetting::Speed => "Speed",
+        }
+    }
+
+    fn text(self, t: &Turret) -> String {
+        match self {
+            TurretSetting::Guns => t.guns().to_string(),
+            TurretSetting::Left => format!("{:.0}", t.yaw_left),
+            TurretSetting::Right => format!("{:.0}", t.yaw_right),
+            TurretSetting::Down => format!("{:.0}", t.pitch_down),
+            TurretSetting::Up => format!("{:.0}", t.pitch_up),
+            TurretSetting::Speed => format!("{:.0}/s", t.speed),
+        }
+    }
+
+    fn step(self, t: &mut Turret, delta: i32) {
+        let d = delta as f32;
+        match self {
+            TurretSetting::Guns => {
+                t.count = (t.guns() as i32 + delta).clamp(1, MAX_GUNS as i32) as u32
+            }
+            TurretSetting::Left => t.yaw_left = (t.yaw_left + 5.0 * d).clamp(0.0, 180.0),
+            TurretSetting::Right => t.yaw_right = (t.yaw_right + 5.0 * d).clamp(0.0, 180.0),
+            TurretSetting::Down => t.pitch_down = (t.pitch_down + 5.0 * d).clamp(0.0, 90.0),
+            TurretSetting::Up => t.pitch_up = (t.pitch_up + 5.0 * d).clamp(0.0, 90.0),
+            TurretSetting::Speed => t.speed = (t.speed + 5.0 * d).clamp(5.0, 360.0),
+        }
+    }
+}
+
+/// The turret list for the aircraft preset on the weapons page.
+fn turret_editor(
+    col: &mut ChildSpawnerCommands,
+    settings: &Settings,
+    ui: &MenuUi,
+    scroll: &ScrollMemory,
+) {
+    let card = settings.card(&ui.loadout_for);
+    let turrets = &card.weapons.turrets;
+    col.spawn(section_header(&format!("Turrets ({})", turrets.len())));
+    col.spawn(label(
+        "All aim 400 m out. F6 to man them, F3 to fly. Limits and speed in degrees.",
+        13.0,
+        DIM,
+    ));
+    col.spawn(row()).with_children(|r| {
+        for place in TurretPlace::ALL {
+            let n = turrets.iter().filter(|t| t.place == place).count();
+            let mut b = r.spawn(button(
+                MenuAction::AddTurret(place),
+                &format!("+ {}", place.label()),
+                px(if place == TurretPlace::Bottom {
+                    90.0
+                } else {
+                    68.0
+                }),
+            ));
+            if n >= place.max() {
+                b.insert(Selected);
+            }
+        }
+    });
+    col.spawn((
+        scroll_list(ScrollList::Turrets, scroll.turrets),
+        Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: px(5),
+            max_height: px(470),
+            overflow: Overflow::scroll_y(),
+            ..default()
+        },
+    ))
+    .with_children(|list| {
+        if turrets.is_empty() {
+            list.spawn(label("No turrets.", 14.0, DIM));
+        }
+        for (i, t) in turrets.iter().enumerate() {
+            let i = i as u8;
+            let nth = turrets[..i as usize]
+                .iter()
+                .filter(|o| o.place == t.place)
+                .count()
+                + 1;
+            let name = if t.place.max() > 1 {
+                format!("{} turret {nth}", t.place.label())
+            } else {
+                format!("{} turret", t.place.label())
+            };
+            list.spawn(row()).with_children(|r| {
+                r.spawn((label(&name, 16.0, TEXT), grow()));
+                r.spawn(button(MenuAction::RemoveTurret(i), "Remove", px(80)));
+            });
+            list.spawn(row()).with_children(|r| {
+                r.spawn(button(
+                    MenuAction::TurretGun(i),
+                    &settings.gun(&t.gun).name,
+                    px(170),
+                ));
+                stepper(r, i, TurretSetting::Guns, t);
+            });
+            if t.place.slides() {
+                list.spawn(row()).with_children(|r| {
+                    let id = SliderId::TurretPos(i);
+                    r.spawn(slider(id, t.position, 0.0, 1.0, px(150)));
+                    r.spawn((
+                        label(&slider_text(id, t.position, settings.units), 13.0, TEXT),
+                        TextLayout::no_wrap(),
+                        SliderLabel(id),
+                        grow(),
+                    ));
+                    r.spawn(button(
+                        MenuAction::TurretFacing(i),
+                        if t.faces_back {
+                            "Faces back"
+                        } else {
+                            "Faces fwd"
+                        },
+                        px(90),
+                    ));
+                });
+            }
+            for pair in [
+                [TurretSetting::Left, TurretSetting::Right],
+                [TurretSetting::Down, TurretSetting::Up],
+            ] {
+                list.spawn(row()).with_children(|r| {
+                    for s in pair {
+                        stepper(r, i, s, t);
+                    }
+                });
+            }
+            list.spawn(row()).with_children(|r| {
+                stepper(r, i, TurretSetting::Speed, t);
+            });
+            list.spawn(Node {
+                height: px(6),
+                ..default()
+            });
+        }
+    });
+}
+
+/// "Label - value +" for one turret setting.
+fn stepper(r: &mut ChildSpawnerCommands, i: u8, s: TurretSetting, t: &Turret) {
+    r.spawn((
+        label(s.label(), 13.0, DIM),
+        Node {
+            width: px(40),
+            ..default()
+        },
+    ));
+    r.spawn(button(MenuAction::TurretStep(i, s, -1), "-", px(28)));
+    r.spawn((
+        label(&s.text(t), 14.0, TEXT),
+        Node {
+            width: px(52),
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+        TextLayout::justify(Justify::Center),
+    ));
+    r.spawn(button(MenuAction::TurretStep(i, s, 1), "+", px(28)));
 }
 
 fn units_page(
@@ -1770,13 +2013,18 @@ fn slot_z(slot: Slot, sub: i32) -> i32 {
 enum SliderId {
     BellyBack,
     WingOut,
+    /// How far along the fuselage a top or bottom turret sits.
+    TurretPos(u8),
 }
 
 /// The text showing a slider's value.
 #[derive(Component)]
 struct SliderLabel(SliderId);
 
-fn slider_text(_id: SliderId, m: f32, units: Units) -> String {
+fn slider_text(id: SliderId, m: f32, units: Units) -> String {
+    if let SliderId::TurretPos(_) = id {
+        return format!("{:.0}% to nose", m * 100.0);
+    }
     let (name, per) = units.altitude_unit();
     format!("{:.1} {name}", m * per)
 }
@@ -1801,7 +2049,11 @@ fn slider(id: SliderId, value: f32, min: f32, max: f32, width: Val) -> impl Bund
         },
         SliderValue(value),
         SliderRange::new(min, max),
-        SliderPrecision(1),
+        SliderPrecision(if matches!(id, SliderId::TurretPos(_)) {
+            2
+        } else {
+            1
+        }),
         Children::spawn((
             Spawn((
                 Node {
@@ -1873,6 +2125,11 @@ fn on_slider_change(
         edit_loadout(&mut settings, &mut ui, |l| match id {
             SliderId::BellyBack => l.belly_back = value,
             SliderId::WingOut => l.wing_out = value,
+            SliderId::TurretPos(i) => {
+                if let Some(t) = l.turrets.get_mut(i as usize) {
+                    t.position = value;
+                }
+            }
         });
     }
 }
@@ -2270,6 +2527,14 @@ fn on_menu_click(
             let ui = ui.as_mut();
             ui.draft.afterburner = Some(!ui.draft.afterburner.unwrap_or(false));
         }
+        MenuAction::CycleModel => {
+            let ui = ui.as_mut();
+            ui.draft.model = Some(ui.draft.model_kind().next());
+        }
+        MenuAction::CycleDamage => {
+            let ui = ui.as_mut();
+            ui.draft.damage = Some(ui.draft.damage_model().next());
+        }
         MenuAction::SavePreset => {
             let base = settings.card(&ui.editing).clone();
             match ui.draft.to_card(&base, settings.units) {
@@ -2398,6 +2663,46 @@ fn on_menu_click(
             edit_loadout(&mut settings, &mut ui, |l| {
                 let m = l.mount_mut(slot);
                 m.count = (m.count as i32 + delta).clamp(0, slot.max() as i32) as u32;
+            });
+        }
+        MenuAction::AddTurret(place) => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                if l.turrets.iter().filter(|t| t.place == place).count() < place.max() {
+                    l.turrets.push(Turret::new(place));
+                }
+            });
+        }
+        MenuAction::RemoveTurret(i) => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                if (i as usize) < l.turrets.len() {
+                    l.turrets.remove(i as usize);
+                }
+            });
+        }
+        MenuAction::TurretGun(i) => {
+            let names: Vec<String> = settings.guns.iter().map(|g| g.name.clone()).collect();
+            edit_loadout(&mut settings, &mut ui, |l| {
+                if let Some(t) = l.turrets.get_mut(i as usize) {
+                    let at = names.iter().position(|n| *n == t.gun);
+                    let next = at.map_or(0, |k| (k + 1) % names.len().max(1));
+                    if let Some(n) = names.get(next) {
+                        t.gun = n.clone();
+                    }
+                }
+            });
+        }
+        MenuAction::TurretFacing(i) => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                if let Some(t) = l.turrets.get_mut(i as usize) {
+                    t.faces_back = !t.faces_back;
+                }
+            });
+        }
+        MenuAction::TurretStep(i, what, delta) => {
+            edit_loadout(&mut settings, &mut ui, |l| {
+                if let Some(t) = l.turrets.get_mut(i as usize) {
+                    what.step(t, delta);
+                }
             });
         }
         MenuAction::SetConvergence(m) => {

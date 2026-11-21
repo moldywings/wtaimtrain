@@ -21,6 +21,46 @@ pub struct Pilot {
     pub break_off: f32,
     /// Which way it breaks (+1 right, -1 left).
     pub break_side: f32,
+    /// How hard it swerves when it's being shot at: 0 never does.
+    pub dodge: f32,
+    /// The current swerve (yaw, pitch offsets, rad) and how long it lasts.
+    swerve: Vec2,
+    swerve_left: f32,
+    seed: u32,
+}
+
+impl Pilot {
+    /// A pilot with a random temper: some swerve away from gunners firing
+    /// at them, some don't bother.
+    pub fn random(seed: u32) -> Pilot {
+        let mut p = Pilot {
+            seed: seed | 1,
+            ..default()
+        };
+        let r = p.rand();
+        p.dodge = if r < 0.35 {
+            0.0
+        } else if r < 0.7 {
+            0.5
+        } else {
+            1.0
+        };
+        p
+    }
+
+    /// 0..1
+    fn rand(&mut self) -> f32 {
+        let mut x = if self.seed == 0 {
+            0x2545_F491
+        } else {
+            self.seed
+        };
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.seed = x;
+        x as f32 / u32::MAX as f32
+    }
 }
 
 /// The plane it's after.
@@ -28,6 +68,24 @@ pub struct Pilot {
 pub struct Foe {
     pub position: Vec3,
     pub velocity: Vec3,
+    /// Where to put the rounds: the middle of the plane, or a bomber's
+    /// cockpit or turret.
+    pub aim: Vec3,
+    /// It's shooting back at us right now.
+    pub shooting: bool,
+}
+
+impl Foe {
+    /// A plane to aim at the middle of.
+    #[cfg(test)]
+    pub fn at(position: Vec3, velocity: Vec3) -> Foe {
+        Foe {
+            position,
+            velocity,
+            aim: position,
+            shooting: false,
+        }
+    }
 }
 
 /// The biggest gun on a card (what the AI aims with), looked up by name.
@@ -111,7 +169,7 @@ pub fn decide(
 
     let rel = foe.position - pos;
     let range = rel.length();
-    let lead = gun.and_then(|g| lead_direction(g, pos, body.velocity, foe.position, foe.velocity));
+    let lead = gun.and_then(|g| lead_direction(g, pos, body.velocity, foe.aim, foe.velocity));
     let closing_speed = -(foe.velocity - body.velocity).dot(rel.normalize_or_zero());
 
     // Too close and closing fast: break away to one side, then turn back in.
@@ -147,6 +205,25 @@ pub fn decide(
         if pos.y > FLOOR * 2.0 && wanted_turn > 0.35 {
             aim = (aim - Vec3::Y * 0.12).normalize();
         }
+    }
+    // Being shot at: some pilots swerve a little to spoil the gunner's aim.
+    if foe.shooting && pilot.dodge > 0.0 && pilot.break_off <= 0.0 && range < 1500.0 {
+        pilot.swerve_left -= dt;
+        if pilot.swerve_left <= 0.0 {
+            let k = pilot.dodge;
+            let yaw = (pilot.rand() * 2.0 - 1.0) * (4.0 + 6.0 * k);
+            let pitch = (pilot.rand() * 2.0 - 1.0) * (2.0 + 4.0 * k);
+            pilot.swerve = Vec2::new(yaw.to_radians(), pitch.to_radians());
+            pilot.swerve_left = 0.6 + pilot.rand() * 0.8;
+        }
+        let right = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = right.cross(aim).normalize_or(Vec3::Y);
+        aim = (Quat::from_axis_angle(up, -pilot.swerve.x)
+            * Quat::from_axis_angle(right, pilot.swerve.y)
+            * aim)
+            .normalize();
+    } else {
+        pilot.swerve_left = 0.0;
     }
     // Keep clear of the floor while fighting.
     if pos.y < FLOOR {
@@ -206,16 +283,10 @@ mod tests {
         let mut body = Body::new(Vec3::new(0.0, 900.0, 0.0), rot, 150.0);
         let mut pilot = Pilot::default();
         // An enemy right below, tempting it to dive.
-        let foe = Foe {
-            position: Vec3::new(0.0, 50.0, -300.0),
-            velocity: Vec3::new(0.0, 0.0, -100.0),
-        };
+        let foe = Foe::at(Vec3::new(0.0, 50.0, -300.0), Vec3::new(0.0, 0.0, -100.0));
         let mut lowest = f32::MAX;
         for _ in 0..(20 * 60) {
-            let f = Foe {
-                position: foe.position.with_y(50.0),
-                ..foe
-            };
+            let f = Foe::at(foe.position.with_y(50.0), foe.velocity);
             let d = decide(&card, &model, &body, None, Some(f), &mut pilot, 1.0 / 60.0);
             fly(&model, &mut body, &d, 1.0 / 60.0);
             lowest = lowest.min(body.position.y);
@@ -238,14 +309,8 @@ mod tests {
         let dt = 1.0 / 60.0;
         let (mut fire_a, mut fire_b, mut lowest) = (0, 0, f32::MAX);
         for _ in 0..(120 * 60) {
-            let fa = Foe {
-                position: b.position,
-                velocity: b.velocity,
-            };
-            let fb = Foe {
-                position: a.position,
-                velocity: a.velocity,
-            };
+            let fa = Foe::at(b.position, b.velocity);
+            let fb = Foe::at(a.position, a.velocity);
             let da = decide(&card, &model, &a, Some(&gun), Some(fa), &mut pa, dt);
             let db = decide(&card, &model, &b, Some(&gun), Some(fb), &mut pb, dt);
             fly(&model, &mut a, &da, dt);
@@ -262,15 +327,68 @@ mod tests {
         );
     }
 
+    /// Against a bomber it puts its rounds on the weak spot it's given.
+    #[test]
+    fn aims_at_the_part_it_is_told() {
+        let (card, model) = yak();
+        let gun = GunCard::shvak();
+        let body = Body::new(Vec3::new(0.0, 2000.0, 0.0), Quat::IDENTITY, 150.0);
+        let mut foe = Foe::at(Vec3::new(0.0, 2000.0, -400.0), Vec3::new(0.0, 0.0, -120.0));
+        let mid = decide(
+            &card,
+            &model,
+            &body,
+            Some(&gun),
+            Some(foe),
+            &mut Pilot::default(),
+            0.016,
+        );
+        foe.aim = foe.position + Vec3::Y * 8.0;
+        let top = decide(
+            &card,
+            &model,
+            &body,
+            Some(&gun),
+            Some(foe),
+            &mut Pilot::default(),
+            0.016,
+        );
+        assert!(top.aim.y > mid.aim.y + 0.01, "{} vs {}", top.aim, mid.aim);
+    }
+
+    /// A dodging pilot swerves while shot at; a calm one doesn't.
+    #[test]
+    fn some_pilots_swerve_when_shot_at() {
+        let (card, model) = yak();
+        let body = Body::new(Vec3::new(0.0, 2000.0, 0.0), Quat::IDENTITY, 150.0);
+        let mut foe = Foe::at(Vec3::new(0.0, 2000.0, -900.0), Vec3::new(0.0, 0.0, -120.0));
+        foe.shooting = true;
+        let calm = decide(
+            &card,
+            &model,
+            &body,
+            None,
+            Some(foe),
+            &mut Pilot::default(),
+            0.016,
+        );
+        let mut jumpy = Pilot {
+            dodge: 1.0,
+            seed: 7,
+            ..Pilot::default()
+        };
+        let swerved = decide(&card, &model, &body, None, Some(foe), &mut jumpy, 0.016);
+        assert!(swerved.aim.angle_between(calm.aim) > 1f32.to_radians());
+        let seeds: Vec<f32> = (1..40).map(|s| Pilot::random(s * 7919).dodge).collect();
+        assert!(seeds.contains(&0.0) && seeds.iter().any(|d| *d > 0.0));
+    }
+
     /// Behind a slower enemy, it eases the throttle instead of overshooting.
     #[test]
     fn eases_off_to_stay_behind() {
         let (card, model) = yak();
         let body = Body::new(Vec3::new(0.0, 2000.0, 0.0), Quat::IDENTITY, 160.0);
-        let foe = Foe {
-            position: Vec3::new(0.0, 2000.0, -250.0),
-            velocity: Vec3::new(0.0, 0.0, -90.0),
-        };
+        let foe = Foe::at(Vec3::new(0.0, 2000.0, -250.0), Vec3::new(0.0, 0.0, -90.0));
         let d = decide(
             &card,
             &model,

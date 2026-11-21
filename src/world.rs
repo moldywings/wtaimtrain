@@ -68,9 +68,13 @@ fn spawn_world(
             if center.length() > FARMLAND_RADIUS {
                 continue;
             }
-            let turn = Vec2::from_angle(rng.range(-0.5, 0.5));
+            let angle = rng.range(-0.5, 0.5);
+            let turn = Vec2::from_angle(angle);
             let size = rng.range(220.0, 480.0);
-            let cells = (DISTRICT / size).floor() as i32;
+            // Turned, the district (and its roads) must still fit in its own
+            // square, or its fields overlap the neighbors' and flicker.
+            let fits = (DISTRICT / 2.0 - 20.0) / (angle.cos().abs() + angle.sin().abs());
+            let cells = (2.0 * fits / size).floor().max(1.0) as i32;
             let half = cells as f32 * size / 2.0;
             for i in 0..cells {
                 for j in 0..cells {
@@ -152,24 +156,28 @@ fn spawn_clouds(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let puff = meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap());
-    // Slightly see-through.
-    let white = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.96, 0.97, 1.0, CLOUD_ALPHA),
+    // Each cloud is one mesh, so its puffs always draw in the same order
+    // (no flicker as the camera moves). Unlit, with the shading baked into
+    // vertex colors, so flying through one stays cheap.
+    let material = materials.add(StandardMaterial {
+        // Above 1 so the vertex colors come out bright after tone mapping.
+        base_color: Color::linear_rgba(1.4, 1.4, 1.4, 1.0),
         alpha_mode: AlphaMode::Blend,
-        emissive: LinearRgba::rgb(0.35, 0.36, 0.38),
-        perceptual_roughness: 1.0,
-        reflectance: 0.0,
+        unlit: true,
         ..default()
     });
-    let shade = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.85, 0.87, 0.92, CLOUD_ALPHA),
-        alpha_mode: AlphaMode::Blend,
-        emissive: LinearRgba::rgb(0.28, 0.29, 0.32),
-        perceptual_roughness: 1.0,
-        reflectance: 0.0,
-        ..default()
-    });
+    let sphere = Sphere::new(1.0).mesh().ico(2).unwrap();
+    let positions: Vec<Vec3> = match sphere.attribute(Mesh::ATTRIBUTE_POSITION) {
+        Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) => {
+            p.iter().map(|v| Vec3::from(*v)).collect()
+        }
+        _ => Vec::new(),
+    };
+    let indices: Vec<u32> = sphere
+        .indices()
+        .map(|i| i.iter().map(|i| i as u32).collect())
+        .unwrap_or_default();
+    let sun = Vec3::new(-0.4, 1.0, 0.6).normalize();
     let mut rng = Lcg(0xc10d_5eed);
     for _ in 0..CLOUD_COUNT {
         let x = rng.range(-CLOUD_RANGE, CLOUD_RANGE);
@@ -177,28 +185,51 @@ fn spawn_clouds(
         // Several layers, so climbing and diving go past them too.
         let y = rng.range(700.0, 4_500.0);
         let size = rng.range(60.0, 220.0);
-        commands
-            .spawn((Transform::from_xyz(x, y, z), Visibility::default(), Cloud))
-            .with_children(|c| {
-                let puffs = 4 + rng.index(6);
-                for i in 0..puffs {
-                    let r = size * rng.range(0.45, 1.0);
-                    let at = Vec3::new(
-                        rng.range(-1.6, 1.6) * size,
-                        rng.range(-0.15, 0.35) * size,
-                        rng.range(-1.0, 1.0) * size,
-                    );
-                    c.spawn((
-                        Mesh3d(puff.clone()),
-                        MeshMaterial3d(if i % 3 == 2 {
-                            shade.clone()
-                        } else {
-                            white.clone()
-                        }),
-                        Transform::from_translation(at).with_scale(Vec3::new(r, r * 0.55, r)),
-                    ));
-                }
-            });
+        let mut pos = Vec::new();
+        let mut normals = Vec::new();
+        let mut colors = Vec::new();
+        let mut idx = Vec::new();
+        let puffs = 4 + rng.index(6);
+        for i in 0..puffs {
+            let r = size * rng.range(0.45, 1.0);
+            let at = Vec3::new(
+                rng.range(-1.6, 1.6) * size,
+                rng.range(-0.15, 0.35) * size,
+                rng.range(-1.0, 1.0) * size,
+            );
+            let scale = Vec3::new(r, r * 0.55, r);
+            let tint = if i % 3 == 2 { 0.9 } else { 1.0 };
+            let base = pos.len() as u32;
+            for v in &positions {
+                pos.push((at + *v * scale).to_array());
+                let n = (*v / scale).normalize_or(Vec3::Y);
+                normals.push(n.to_array());
+                // Bright on top and toward the sun, grey underneath.
+                let light = 0.72 + 0.18 * n.y + 0.1 * n.dot(sun).max(0.0);
+                let c = Color::srgb(
+                    0.97 * light * tint,
+                    0.98 * light * tint,
+                    1.0 * light * tint.max(0.94),
+                )
+                .to_linear();
+                colors.push([c.red, c.green, c.blue, CLOUD_ALPHA]);
+            }
+            idx.extend(indices.iter().map(|i| base + i));
+        }
+        let mesh = Mesh::new(
+            bevy::mesh::PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::RENDER_WORLD,
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+        .with_inserted_indices(bevy::mesh::Indices::U32(idx));
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(material.clone()),
+            Transform::from_xyz(x, y, z),
+            Cloud,
+        ));
     }
 }
 

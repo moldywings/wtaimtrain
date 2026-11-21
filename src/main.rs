@@ -9,38 +9,23 @@
 
 mod ai;
 mod camera;
+mod damage;
 mod flight;
 mod flight_model;
 mod hud;
 mod menu;
+mod models;
 mod multiplayer;
 mod names;
 mod settings;
 mod sound;
 mod target;
+mod turrets;
 mod weapons;
 mod world;
 
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
-
-/// Path of the shared aircraft model, relative to `assets/`.
-pub const AIRPLANE_MODEL: &str = "models/airplane.glb";
-
-/// The model is about 0.75x a real Yak-3 (8.5 m long, 9.2 m span).
-/// Scale it up so ranges and lead angles look right.
-pub const MODEL_SCALE: f32 = 1.33;
-
-/// The model's nose points +Z; Bevy treats -Z as forward.
-/// Height in the model of the fuselage's center line, which the plane
-/// rolls about (the model's origin is at the bottom of the fuselage).
-pub const MODEL_ROLL_AXIS_Y: f32 = 0.6;
-
-pub fn model_correction() -> Transform {
-    Transform::from_rotation(Quat::from_rotation_y(std::f32::consts::PI))
-        .with_scale(Vec3::splat(MODEL_SCALE))
-        .with_translation(Vec3::new(0.0, -MODEL_ROLL_AXIS_Y * MODEL_SCALE, 0.0))
-}
 
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GameState {
@@ -71,6 +56,8 @@ fn main() {
             weapons::WeaponsPlugin,
             sound::SoundPlugin,
             multiplayer::MultiplayerPlugin,
+            models::ModelsPlugin,
+            turrets::TurretsPlugin,
         ))
         .add_systems(OnEnter(GameState::Playing), (resume_time, capture_cursor))
         .add_systems(OnEnter(GameState::Paused), release_cursor)

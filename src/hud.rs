@@ -5,12 +5,13 @@ use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 
 use crate::GameState;
-use crate::camera::{ChaseCamera, MouseAim};
+use crate::camera::{ChaseCamera, GunnerView, MouseAim};
 use crate::flight::{Aircraft, Player};
 use crate::flight_model::air_density;
 use crate::multiplayer::{Mp, RemotePlane};
 use crate::settings::{Crosshair, CrosshairColor, Settings};
 use crate::target::Target;
+use crate::turrets::{CONVERGENCE, Turrets};
 use crate::weapons::GunBook;
 
 pub struct HudPlugin;
@@ -65,6 +66,19 @@ struct StallWarning;
 
 #[derive(Component)]
 struct HelpText;
+
+/// Gunner view: the sight in the middle of the screen.
+#[derive(Component)]
+struct GunnerSight;
+
+/// Gunner view: where one turret's guns point (by its place in the list).
+#[derive(Component)]
+struct TurretMarker(usize);
+
+const SIGHT_SIZE: f32 = 34.0;
+const TURRET_MARK: f32 = 12.0;
+/// Most turrets a plane can have.
+const MAX_TURRETS: usize = 6;
 
 const AIM_SIZE: f32 = 26.0;
 const CROSSHAIR_SIZE: f32 = 40.0;
@@ -163,6 +177,28 @@ fn spawn_hud(mut commands: Commands) {
         Visibility::Hidden,
         GunCrosshair,
     ));
+
+    commands
+        .spawn((
+            absolute(SIGHT_SIZE, SIGHT_SIZE),
+            Visibility::Hidden,
+            GunnerSight,
+        ))
+        .with_children(|m| {
+            m.spawn(ring(SIGHT_SIZE, SIGHT_SIZE, 2.0, RETICLE_GOLD));
+            m.spawn(dot(SIGHT_SIZE, 3.0, RETICLE_GOLD));
+        });
+    for i in 0..MAX_TURRETS {
+        commands
+            .spawn((
+                absolute(TURRET_MARK, TURRET_MARK),
+                Visibility::Hidden,
+                TurretMarker(i),
+            ))
+            .with_children(|m| {
+                m.spawn(ring(TURRET_MARK, TURRET_MARK, 2.0, RETICLE_WHITE));
+            });
+    }
 
     // Edge arrow: a red chevron, turned to point at the target.
     commands
@@ -392,7 +428,16 @@ fn update_hud(
     state: Res<State<GameState>>,
     cursor: Single<&CursorOptions>,
     camera: Single<(&Camera, &GlobalTransform), With<ChaseCamera>>,
-    player: Single<(&GlobalTransform, &Aircraft, Option<&GunBook>), With<Player>>,
+    player: Single<
+        (
+            &GlobalTransform,
+            &Aircraft,
+            Option<&GunBook>,
+            Option<&Turrets>,
+        ),
+        With<Player>,
+    >,
+    gunner: Res<GunnerView>,
     target: Single<(&GlobalTransform, &Aircraft, &Target)>,
     mp: Res<Mp>,
     remotes: Query<(&GlobalTransform, &Aircraft, &RemotePlane), Without<Player>>,
@@ -404,6 +449,11 @@ fn update_hud(
         Single<&mut Visibility, With<HelpText>>,
         Single<(&mut Node, &mut Visibility), With<LeadMarker>>,
         Single<(&mut Node, &mut Visibility, &mut UiTransform), With<TargetArrow>>,
+        // Gunner view: the sight (no marker) and the turret markers.
+        Query<
+            (Option<&TurretMarker>, &mut Node, &mut Visibility),
+            Or<(With<GunnerSight>, With<TurretMarker>)>,
+        >,
     )>,
     mut texts: ParamSet<(
         Single<&mut Text, With<TargetName>>,
@@ -412,7 +462,8 @@ fn update_hud(
     )>,
 ) {
     let (cam, cam_tf) = *camera;
-    let (player_tf, plane, book) = *player;
+    let (player_tf, plane, book, turrets) = *player;
+    let gunning = gunner.active;
     let (target_tf, target_plane, target_state) = *target;
     let online = mp.online();
     let flying = mp.alive();
@@ -429,7 +480,7 @@ fn update_hud(
     let aim_point = cam_tf.translation() + aim.direction() * 20_000.0;
     place(
         nodes.p0().into_inner(),
-        project(aim_point).filter(|_| flying),
+        project(aim_point).filter(|_| flying && !gunning),
         Vec2::splat(AIM_SIZE / 2.0),
     );
 
@@ -437,9 +488,33 @@ fn update_hud(
     let nose_point = player_tf.translation() + player_tf.forward().as_vec3() * 20_000.0;
     place(
         nodes.p1().into_inner(),
-        project(nose_point).filter(|_| flying),
+        project(nose_point).filter(|_| flying && !gunning),
         Vec2::splat(CROSSHAIR_SIZE / 2.0),
     );
+
+    // Gunner view: the sight in the middle, and where each turret points.
+    let size = cam
+        .logical_viewport_size()
+        .unwrap_or(Vec2::new(1280.0, 720.0));
+    let list = turrets.map(|t| t.list.as_slice()).unwrap_or(&[]);
+    for (mark, node, vis) in &mut nodes.p7() {
+        let Some(mark) = mark else {
+            place(
+                (node, vis),
+                (gunning && flying).then_some(size / 2.0),
+                Vec2::splat(SIGHT_SIZE / 2.0),
+            );
+            continue;
+        };
+        let at = list
+            .get(mark.0)
+            .filter(|t| gunning && flying && !t.lost)
+            .and_then(|t| {
+                let point = player_tf.transform_point(t.mount + t.direction() * CONVERGENCE);
+                project(point)
+            });
+        place((node, vis), at, Vec2::splat(TURRET_MARK / 2.0));
+    }
 
     // Target marker, anchored so the diamond's center sits on the target.
     // (Online there's no target; other players have their own markers.)
@@ -472,12 +547,22 @@ fn update_hud(
     // Lead indicator, worked out for the biggest gun on the plane.
     let lead = (settings.lead_indicator && mp.lead_allowed() && flying)
         .then(|| {
-            plane
-                .card
-                .weapons
-                .guns()
-                .iter()
-                .map(|(_, g, _)| GunBook::gun(book, &settings, g))
+            let guns: Vec<String> = if gunning {
+                list.iter()
+                    .filter(|t| !t.lost)
+                    .map(|t| t.config.gun.clone())
+                    .collect()
+            } else {
+                plane
+                    .card
+                    .weapons
+                    .guns()
+                    .iter()
+                    .map(|(_, g, _)| g.to_string())
+                    .collect()
+            };
+            guns.iter()
+                .map(|g| GunBook::gun(book, &settings, g))
                 .max_by(|a, b| a.caliber_mm().total_cmp(&b.caliber_mm()))
                 .cloned()
         })
@@ -498,9 +583,6 @@ fn update_hud(
     // Edge arrow when the target is off screen.
     {
         let (mut node, mut vis, mut turn) = nodes.p6().into_inner();
-        let size = cam
-            .logical_viewport_size()
-            .unwrap_or(Vec2::new(1280.0, 720.0));
         let arrow_to = enemy.map(|e| e.0).filter(|_| flying);
         let on_screen = arrow_to
             .and_then(project)
@@ -524,11 +606,14 @@ fn update_hud(
         }
     }
 
-    texts.p0().0 = target_plane.model.name.clone();
-    texts.p1().0 = units.range(range);
+    texts
+        .p0()
+        .into_inner()
+        .set_if_neq(Text(target_plane.model.name.clone()));
+    texts.p1().into_inner().set_if_neq(Text(units.range(range)));
 
     let body = &plane.body;
-    texts.p2().0 = format!(
+    let readout = format!(
         "{}\nIAS {}\nTAS {}\nALT {}\nTHR {:.0} %{}\nG {:.1}",
         plane.model.name,
         units.speed(
@@ -544,28 +629,36 @@ fn update_hud(
         },
         body.g_load,
     );
-    **nodes.p3() = if plane.is_stalled() {
+    texts.p2().into_inner().set_if_neq(Text(readout));
+    nodes.p3().into_inner().set_if_neq(if plane.is_stalled() {
         Visibility::Visible
     } else {
         Visibility::Hidden
-    };
+    });
 
-    **nodes.p4() = if cursor.grab_mode == CursorGrabMode::None && *state.get() == GameState::Playing
-    {
-        Visibility::Visible
-    } else {
-        Visibility::Hidden
-    };
+    nodes.p4().into_inner().set_if_neq(
+        if cursor.grab_mode == CursorGrabMode::None && *state.get() == GameState::Playing {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        },
+    );
 }
 
 /// Move a marker so `anchor` (offset inside the marker) lands on `screen`.
+/// Only what changed is written, so a still marker doesn't redo the layout.
 fn place((mut node, mut vis): (Mut<Node>, Mut<Visibility>), screen: Option<Vec2>, anchor: Vec2) {
     match screen {
         Some(p) => {
-            node.left = px(p.x - anchor.x);
-            node.top = px(p.y - anchor.y);
-            *vis = Visibility::Visible;
+            let (left, top) = (px(p.x - anchor.x), px(p.y - anchor.y));
+            if node.left != left || node.top != top {
+                node.left = left;
+                node.top = top;
+            }
+            vis.set_if_neq(Visibility::Visible);
         }
-        None => *vis = Visibility::Hidden,
+        None => {
+            vis.set_if_neq(Visibility::Hidden);
+        }
     }
 }

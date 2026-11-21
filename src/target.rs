@@ -57,6 +57,7 @@ pub struct ResetScenario;
 #[derive(Message)]
 pub struct TargetHit {
     pub damage: f32,
+    pub part: crate::damage::HitPart,
 }
 
 /// One of the target's rounds hit you, taking away this fraction of your
@@ -64,6 +65,7 @@ pub struct TargetHit {
 #[derive(Message)]
 pub struct PlayerHit {
     pub damage: f32,
+    pub part: crate::damage::HitPart,
 }
 
 /// What the target is doing.
@@ -113,8 +115,9 @@ pub struct Target {
     roll: f32,
     /// Seconds until the next dodge.
     next_dodge: f32,
-    /// Fraction of the target destroyed (1 = gone).
-    damage: f32,
+    /// The damage it has taken, and whether that brought it down.
+    hurt: crate::damage::Damage,
+    down: bool,
     /// Its guns are on target and it's shooting.
     pub firing: bool,
     /// The dogfighting pilot (for the attack behavior).
@@ -129,14 +132,15 @@ impl Target {
             dodge: Vec2::ZERO,
             roll: 0.0,
             next_dodge: 0.0,
-            damage: 0.0,
+            hurt: Default::default(),
+            down: false,
             firing: false,
             pilot: crate::ai::Pilot::default(),
         }
     }
 
     pub fn destroyed(&self) -> bool {
-        self.damage >= 1.0
+        self.down
     }
 }
 
@@ -151,6 +155,9 @@ pub struct ScenarioState {
     destroyed_for: Option<f32>,
     /// Fraction of your plane destroyed by the target's fire (1 = down).
     pub player_damage: f32,
+    /// The damage you've taken, and whether it brought you down.
+    player_hurt: crate::damage::Damage,
+    player_shot_down: bool,
     /// Your shot count when the run started (to tell when you open fire).
     shots_at_start: u32,
     rng: Rng,
@@ -174,6 +181,8 @@ impl Default for ScenarioState {
             time: 0.0,
             destroyed_for: None,
             player_damage: 0.0,
+            player_hurt: Default::default(),
+            player_shot_down: false,
             shots_at_start: 0,
             rng: Rng(seed | 1),
             notice: None,
@@ -183,7 +192,7 @@ impl Default for ScenarioState {
 
 impl ScenarioState {
     pub fn player_down(&self) -> bool {
-        self.player_damage >= 1.0
+        self.player_shot_down
     }
 }
 
@@ -234,7 +243,6 @@ fn heading(dir: Vec3) -> Quat {
 
 fn spawn_target(
     mut commands: Commands,
-    assets: Res<AssetServer>,
     settings: Res<Settings>,
     mut reset: MessageWriter<ResetScenario>,
 ) {
@@ -246,22 +254,12 @@ fn spawn_target(
             100.0,
         ),
     );
-    commands
-        .spawn((
-            Transform::from_translation(aircraft.body.position),
-            Visibility::default(),
-            Target::new(Behavior::Straight { dir: Vec3::NEG_Z }),
-            aircraft,
-        ))
-        .with_children(|plane| {
-            plane.spawn((
-                WorldAssetRoot(
-                    assets.load(GltfAssetLabel::Scene(0).from_asset(crate::AIRPLANE_MODEL)),
-                ),
-                crate::model_correction(),
-                crate::weapons::PlaneModel,
-            ));
-        });
+    commands.spawn((
+        Transform::from_translation(aircraft.body.position),
+        Visibility::default(),
+        Target::new(Behavior::Straight { dir: Vec3::NEG_Z }),
+        aircraft,
+    ));
     reset.write(ResetScenario);
 }
 
@@ -305,9 +303,13 @@ fn reset_scenario(
     player: Single<(&mut Aircraft, &mut Transform), (With<Player>, Without<Target>)>,
     targets: Query<(&mut Aircraft, &mut Target, &mut Transform, &mut Visibility), Without<Player>>,
     shots: Res<HitStats>,
+    mut turrets: Query<&mut crate::turrets::Turrets>,
 ) {
     if messages.read().count() == 0 {
         return;
+    }
+    for mut t in &mut turrets {
+        t.lost = 0;
     }
     let (mut player, mut player_tf) = player.into_inner();
     let fraction = state.rng.range(
@@ -335,6 +337,8 @@ fn reset_scenario(
     state.time = 0.0;
     state.destroyed_for = None;
     state.player_damage = 0.0;
+    state.player_hurt = Default::default();
+    state.player_shot_down = false;
     state.shots_at_start = shots.shots;
 
     let ranges = settings.ranges;
@@ -428,7 +432,9 @@ fn reset_scenario(
                     let speed = model.top_speed(pos.y) * rng.range(0.45, 1.0);
                     // It hunts you and tries to shoot you down.
                     let behavior = Behavior::Attack;
-                    (Target::new(behavior), Body::new(pos, heading(dir), speed))
+                    let mut t = Target::new(behavior);
+                    t.pilot = crate::ai::Pilot::random((rng.unit() * u32::MAX as f32) as u32);
+                    (t, Body::new(pos, heading(dir), speed))
                 }
                 Scenario::Banking => {
                     let dist = pick(rng, ranges.banking);
@@ -507,11 +513,15 @@ fn offset_dir(dir: Vec3, yaw: f32, pitch: f32) -> Vec3 {
     (Quat::from_axis_angle(up, -yaw) * Quat::from_axis_angle(right, pitch) * dir).normalize()
 }
 
+#[allow(clippy::type_complexity)]
 pub fn fly_target(
     time: Res<Time>,
     settings: Res<Settings>,
     mut state: ResMut<ScenarioState>,
-    player: Single<&Aircraft, (With<Player>, Without<Target>)>,
+    player: Single<
+        (&Aircraft, &Transform, Option<&crate::turrets::Turrets>),
+        (With<Player>, Without<Target>),
+    >,
     mut targets: Query<(&mut Transform, &mut Aircraft, &mut Target), Without<Player>>,
     shots: Res<HitStats>,
 ) {
@@ -520,7 +530,8 @@ pub fn fly_target(
         return;
     }
     state.time += dt;
-    let player = &player.body;
+    let (player_plane, player_tf, player_turrets) = *player;
+    let player = &player_plane.body;
     for (mut tf, mut aircraft, mut target) in &mut targets {
         if target.destroyed() {
             continue;
@@ -579,6 +590,13 @@ pub fn fly_target(
                 let foe = (!state.player_down()).then_some(crate::ai::Foe {
                     position: player.position,
                     velocity: player.velocity,
+                    aim: crate::turrets::aim_point(
+                        &player_plane.card,
+                        player_tf,
+                        player_turrets,
+                        pos,
+                    ),
+                    shooting: player_turrets.is_some_and(|t| t.any_firing()),
                 });
                 let d = crate::ai::decide(
                     &aircraft.card,
@@ -734,13 +752,33 @@ pub fn fly_target(
     }
 }
 
-/// Count the target's hits on you; enough and you're shot down.
-fn take_player_hits(mut hits: MessageReader<PlayerHit>, mut state: ResMut<ScenarioState>) {
-    let damage: f32 = hits.read().map(|h| h.damage).sum();
-    if damage <= 0.0 || state.player_down() {
+/// Count the target's hits on you; enough (or one in the cockpit) and
+/// you're shot down.
+fn take_player_hits(
+    mut hits: MessageReader<PlayerHit>,
+    mut state: ResMut<ScenarioState>,
+    player: Single<(&Aircraft, Option<&mut crate::turrets::Turrets>), With<Player>>,
+) {
+    let (aircraft, turrets) = player.into_inner();
+    let mut any = false;
+    for h in hits.read() {
+        if state.player_down() {
+            break;
+        }
+        any = true;
+        state.player_hurt.hit(&aircraft.card, h.part, h.damage);
+        state.player_shot_down = state.player_hurt.destroyed(&aircraft.card);
+    }
+    if !any {
         return;
     }
-    state.player_damage += damage;
+    state.player_damage = state.player_hurt.airframe.min(1.0);
+    if let Some(mut t) = turrets {
+        let lost = state.player_hurt.lost_mask();
+        if t.lost != lost {
+            t.lost = lost;
+        }
+    }
     if state.player_down() && state.destroyed_for.is_none() {
         state.destroyed_for = Some(0.0);
         state.notice = Some((
@@ -760,17 +798,32 @@ fn take_hits(
     sounds: Res<Sounds>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    targets: Query<(&mut Target, &Transform, &mut Visibility)>,
+    targets: Query<(
+        &mut Target,
+        &Aircraft,
+        &Transform,
+        &mut Visibility,
+        Option<&mut crate::turrets::Turrets>,
+    )>,
 ) {
-    let damage: f32 = hits.read().map(|h| h.damage).sum();
-    if damage <= 0.0 {
+    let hits: Vec<_> = hits.read().map(|h| (h.part, h.damage)).collect();
+    if hits.is_empty() {
         return;
     }
-    for (mut target, tf, mut vis) in targets {
+    for (mut target, aircraft, tf, mut vis, turrets) in targets {
         if target.destroyed() {
             continue;
         }
-        target.damage += damage;
+        for (part, damage) in &hits {
+            target.hurt.hit(&aircraft.card, *part, *damage);
+        }
+        target.down = target.hurt.destroyed(&aircraft.card);
+        if let Some(mut t) = turrets {
+            let lost = target.hurt.lost_mask();
+            if t.lost != lost {
+                t.lost = lost;
+            }
+        }
         if target.destroyed() {
             *vis = Visibility::Hidden;
             state.destroyed_for = Some(0.0);
@@ -780,7 +833,13 @@ fn take_hits(
                 RESET_AFTER_KILL,
             ));
             sound::play(&mut commands, sounds.kill(), 0.3, 1.0);
-            spawn_explosion(&mut commands, &mut meshes, &mut materials, tf.translation);
+            spawn_explosion(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                tf.translation,
+                aircraft.card.model_kind().spec().reach() / 7.0,
+            );
         }
     }
 }
@@ -788,17 +847,20 @@ fn take_hits(
 #[derive(Component)]
 struct Explosion {
     age: f32,
+    size: f32,
 }
 
-/// The fireball when a plane is destroyed.
+/// The fireball when a plane (or, `size` well under 1, a turret) is
+/// destroyed. `size` 1 suits a fighter.
 pub fn spawn_explosion(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     at: Vec3,
+    size: f32,
 ) {
     commands.spawn((
-        Explosion { age: 0.0 },
+        Explosion { age: 0.0, size },
         Transform::from_translation(at),
         Mesh3d(meshes.add(Sphere::new(1.0))),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -830,7 +892,7 @@ fn fade_explosions(
             commands.entity(e).despawn();
             continue;
         }
-        tf.scale = Vec3::splat(3.0 + 14.0 * k.sqrt());
+        tf.scale = Vec3::splat((3.0 + 14.0 * k.sqrt()) * ex.size);
         if let Some(mut m) = materials.get_mut(&mat.0) {
             m.base_color = Color::srgba(
                 1.0,

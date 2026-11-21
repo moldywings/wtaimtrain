@@ -72,6 +72,11 @@ pub struct AircraftCard {
     pub afterburner_thrust: Option<f32>,
     /// Guns and where they're mounted.
     pub weapons: crate::weapons::Loadout,
+    /// Which 3D model it uses. Blank picks one from the engines.
+    pub model: Option<crate::models::ModelKind>,
+    /// How it takes damage. Blank: bombers use the bomber damage model,
+    /// everything else the fighter one.
+    pub damage: Option<crate::damage::DamageModel>,
 }
 
 /// The optional figures with every blank filled in.
@@ -115,7 +120,23 @@ impl AircraftCard {
             afterburner: false,
             afterburner_thrust: None,
             weapons: crate::weapons::Loadout::default(),
+            model: None,
+            damage: None,
         }
+    }
+
+    /// The 3D model it flies with.
+    pub fn model_kind(&self) -> crate::models::ModelKind {
+        self.model
+            .unwrap_or_else(|| crate::models::ModelKind::guess(self.engine, self.engines))
+    }
+
+    /// How it takes damage.
+    pub fn damage_model(&self) -> crate::damage::DamageModel {
+        self.damage.unwrap_or(match self.model_kind() {
+            crate::models::ModelKind::Bomber => crate::damage::DamageModel::Bomber,
+            _ => crate::damage::DamageModel::Fighter,
+        })
     }
 
     /// Whether this card's afterburner is in use (jets only).
@@ -1454,6 +1475,8 @@ mod tests {
             afterburner: false,
             afterburner_thrust: None,
             weapons: Default::default(),
+            model: None,
+            damage: None,
         };
         let m = FlightModel::from_card(&card);
         println!("jet {:?}", m.check);

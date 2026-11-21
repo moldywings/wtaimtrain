@@ -21,16 +21,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::GameState;
 use crate::camera::{ChaseCamera, MouseAim, snap_view};
+use crate::damage::HitPart;
 use crate::flight::{Aircraft, PaintColor, Player};
 use crate::flight_model::{AircraftCard, Body};
 use crate::settings::{Action, PlaneColor, Settings};
 use crate::target::Target;
+use crate::turrets::Turrets;
 use crate::weapons::{GunBook, GunCard, HitStats};
 
 pub const DEFAULT_PORT: u16 = 5050;
 /// Changes whenever the messages below change, so different versions of
 /// the game don't try to talk to each other.
-const PROTOCOL_ID: u64 = 0x5754_4154_0001;
+const PROTOCOL_ID: u64 = 0x5754_4154_0002;
 /// The host's own player id.
 pub const HOST_ID: u64 = 0;
 /// AI targets get ids from here up (joined players' ids are huge and odd).
@@ -135,6 +137,12 @@ pub struct PlaneState {
     pub v: [f32; 3],
     pub firing: bool,
     pub alive: bool,
+    /// Where the turrets aim (world point), if anywhere.
+    #[serde(default)]
+    pub aim: Option<[f32; 3]>,
+    /// The turrets are firing.
+    #[serde(default)]
+    pub tfire: bool,
 }
 
 /// One player on the scoreboard.
@@ -150,6 +158,9 @@ pub struct Entry {
     pub alive: bool,
     /// Share of the plane shot away (1 = down).
     pub damage: f32,
+    /// Each turret's damage (1 = knocked out).
+    #[serde(default)]
+    pub turrets: Vec<f32>,
     /// The host locked this player to one of the host's aircraft presets.
     pub locked: Option<String>,
 }
@@ -165,6 +176,7 @@ impl Entry {
             bot: false,
             alive: false,
             damage: 0.0,
+            turrets: vec![],
             locked: None,
         }
     }
@@ -196,7 +208,11 @@ pub struct Spawn {
 enum ToHost {
     Info(PlayerInfo),
     State(PlaneState),
-    Hit { victim: u64, damage: f32 },
+    Hit {
+        victim: u64,
+        damage: f32,
+        part: HitPart,
+    },
     Crashed,
 }
 
@@ -372,6 +388,11 @@ impl Mp {
         !self.online() || matches!(self.phase, Phase::Lobby) || self.me().is_some_and(|e| e.alive)
     }
 
+    /// AI targets may fire (only once the fight is on).
+    pub fn guns_free_for_bots(&self) -> bool {
+        matches!(self.phase, Phase::Fight(_))
+    }
+
     /// You may fire.
     pub fn guns_free(&self) -> bool {
         !self.online() || (matches!(self.phase, Phase::Fight(_)) && self.alive())
@@ -404,9 +425,9 @@ impl Mp {
         };
         let guns = card
             .weapons
-            .guns()
+            .gun_names()
             .iter()
-            .map(|(_, g, _)| {
+            .map(|g| {
                 book.iter()
                     .chain(settings.guns.iter())
                     .find(|c| c.name == *g)
@@ -469,6 +490,9 @@ pub struct RemotePlane {
     pub id: u64,
     pub firing: bool,
     pub alive: bool,
+    /// Where its turrets aim, and whether they're firing.
+    pub turret_aim: Option<Vec3>,
+    pub turret_firing: bool,
 }
 
 /// Your round hit another player's plane.
@@ -476,6 +500,7 @@ pub struct RemotePlane {
 pub struct RemoteHit {
     pub id: u64,
     pub damage: f32,
+    pub part: HitPart,
 }
 
 /// An AI target's round hit a plane (worked out on the host).
@@ -485,6 +510,7 @@ pub struct BotHit {
     /// The plane hit: a remote plane's id, or the host's own.
     pub victim: u64,
     pub damage: f32,
+    pub part: HitPart,
 }
 
 /// An AI target, flown by the host.
@@ -523,6 +549,7 @@ impl Plugin for MultiplayerPlugin {
                     move_remote_planes,
                     fly_bots,
                     local_status,
+                    sync_turret_losses,
                     spectate_controls,
                     send,
                 )
@@ -757,7 +784,7 @@ fn apply_elimination(mp: &mut Mp, victim: u64, by: Option<u64>) {
 }
 
 /// Host: hits from a player on another.
-fn apply_hit(mp: &mut Mp, attacker: u64, victim: u64, damage: f32) {
+fn apply_hit(mp: &mut Mp, attacker: u64, victim: u64, damage: f32, part: HitPart) {
     if !matches!(mp.phase, Phase::Fight(_)) {
         return;
     }
@@ -772,8 +799,20 @@ fn apply_hit(mp: &mut Mp, attacker: u64, victim: u64, damage: f32) {
     if !e.alive || !attacker_alive {
         return;
     }
-    e.damage += damage.clamp(0.0, 1.0);
-    if e.damage >= 1.0 {
+    let Some(card) = e.info.as_ref().map(|i| i.card.clone()) else {
+        return;
+    };
+    // Worked out by the plane's damage model: a cockpit hit, enough hits,
+    // or (bombers) every turret gone.
+    let mut hurt = crate::damage::Damage {
+        airframe: e.damage,
+        turrets: e.turrets.clone(),
+        cockpit: false,
+    };
+    hurt.hit(&card, part, damage);
+    e.damage = hurt.airframe.min(1.0);
+    e.turrets = hurt.turrets.clone();
+    if hurt.destroyed(&card) {
         eliminate(mp, victim, Some(attacker));
     } else {
         broadcast_roster(mp);
@@ -867,6 +906,7 @@ fn start_round(mp: &mut Mp) {
     for e in &mut mp.roster {
         e.alive = ids.contains(&e.id);
         e.damage = 0.0;
+        e.turrets.clear();
     }
     mp.round_size = ids.len();
     mp.round_teams = ids
@@ -979,9 +1019,13 @@ fn receive(time: Res<Time<Real>>, mut mp: ResMut<Mp>, settings: Res<Settings>) {
                     ToHost::State(s) => {
                         mp.states.insert(id, (s, now));
                     }
-                    ToHost::Hit { victim, damage } => {
+                    ToHost::Hit {
+                        victim,
+                        damage,
+                        part,
+                    } => {
                         if victim == HOST_ID || mp.roster.iter().any(|e| e.id == victim) {
-                            apply_hit(mp, id, victim, damage);
+                            apply_hit(mp, id, victim, damage, part);
                         }
                     }
                     ToHost::Crashed => {
@@ -1076,6 +1120,7 @@ fn receive(time: Res<Time<Real>>, mut mp: ResMut<Mp>, settings: Res<Settings>) {
                         for e in &mut mp.roster {
                             e.alive = spawns.iter().any(|(id, _)| *id == e.id);
                             e.damage = 0.0;
+                            e.turrets.clear();
                         }
                         pending_spawn(mp, &spawns);
                     }
@@ -1249,7 +1294,6 @@ fn run_round(
 fn sync_remote_planes(
     mut commands: Commands,
     mp: Res<Mp>,
-    assets: Res<AssetServer>,
     mut remotes: Query<(
         Entity,
         &mut RemotePlane,
@@ -1299,21 +1343,14 @@ fn sync_remote_planes(
                     id: e.id,
                     firing: false,
                     alive: e.alive,
+                    turret_aim: None,
+                    turret_firing: false,
                 },
                 PaintColor(info.color),
                 GunBook(info.guns.clone()),
                 aircraft,
             ))
-            .insert_if(Bot::default(), || e.bot && mp.is_host())
-            .with_children(|plane| {
-                plane.spawn((
-                    WorldAssetRoot(
-                        assets.load(GltfAssetLabel::Scene(0).from_asset(crate::AIRPLANE_MODEL)),
-                    ),
-                    crate::model_correction(),
-                    crate::weapons::PlaneModel,
-                ));
-            });
+            .insert_if(Bot::default(), || e.bot && mp.is_host());
     }
 }
 
@@ -1345,6 +1382,8 @@ fn move_remote_planes(
             *vis = want;
         }
         remote.firing = s.firing && shown;
+        remote.turret_aim = s.aim.map(Vec3::from).filter(|p| p.is_finite());
+        remote.turret_firing = s.tfire && shown;
         let v = Vec3::from(s.v);
         let age = (now - at).clamp(0.0, 0.5);
         let p = Vec3::from(s.p) + v * age;
@@ -1452,20 +1491,28 @@ fn local_status(
     // AI targets' hits (host only).
     let list: Vec<_> = bot_hits
         .read()
-        .map(|h| (h.bot, h.victim, h.damage))
+        .map(|h| (h.bot, h.victim, h.damage, h.part))
         .collect();
-    for (bot, victim, damage) in list {
+    for (bot, victim, damage, part) in list {
         if mp.is_host() {
-            apply_hit(&mut mp, bot, victim, damage);
+            apply_hit(&mut mp, bot, victim, damage, part);
         }
     }
     // Your hits on others go to the host.
-    let list: Vec<_> = hits.read().map(|h| (h.id, h.damage)).collect();
-    for (victim, damage) in list {
+    let list: Vec<_> = hits.read().map(|h| (h.id, h.damage, h.part)).collect();
+    for (victim, damage, part) in list {
         if mp.is_host() {
-            apply_hit(&mut mp, HOST_ID, victim, damage);
+            apply_hit(&mut mp, HOST_ID, victim, damage, part);
         } else {
-            client_send(&mut mp, &ToHost::Hit { victim, damage }, true);
+            client_send(
+                &mut mp,
+                &ToHost::Hit {
+                    victim,
+                    damage,
+                    part,
+                },
+                true,
+            );
         }
     }
 }
@@ -1525,6 +1572,7 @@ fn spectate_controls(
 
 /// Send your plane's motion and details, and (host) everyone's.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn send(
     time: Res<Time<Real>>,
     mut mp: ResMut<Mp>,
@@ -1532,6 +1580,8 @@ fn send(
     mouse: Res<ButtonInput<MouseButton>>,
     cursor: Single<&bevy::window::CursorOptions>,
     player: Single<&Aircraft, With<Player>>,
+    gunner: Res<crate::camera::GunnerView>,
+    gunner_aim: Res<crate::turrets::GunnerAim>,
 ) {
     if !mp.online() {
         return;
@@ -1576,8 +1626,9 @@ fn send(
         if mp.send_timer < 0.0 {
             mp.send_timer = 0.0;
         }
-        let firing =
-            mp.guns_free() && crate::weapons::trigger_now(&mouse, &cursor, settings.single_fire);
+        let firing = mp.guns_free()
+            && !gunner.active
+            && crate::weapons::trigger_now(&mouse, &cursor, settings.single_fire);
         let b = &player.body;
         let state = PlaneState {
             p: b.position.to_array(),
@@ -1585,6 +1636,8 @@ fn send(
             v: b.velocity.to_array(),
             firing,
             alive: mp.alive(),
+            aim: gunner_aim.point.map(|p| p.to_array()),
+            tfire: gunner_aim.firing,
         };
         if mp.is_host() {
             let mut list: Vec<(u64, PlaneState)> =
@@ -1696,7 +1749,7 @@ fn fly_bots(
     time: Res<Time>,
     mut mp: ResMut<Mp>,
     settings: Res<Settings>,
-    player: Single<&Aircraft, (With<Player>, Without<Bot>)>,
+    player: Single<(&Aircraft, &Transform, Option<&Turrets>), (With<Player>, Without<Bot>)>,
     mut bots: Query<
         (
             &mut Bot,
@@ -1705,10 +1758,14 @@ fn fly_bots(
             &mut Transform,
             &mut Visibility,
             Option<&GunBook>,
+            Option<&Turrets>,
         ),
         Without<Player>,
     >,
-    others: Query<(&RemotePlane, &Aircraft), (Without<Bot>, Without<Player>)>,
+    others: Query<
+        (&RemotePlane, &Aircraft, &Transform, Option<&Turrets>),
+        (Without<Bot>, Without<Player>),
+    >,
 ) {
     if !mp.is_host() {
         return;
@@ -1717,24 +1774,60 @@ fn fly_bots(
     if dt <= 0.0 {
         return;
     }
-    // Everyone a bot might chase: you, other players, and the bots.
-    let mut planes: Vec<(u64, Vec3, Vec3)> = vec![];
-    if mp.alive() && !matches!(mp.phase, Phase::Lobby) {
-        planes.push((HOST_ID, player.body.position, player.body.velocity));
+    // Everyone a bot might chase: you, other players, and the bots. For
+    // each: where it is, and where to shoot it from a given spot.
+    struct Prey {
+        id: u64,
+        pos: Vec3,
+        vel: Vec3,
+        card: AircraftCard,
+        tf: Transform,
+        spots: Option<Turrets>,
+        shooting: bool,
     }
-    for (r, a) in &others {
+    let snapshot = |t: Option<&Turrets>| t.map(|t| t.snapshot());
+    let mut planes: Vec<Prey> = vec![];
+    let (pa, ptf, pt) = *player;
+    if mp.alive() && !matches!(mp.phase, Phase::Lobby) {
+        planes.push(Prey {
+            id: HOST_ID,
+            pos: pa.body.position,
+            vel: pa.body.velocity,
+            card: pa.card.clone(),
+            tf: *ptf,
+            spots: snapshot(pt),
+            shooting: pt.is_some_and(|t| t.any_firing()),
+        });
+    }
+    for (r, a, tf, t) in &others {
         if r.alive {
-            planes.push((r.id, a.body.position, a.body.velocity));
+            planes.push(Prey {
+                id: r.id,
+                pos: a.body.position,
+                vel: a.body.velocity,
+                card: a.card.clone(),
+                tf: *tf,
+                spots: snapshot(t),
+                shooting: r.firing || t.is_some_and(|t| t.any_firing()),
+            });
         }
     }
-    for (_, r, a, ..) in &bots {
+    for (_, r, a, tf, _, _, t) in &bots {
         if r.alive {
-            planes.push((r.id, a.body.position, a.body.velocity));
+            planes.push(Prey {
+                id: r.id,
+                pos: a.body.position,
+                vel: a.body.velocity,
+                card: a.card.clone(),
+                tf: *tf,
+                spots: snapshot(t),
+                shooting: r.firing || t.is_some_and(|t| t.any_firing()),
+            });
         }
     }
     let fight = matches!(mp.phase, Phase::Fight(_));
     let mut crashed = vec![];
-    for (mut bot, mut remote, mut aircraft, mut tf, mut vis, book) in &mut bots {
+    for (mut bot, mut remote, mut aircraft, mut tf, mut vis, book, turrets) in &mut bots {
         let id = remote.id;
         let alive = mp.roster.iter().any(|e| e.id == id && e.alive);
         remote.alive = alive;
@@ -1742,7 +1835,9 @@ fn fly_bots(
             let rot = Quat::from_rotation_y(spawn.heading);
             let speed = spawn.speed * aircraft.model.top_speed(spawn.p[1]);
             aircraft.body = Body::new(Vec3::from(spawn.p), rot, speed);
-            bot.pilot = crate::ai::Pilot::default();
+            bot.pilot = crate::ai::Pilot::random(
+                (id as u32).wrapping_mul(2_654_435_761) ^ now_since_epoch().subsec_nanos(),
+            );
             tf.translation = aircraft.body.position;
             tf.rotation = rot;
         }
@@ -1765,6 +1860,8 @@ fn fly_bots(
                     v: b.velocity.to_array(),
                     firing: false,
                     alive: false,
+                    aim: None,
+                    tfire: false,
                 },
             );
             continue;
@@ -1772,11 +1869,13 @@ fn fly_bots(
         let pos = aircraft.body.position;
         let foe = planes
             .iter()
-            .filter(|(other, ..)| mp.enemies(id, *other))
-            .min_by(|a, b| a.1.distance(pos).total_cmp(&b.1.distance(pos)))
-            .map(|(_, p, v)| crate::ai::Foe {
-                position: *p,
-                velocity: *v,
+            .filter(|other| mp.enemies(id, other.id))
+            .min_by(|a, b| a.pos.distance(pos).total_cmp(&b.pos.distance(pos)))
+            .map(|p| crate::ai::Foe {
+                position: p.pos,
+                velocity: p.vel,
+                aim: crate::turrets::aim_point(&p.card, &p.tf, p.spots.as_ref(), pos),
+                shooting: p.shooting,
             })
             .filter(|_| fight);
         let gun = crate::ai::biggest_gun(&aircraft.card, |g| GunBook::gun(book, &settings, g));
@@ -1813,12 +1912,57 @@ fn fly_bots(
                 v: body.velocity.to_array(),
                 firing: remote.firing,
                 alive: true,
+                // Joined players see the turrets aim along the first
+                // working one.
+                aim: turrets
+                    .and_then(|t| t.list.iter().find(|t| !t.lost))
+                    .map(|t| {
+                        let p = body.position
+                            + body.rotation
+                                * (t.mount + t.direction() * crate::turrets::CONVERGENCE);
+                        p.to_array()
+                    }),
+                tfire: turrets.is_some_and(|t| t.any_firing()),
             },
         );
     }
     for id in crashed {
         if matches!(mp.phase, Phase::Fight(_) | Phase::Countdown(_)) {
             eliminate(&mut mp, id, None);
+        }
+    }
+}
+
+/// Knocked out turrets, as the host keeps score.
+fn sync_turret_losses(
+    mp: Res<Mp>,
+    mut planes: Query<(&mut Turrets, Option<&RemotePlane>, Has<Player>)>,
+) {
+    if !mp.online() {
+        return;
+    }
+    for (mut t, remote, is_player) in &mut planes {
+        let id = if is_player {
+            mp.my_id
+        } else if let Some(r) = remote {
+            r.id
+        } else {
+            continue;
+        };
+        let lost = mp
+            .roster
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| {
+                crate::damage::Damage {
+                    turrets: e.turrets.clone(),
+                    ..default()
+                }
+                .lost_mask()
+            })
+            .unwrap_or(0);
+        if t.lost != lost {
+            t.lost = lost;
         }
     }
 }
@@ -1831,23 +1975,24 @@ fn explode_eliminated(
     sounds: Res<crate::sound::Sounds>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    player: Single<&GlobalTransform, With<Player>>,
-    remotes: Query<(&RemotePlane, &GlobalTransform)>,
+    player: Single<(&GlobalTransform, &Aircraft), With<Player>>,
+    remotes: Query<(&RemotePlane, &GlobalTransform, &Aircraft)>,
 ) {
     if mp.explode.is_empty() {
         return;
     }
     for id in std::mem::take(&mut mp.explode) {
         let at = if id == mp.my_id {
-            Some(player.translation())
+            Some((player.0.translation(), &player.1.card))
         } else {
             remotes
                 .iter()
-                .find(|(r, _)| r.id == id)
-                .map(|(_, tf)| tf.translation())
+                .find(|(r, ..)| r.id == id)
+                .map(|(_, tf, a)| (tf.translation(), &a.card))
         };
-        if let Some(at) = at {
-            crate::target::spawn_explosion(&mut commands, &mut meshes, &mut materials, at);
+        if let Some((at, card)) = at {
+            let size = card.model_kind().spec().reach() / 7.0;
+            crate::target::spawn_explosion(&mut commands, &mut meshes, &mut materials, at, size);
             crate::sound::play(&mut commands, sounds.kill(), 0.3, 1.0);
         }
     }
